@@ -1,0 +1,690 @@
+// parseexpr: expressions, statements, blocks, match, and patterns. They live
+// in one module because they are mutually recursive: a block holds
+// statements, a statement holds expressions, and a match expression holds
+// blocks again. The expression core is the eight level precedence ladder of
+// docs/grammar.md, parsed by binding power with every operator left
+// associative, postfix call, index, member, and '?' binding tightest, and
+// unary '!' and '-' between postfix and the multiplicative level.
+//
+// A newline terminates a statement and stops the binary and postfix loops,
+// but only outside every open parenthesis and bracket; the grouping depth in
+// the parser state carries that rule. A brace resets the depth, because the
+// body of a block or a match inside an argument list is statement land again.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import bytes
+@import token
+@import intern
+@import ast
+@import parse
+@import parsety
+
+export func parse_expr(p: *Parser) -> int64 {
+    return parse_bin(p, 0)
+}
+
+// The header expression of if, while, for, and match. A bare record literal
+// is forbidden here, the way Rust forbids a struct literal in the same spot,
+// because `if x { }` must read the brace as the body and not as a literal.
+// Wrapping the literal in parentheses opts back in.
+export func parse_expr_no_record(p: *Parser) -> int64 {
+    saved: bool = (*p).no_record
+    (*p).no_record = true
+    e: int64 = parse_bin(p, 0)
+    (*p).no_record = saved
+    return e
+}
+
+func binop_for_kind(k: int64) -> int64 {
+    if k == k_or_or() { return bop_or() }
+    if k == k_and_and() { return bop_and() }
+    if k == k_eq_eq() { return bop_eq() }
+    if k == k_ne() { return bop_ne() }
+    if k == k_lt() { return bop_lt() }
+    if k == k_le() { return bop_le() }
+    if k == k_gt() { return bop_gt() }
+    if k == k_ge() { return bop_ge() }
+    if k == k_plus() { return bop_add() }
+    if k == k_minus() { return bop_sub() }
+    if k == k_star() { return bop_mul() }
+    if k == k_slash() { return bop_div() }
+    if k == k_percent() { return bop_mod() }
+    return -1
+}
+
+// Left binding power per precedence level, loosest lowest. Every operator is
+// left associative, so the right side parses at power + 1.
+func bin_lbp(op: int64) -> int64 {
+    if op == bop_or() { return 10 }
+    if op == bop_and() { return 20 }
+    if op == bop_eq() { return 30 }
+    if op == bop_ne() { return 30 }
+    if op == bop_lt() { return 40 }
+    if op == bop_le() { return 40 }
+    if op == bop_gt() { return 40 }
+    if op == bop_ge() { return 40 }
+    if op == bop_add() { return 50 }
+    if op == bop_sub() { return 50 }
+    return 60
+}
+
+func dummy_expr(p: *Parser) -> int64 {
+    empty: int64 = ast_intern(p_ast(p), "")
+    return ast_expr(p_ast(p), xk_ident(), p_lo(p), p_hi(p), empty, 0, 0, 0)
+}
+
+func parse_bin(p: *Parser, min_bp: int64) -> int64 {
+    mut e: int64 = -1
+    if p_enter_nesting(p) {
+        e = parse_bin_inner(p, min_bp)
+    } else {
+        e = dummy_expr(p)
+    }
+    p_leave_nesting(p)
+    return e
+}
+
+func parse_bin_inner(p: *Parser, min_bp: int64) -> int64 {
+    mut lhs: int64 = parse_unary(p)
+    mut going: bool = true
+    while going {
+        if p_nl_term(p) {
+            going = false
+        } else {
+            op: int64 = binop_for_kind(p_kind(p))
+            if op < 0 {
+                going = false
+            } else if bin_lbp(op) < min_bp {
+                going = false
+            } else {
+                p_bump(p)
+                rhs: int64 = parse_bin(p, bin_lbp(op) + 1)
+                l: ExprNode = vec_get((*p_ast(p)).exprs, lhs)
+                r: ExprNode = vec_get((*p_ast(p)).exprs, rhs)
+                lhs = ast_expr(p_ast(p), xk_binary(), l.lo, r.hi, op, lhs, rhs, 0)
+            }
+        }
+    }
+    return lhs
+}
+
+func parse_unary(p: *Parser) -> int64 {
+    mut e: int64 = -1
+    if p_enter_nesting(p) {
+        e = parse_unary_inner(p)
+    } else {
+        e = dummy_expr(p)
+    }
+    p_leave_nesting(p)
+    return e
+}
+
+func parse_unary_inner(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    mut op: int64 = -1
+    if p_at(p, k_minus()) { op = uop_neg() }
+    if p_at(p, k_bang()) { op = uop_not() }
+    if op >= 0 {
+        p_bump(p)
+        e: int64 = parse_unary(p)
+        n: ExprNode = vec_get((*p_ast(p)).exprs, e)
+        return ast_expr(p_ast(p), xk_unary(), lo, n.hi, op, e, 0, 0)
+    }
+    return parse_postfix(p)
+}
+
+func parse_postfix(p: *Parser) -> int64 {
+    mut e: int64 = parse_primary(p)
+    mut going: bool = true
+    while going {
+        if p_nl_term(p) {
+            going = false
+        } else if p_at(p, k_lparen()) {
+            off, len := parse_call_args(p)
+            n: ExprNode = vec_get((*p_ast(p)).exprs, e)
+            e = ast_expr(p_ast(p), xk_call(), n.lo, p_prev_hi(p), e, off, len, 0)
+        } else if p_at(p, k_lbracket()) {
+            p_bump(p)
+            p_group_enter(p)
+            saved: bool = (*p).no_record
+            (*p).no_record = false
+            idx: int64 = parse_expr(p)
+            (*p).no_record = saved
+            p_group_leave(p)
+            p_expect(p, k_rbracket(), "']'")
+            n2: ExprNode = vec_get((*p_ast(p)).exprs, e)
+            e = ast_expr(p_ast(p), xk_index(), n2.lo, p_prev_hi(p), e, idx, 0, 0)
+        } else if p_at(p, k_dot()) {
+            p_bump(p)
+            name: int64 = p_member_name(p)
+            n3: ExprNode = vec_get((*p_ast(p)).exprs, e)
+            e = ast_expr(p_ast(p), xk_member(), n3.lo, p_prev_hi(p), e, name, 0, 0)
+        } else if p_at(p, k_question()) {
+            p_bump(p)
+            n4: ExprNode = vec_get((*p_ast(p)).exprs, e)
+            e = ast_expr(p_ast(p), xk_question(), n4.lo, p_prev_hi(p), e, 0, 0, 0)
+        } else {
+            going = false
+        }
+    }
+    return e
+}
+
+// "(" [ Arg { "," Arg } ] ")" with Arg ::= [ IDENT ":" ] Expr. Returns the
+// kids slice of arg ids. The record literal gate opens inside the
+// parentheses, since an argument is a fresh expression position.
+func parse_call_args(p: *Parser) -> (int64, int64) {
+    p_bump(p)
+    p_group_enter(p)
+    saved: bool = (*p).no_record
+    (*p).no_record = false
+    args: *Vector<int64> = alloc(vec_new())
+    if !p_at(p, k_rparen()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_end(p) {
+                reading = false
+            } else {
+                vec_push(args, parse_arg(p))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    (*p).no_record = saved
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    return ast_kids(p_ast(p), args)
+}
+
+// One argument, labeled when an identifier is directly followed by a colon.
+// A colon can never continue an expression that begins with a lone
+// identifier, so the two token lookahead is unambiguous.
+func parse_arg(p: *Parser) -> int64 {
+    mut label: int64 = -1
+    if p_at(p, k_ident()) {
+        if p_kind2(p) == k_colon() {
+            label = p_ident(p)
+            p_bump(p)
+        }
+    }
+    e: int64 = parse_expr(p)
+    return ast_arg(p_ast(p), label, e)
+}
+
+// A literal in expression position, or -1 when the current token is not a
+// literal. Shared by primaries, patterns, and attribute values, so all three
+// decode a payload exactly once and the same way.
+export func parse_literal_expr(p: *Parser) -> int64 {
+    t: Token = p_tok(p)
+    if t.kind == k_int() {
+        v: int64 = p_int_value(p, t)
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_int(), t.lo, t.hi, v, 0, 0, 0)
+    }
+    if t.kind == k_float() {
+        tid: int64 = p_float_text_id(p, t)
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_float(), t.lo, t.hi, tid, 0, 0, 0)
+    }
+    if t.kind == k_str() {
+        sid: int64 = p_string_body_id(p, t)
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_str(), t.lo, t.hi, sid, 0, 0, 0)
+    }
+    if t.kind == k_char() {
+        sc: int64 = p_char_scalar(p, t.lo + 1)
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_char(), t.lo, t.hi, sc, 0, 0, 0)
+    }
+    if t.kind == k_bool() {
+        mut bv: int64 = 0
+        if str_eq_range((*p).src, t.lo, t.hi, "true") {
+            bv = 1
+        }
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_bool(), t.lo, t.hi, bv, 0, 0, 0)
+    }
+    return -1
+}
+
+func parse_primary(p: *Parser) -> int64 {
+    t: Token = p_tok(p)
+    lit: int64 = parse_literal_expr(p)
+    if lit >= 0 {
+        return lit
+    }
+    if p_kw(p, "match") {
+        return parse_match_expr(p)
+    }
+    if p_kw(p, "mut") {
+        return parse_mut_expr(p)
+    }
+    if t.kind == k_lparen() {
+        return parse_paren(p, t.lo)
+    }
+    if t.kind == k_lbracket() {
+        return parse_list(p, t.lo)
+    }
+    if t.kind == k_ident() {
+        return parse_ident_primary(p, t)
+    }
+    if t.kind == k_underscore() {
+        p_error(p, "'_' is a pattern, not an expression")
+        p_bump(p)
+        return dummy_expr(p)
+    }
+    p_error(p, expected_found(p, "an expression"))
+    p_bump(p)
+    return ast_expr(p_ast(p), xk_ident(), t.lo, t.hi, ast_intern(p_ast(p), ""), 0, 0, 0)
+}
+
+// mut "(" Expr ")", the builtin that copies a vow value into a mutable local.
+func parse_mut_expr(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    p_expect(p, k_lparen(), "'(' after 'mut'")
+    p_group_enter(p)
+    saved: bool = (*p).no_record
+    (*p).no_record = false
+    e: int64 = parse_expr(p)
+    (*p).no_record = saved
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    return ast_expr(p_ast(p), xk_mut(), lo, p_prev_hi(p), e, 0, 0, 0)
+}
+
+// A parenthesized expression or a tuple literal. One element re-wraps the
+// inner node with the outer span; two or more become a tuple. The grammar
+// has no unit literal, so bare () is an error rather than an empty tuple.
+func parse_paren(p: *Parser, lo: int64) -> int64 {
+    p_bump(p)
+    p_group_enter(p)
+    saved: bool = (*p).no_record
+    (*p).no_record = false
+    if p_at(p, k_rparen()) {
+        p_error(p, "expected an expression inside the parentheses")
+        p_bump(p)
+        (*p).no_record = saved
+        p_group_leave(p)
+        return dummy_expr(p)
+    }
+    first: int64 = parse_expr(p)
+    if p_at(p, k_comma()) {
+        elems: *Vector<int64> = alloc(vec_new())
+        vec_push(elems, first)
+        while p_eat(p, k_comma()) {
+            vec_push(elems, parse_expr(p))
+        }
+        (*p).no_record = saved
+        p_group_leave(p)
+        p_expect(p, k_rparen(), "')'")
+        off, len := ast_kids(p_ast(p), elems)
+        return ast_expr(p_ast(p), xk_tuple(), lo, p_prev_hi(p), off, len, 0, 0)
+    }
+    (*p).no_record = saved
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    n: ExprNode = vec_get((*p_ast(p)).exprs, first)
+    return ast_expr(p_ast(p), n.kind, lo, p_prev_hi(p), n.a, n.b, n.c, n.d)
+}
+
+// "[" [ Expr { "," Expr } ] "]", the list literal.
+func parse_list(p: *Parser, lo: int64) -> int64 {
+    p_bump(p)
+    p_group_enter(p)
+    saved: bool = (*p).no_record
+    (*p).no_record = false
+    elems: *Vector<int64> = alloc(vec_new())
+    if !p_at(p, k_rbracket()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_end(p) {
+                reading = false
+            } else {
+                vec_push(elems, parse_expr(p))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    (*p).no_record = saved
+    p_group_leave(p)
+    p_expect(p, k_rbracket(), "']'")
+    off, len := ast_kids(p_ast(p), elems)
+    return ast_expr(p_ast(p), xk_list(), lo, p_prev_hi(p), off, len, 0, 0)
+}
+
+// An identifier primary: the Some, None, Ok, and Err constructors, a record
+// literal when a brace opens on the same line and the position allows one,
+// or a plain name. Some, Ok, and Err without a parenthesis fall through to
+// plain names, since only the applied form is a constructor.
+func parse_ident_primary(p: *Parser, t: Token) -> int64 {
+    if p_kind2(p) == k_lparen() {
+        mut ck: int64 = -1
+        if str_eq_range((*p).src, t.lo, t.hi, "Some") { ck = xk_some() }
+        if str_eq_range((*p).src, t.lo, t.hi, "Ok") { ck = xk_ok() }
+        if str_eq_range((*p).src, t.lo, t.hi, "Err") { ck = xk_err() }
+        if ck >= 0 {
+            p_bump(p)
+            p_bump(p)
+            p_group_enter(p)
+            saved: bool = (*p).no_record
+            (*p).no_record = false
+            inner: int64 = parse_expr(p)
+            (*p).no_record = saved
+            p_group_leave(p)
+            p_expect(p, k_rparen(), "')'")
+            return ast_expr(p_ast(p), ck, t.lo, p_prev_hi(p), inner, 0, 0, 0)
+        }
+    }
+    if str_eq_range((*p).src, t.lo, t.hi, "None") {
+        p_bump(p)
+        return ast_expr(p_ast(p), xk_none(), t.lo, t.hi, 0, 0, 0, 0)
+    }
+    name: int64 = intern_range((*p_ast(p)).interner, (*p).src, (*p).n, t.lo, t.hi)
+    p_bump(p)
+    if p_at(p, k_lbrace()) {
+        if !(*p).no_record {
+            if !p_nl_here(p) {
+                return parse_record_lit(p, name, t.lo)
+            }
+        }
+    }
+    return ast_expr(p_ast(p), xk_ident(), t.lo, t.hi, name, 0, 0, 0)
+}
+
+// IDENT "{" [ IDENT ":" Expr { "," IDENT ":" Expr } ] "}". Field name and
+// value ids land in kids as pairs. Fields are comma separated; a newline
+// between them is fine because nothing here consults the newline flag.
+func parse_record_lit(p: *Parser, name: int64, lo: int64) -> int64 {
+    p_bump(p)
+    bsaved: int64 = p_brace_save(p)
+    pairs: *Vector<int64> = alloc(vec_new())
+    if !p_at(p, k_rbrace()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_end(p) {
+                reading = false
+            } else if p_at(p, k_rbrace()) {
+                reading = false
+            } else {
+                fname: int64 = p_ident(p)
+                p_expect(p, k_colon(), "':' between the field name and its value")
+                saved: bool = (*p).no_record
+                (*p).no_record = false
+                val: int64 = parse_expr(p)
+                (*p).no_record = saved
+                vec_push(pairs, fname)
+                vec_push(pairs, val)
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    p_brace_restore(p, bsaved)
+    p_expect(p, k_rbrace(), "'}'")
+    off, len := ast_kids(p_ast(p), pairs)
+    return ast_expr(p_ast(p), xk_record_lit(), lo, p_prev_hi(p), name, off, len, 0)
+}
+
+// match Expr "{" NL { MatchArm NL } "}". Arms are newline separated; a body
+// is an expression or a block, told apart by the brace after the arrow.
+func parse_match_expr(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    scrut: int64 = parse_expr_no_record(p)
+    arms: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the match arms")
+    bsaved: int64 = p_brace_save(p)
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            pat: int64 = parse_pattern(p)
+            if !p_eat(p, k_arrow()) {
+                p_error(p, "a match arm needs '->' between its pattern and its body")
+            }
+            mut is_block: bool = false
+            mut body: int64 = -1
+            if p_at(p, k_lbrace()) {
+                is_block = true
+                body = parse_block(p)
+            } else {
+                body = parse_expr(p)
+            }
+            vec_push(arms, ast_arm(p_ast(p), pat, is_block, body))
+            p_sep(p, "expected a newline after the match arm")
+            p_guard_progress(p, before, "unexpected token in the match arms")
+        }
+    }
+    p_brace_restore(p, bsaved)
+    p_expect_close(p, "the match body is not closed; expected '}' before end of input")
+    aoff, alen := ast_kids(p_ast(p), arms)
+    return ast_expr(p_ast(p), xk_match(), lo, p_prev_hi(p), scrut, aoff, alen, 0)
+}
+
+// Pattern ::= Literal | "_" | IDENT | IDENT "(" Pattern { "," Pattern } ")"
+// with Some, None, Ok, and Err as their own forms. A bare identifier binds.
+func parse_pattern(p: *Parser) -> int64 {
+    mut pat: int64 = -1
+    if p_enter_nesting(p) {
+        pat = parse_pattern_inner(p)
+    } else {
+        pat = ast_pattern(p_ast(p), pk_wildcard(), 0, 0, 0)
+    }
+    p_leave_nesting(p)
+    return pat
+}
+
+func parse_pattern_inner(p: *Parser) -> int64 {
+    t: Token = p_tok(p)
+    if t.kind == k_underscore() {
+        p_bump(p)
+        return ast_pattern(p_ast(p), pk_wildcard(), 0, 0, 0)
+    }
+    lit: int64 = parse_literal_expr(p)
+    if lit >= 0 {
+        return ast_pattern(p_ast(p), pk_lit(), lit, 0, 0)
+    }
+    if t.kind == k_ident() {
+        if p_kind2(p) == k_lparen() {
+            mut ck: int64 = -1
+            if str_eq_range((*p).src, t.lo, t.hi, "Some") { ck = pk_some() }
+            if str_eq_range((*p).src, t.lo, t.hi, "Ok") { ck = pk_ok() }
+            if str_eq_range((*p).src, t.lo, t.hi, "Err") { ck = pk_err() }
+            if ck >= 0 {
+                p_bump(p)
+                p_bump(p)
+                p_group_enter(p)
+                inner: int64 = parse_pattern(p)
+                p_group_leave(p)
+                p_expect(p, k_rparen(), "')'")
+                return ast_pattern(p_ast(p), ck, inner, 0, 0)
+            }
+            return parse_variant_pattern(p)
+        }
+        if str_eq_range((*p).src, t.lo, t.hi, "None") {
+            p_bump(p)
+            return ast_pattern(p_ast(p), pk_none(), 0, 0, 0)
+        }
+        name: int64 = p_ident(p)
+        return ast_pattern(p_ast(p), pk_bind(), name, 0, 0)
+    }
+    p_error(p, expected_found(p, "a pattern"))
+    p_bump(p)
+    return ast_pattern(p_ast(p), pk_wildcard(), 0, 0, 0)
+}
+
+func parse_variant_pattern(p: *Parser) -> int64 {
+    name: int64 = p_ident(p)
+    p_bump(p)
+    p_group_enter(p)
+    pats: *Vector<int64> = alloc(vec_new())
+    if !p_at(p, k_rparen()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_end(p) {
+                reading = false
+            } else {
+                vec_push(pats, parse_pattern(p))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    off, len := ast_kids(p_ast(p), pats)
+    return ast_pattern(p_ast(p), pk_variant(), name, off, len)
+}
+
+// Block ::= "{" NL { Stmt NL } "}". The brace resets the grouping depth so
+// statements inside a block terminate on newlines even when the block sits
+// inside an argument list.
+export func parse_block(p: *Parser) -> int64 {
+    if !p_enter_nesting(p) {
+        p_leave_nesting(p)
+        empty: *Vector<int64> = alloc(vec_new())
+        return ast_block(p_ast(p), empty)
+    }
+    p_expect(p, k_lbrace(), "'{'")
+    bsaved: int64 = p_brace_save(p)
+    stmts: *Vector<int64> = alloc(vec_new())
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            vec_push(stmts, parse_stmt(p))
+            p_sep(p, "expected a newline after the statement")
+            p_guard_progress(p, before, "unexpected token in the block")
+        }
+    }
+    p_brace_restore(p, bsaved)
+    p_expect_close(p, "the block is not closed; expected '}' before end of input")
+    p_leave_nesting(p)
+    return ast_block(p_ast(p), stmts)
+}
+
+export func parse_stmt(p: *Parser) -> int64 {
+    if p_kw(p, "let") {
+        return parse_let_stmt(p)
+    }
+    if p_kw(p, "return") {
+        return parse_return_stmt(p)
+    }
+    if p_kw(p, "if") {
+        return parse_if_stmt(p)
+    }
+    if p_kw(p, "while") {
+        return parse_while_stmt(p)
+    }
+    if p_kw(p, "for") {
+        return parse_for_stmt(p)
+    }
+    if p_eat_kw(p, "break") {
+        return ast_stmt(p_ast(p), sk_break(), 0, 0, 0, 0)
+    }
+    if p_eat_kw(p, "continue") {
+        return ast_stmt(p_ast(p), sk_continue(), 0, 0, 0, 0)
+    }
+    e: int64 = parse_expr(p)
+    if !p_nl_term(p) {
+        if p_eat(p, k_assign()) {
+            rhs: int64 = parse_expr(p)
+            return ast_stmt(p_ast(p), sk_assign(), e, rhs, 0, 0)
+        }
+    }
+    return ast_stmt(p_ast(p), sk_expr(), e, 0, 0, 0)
+}
+
+// let [ mut ] IDENT [ ":" Type ] "=" Expr.
+func parse_let_stmt(p: *Parser) -> int64 {
+    p_bump(p)
+    mut flags: int64 = 0
+    if p_eat_kw(p, "mut") {
+        flags = 1
+    }
+    name: int64 = p_ident(p)
+    mut ty: int64 = -1
+    if p_eat(p, k_colon()) {
+        ty = parse_type(p)
+    }
+    p_expect(p, k_assign(), "'=' in the let binding")
+    value: int64 = parse_expr(p)
+    return ast_stmt(p_ast(p), sk_let(), name, ty, value, flags)
+}
+
+// return [ Expr ]. The operand is absent when the statement ends right
+// there: a closing brace, end of input, or a newline before the next token.
+func parse_return_stmt(p: *Parser) -> int64 {
+    p_bump(p)
+    if p_at(p, k_rbrace()) {
+        return ast_stmt(p_ast(p), sk_return(), -1, 0, 0, 0)
+    }
+    if p_at_end(p) {
+        return ast_stmt(p_ast(p), sk_return(), -1, 0, 0, 0)
+    }
+    if p_nl_term(p) {
+        return ast_stmt(p_ast(p), sk_return(), -1, 0, 0, 0)
+    }
+    return ast_stmt(p_ast(p), sk_return(), parse_expr(p), 0, 0, 0)
+}
+
+// if Expr Block { else if Expr Block } [ else Block ]. An else if chain is
+// stored as an else block holding a single if statement, which keeps the
+// statement node fixed width. The else keyword is accepted across a newline,
+// since nothing else can legally start with it.
+func parse_if_stmt(p: *Parser) -> int64 {
+    p_bump(p)
+    cond: int64 = parse_expr_no_record(p)
+    then_block: int64 = parse_block(p)
+    mut els: int64 = -1
+    if p_eat_kw(p, "else") {
+        if p_kw(p, "if") {
+            if p_enter_nesting(p) {
+                one: *Vector<int64> = alloc(vec_new())
+                vec_push(one, parse_if_stmt(p))
+                els = ast_block(p_ast(p), one)
+            } else {
+                empty: *Vector<int64> = alloc(vec_new())
+                els = ast_block(p_ast(p), empty)
+            }
+            p_leave_nesting(p)
+        } else {
+            els = parse_block(p)
+        }
+    }
+    return ast_stmt(p_ast(p), sk_if(), cond, then_block, els, 0)
+}
+
+func parse_while_stmt(p: *Parser) -> int64 {
+    p_bump(p)
+    cond: int64 = parse_expr_no_record(p)
+    body: int64 = parse_block(p)
+    return ast_stmt(p_ast(p), sk_while(), cond, body, 0, 0)
+}
+
+func parse_for_stmt(p: *Parser) -> int64 {
+    p_bump(p)
+    name: int64 = p_ident(p)
+    p_expect_kw(p, "in", "'in' between the loop variable and its sequence")
+    iter: int64 = parse_expr_no_record(p)
+    body: int64 = parse_block(p)
+    return ast_stmt(p_ast(p), sk_for(), name, iter, body, 0)
+}

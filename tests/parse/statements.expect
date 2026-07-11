@@ -1,0 +1,235 @@
+File {
+    imports: [],
+    decls: [
+        Sum {
+            name: "FlowError",
+            variants: [
+                Variant {
+                    name: "Empty",
+                    fields: [],
+                },
+            ],
+        },
+        Contract {
+            internal: false,
+            name: "Flow",
+            attrs: [],
+            members: [
+                Vow {
+                    name: "limit",
+                    ty: Named("Int"),
+                    init: Int(10),
+                },
+                Pledge {
+                    name: "run",
+                    params: [
+                        Field {
+                            name: "args",
+                            ty: Named("List", [
+                                Named("String"),
+                            ]),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("Int"),
+                        Named("FlowError"),
+                    ]),
+                    attrs: [],
+                    body: Block {
+                        stmts: [
+                            Let {
+                                mutable: true,
+                                name: "total",
+                                ty: Named("Int"),
+                                value: Int(0),
+                            },
+                            Let {
+                                mutable: true,
+                                name: "i",
+                                ty: None,
+                                value: Int(0),
+                            },
+                            While {
+                                cond: Binary(
+                                    Lt,
+                                    Ident("i"),
+                                    Ident("limit"),
+                                ),
+                                body: Block {
+                                    stmts: [
+                                        If {
+                                            cond: Binary(
+                                                Eq,
+                                                Ident("i"),
+                                                Int(7),
+                                            ),
+                                            then: Block {
+                                                stmts: [
+                                                    Assign(
+                                                        Ident("i"),
+                                                        Binary(
+                                                            Add,
+                                                            Ident("i"),
+                                                            Int(1),
+                                                        ),
+                                                    ),
+                                                    Continue,
+                                                ],
+                                            },
+                                            els: None,
+                                        },
+                                        If {
+                                            cond: Binary(
+                                                Gt,
+                                                Ident("total"),
+                                                Int(100),
+                                            ),
+                                            then: Block {
+                                                stmts: [
+                                                    Break,
+                                                ],
+                                            },
+                                            els: None,
+                                        },
+                                        Assign(
+                                            Ident("total"),
+                                            Binary(
+                                                Add,
+                                                Ident("total"),
+                                                Ident("i"),
+                                            ),
+                                        ),
+                                        Assign(
+                                            Ident("i"),
+                                            Binary(
+                                                Add,
+                                                Ident("i"),
+                                                Int(1),
+                                            ),
+                                        ),
+                                    ],
+                                },
+                            },
+                            For {
+                                var: "arg",
+                                iter: Ident("args"),
+                                body: Block {
+                                    stmts: [
+                                        Assign(
+                                            Ident("total"),
+                                            Binary(
+                                                Add,
+                                                Ident("total"),
+                                                Int(1),
+                                            ),
+                                        ),
+                                    ],
+                                },
+                            },
+                            Let {
+                                mutable: true,
+                                name: "copy",
+                                ty: None,
+                                value: Mut(
+                                    Ident("limit"),
+                                ),
+                            },
+                            Assign(
+                                Ident("copy"),
+                                Binary(
+                                    Add,
+                                    Ident("copy"),
+                                    Int(1),
+                                ),
+                            ),
+                            Assign(
+                                Index(
+                                    Ident("grid"),
+                                    Int(0),
+                                ),
+                                Ident("total"),
+                            ),
+                            Assign(
+                                Member(
+                                    Member(
+                                        Ident("holder"),
+                                        "point",
+                                    ),
+                                    "x",
+                                ),
+                                Int(5),
+                            ),
+                            If {
+                                cond: Binary(
+                                    Eq,
+                                    Ident("total"),
+                                    Int(0),
+                                ),
+                                then: Block {
+                                    stmts: [
+                                        Return(
+                                            Err(
+                                                Member(
+                                                    Ident("FlowError"),
+                                                    "Empty",
+                                                ),
+                                            ),
+                                        ),
+                                    ],
+                                },
+                                els: Block {
+                                    stmts: [
+                                        If {
+                                            cond: Binary(
+                                                Eq,
+                                                Ident("total"),
+                                                Int(1),
+                                            ),
+                                            then: Block {
+                                                stmts: [
+                                                    Expr(
+                                                        Call {
+                                                            callee: Ident("log_once"),
+                                                            args: [],
+                                                        },
+                                                    ),
+                                                ],
+                                            },
+                                            els: Block {
+                                                stmts: [
+                                                    Assign(
+                                                        Ident("total"),
+                                                        Binary(
+                                                            Sub,
+                                                            Ident("total"),
+                                                            Int(1),
+                                                        ),
+                                                    ),
+                                                ],
+                                            },
+                                        },
+                                    ],
+                                },
+                            },
+                            Return(
+                                Ok(
+                                    Ident("total"),
+                                ),
+                            ),
+                        ],
+                    },
+                },
+                Clause {
+                    name: "log_once",
+                    params: [],
+                    ret: Named("Unit"),
+                    body: Block {
+                        stmts: [
+                            Return(None),
+                        ],
+                    },
+                },
+            ],
+        },
+    ],
+}

@@ -95,7 +95,7 @@ func push_canonical(out: *StringBuilder, cp: int64, quote: int64) -> void {
 // escape adding nothing, then each scalar is emitted in canonical form. An
 // unterminated literal simply runs out of span here, so the dump still prints
 // what was scanned.
-func debug_string(src: string, n: int64, lo: int64, hi: int64) -> string {
+export func debug_string(src: string, n: int64, lo: int64, hi: int64) -> string {
     out: *StringBuilder = alloc(sb_new())
     sb_push_char(out, 34)
     mut p: int64 = lo + 1
@@ -168,7 +168,7 @@ func debug_char(src: string, n: int64, lo: int64) -> string {
 // digits with underscore separators. Accumulation is guarded the same way the
 // lexer's overflow test is, and an overflowing literal renders as 0, a
 // deterministic value beside the fault the lexer already recorded.
-func int_value(src: string, n: int64, lo: int64, hi: int64) -> int64 {
+export func int_value(src: string, n: int64, lo: int64, hi: int64) -> int64 {
     mut base: int64 = 10
     mut p: int64 = lo
     if bytes.byte_at(src, n, lo) == 48 {

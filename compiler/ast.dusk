@@ -1,0 +1,387 @@
+// ast: the parse order arena AST for ashford, one arena per node shape and one
+// shared kids arena of int64 for every variable length list, stored as an
+// (off, len) slice. Expr, Stmt, Type, and Pattern are tagged fixed slot nodes
+// whose slots are read by kind; the declaration forms of docs/grammar.md each
+// get their own record arena. Every name is an interner id, so the tree itself
+// owns no strings beyond the interner table. Node ids are indices into their
+// arena, and -1 everywhere means an absent optional.
+
+@paradigm procedural
+
+@import std.vector
+@import intern
+
+export struct ExprNode { kind: int64, lo: int64, hi: int64, a: int64, b: int64, c: int64, d: int64 }
+export struct StmtNode { kind: int64, a: int64, b: int64, c: int64, d: int64 }
+export struct TypeNode { kind: int64, a: int64, b: int64, c: int64 }
+export struct PatternNode { kind: int64, a: int64, b: int64, c: int64 }
+
+// A call argument with its optional label, the [IDENT ":"] Expr form.
+export struct ArgNode { label: int64, expr: int64 }
+
+// A match arm. is_block records whether the body was written as a block, so
+// the dump and the checker can tell `-> e` from `-> { ... }`; body is an expr
+// id or a block id accordingly.
+export struct ArmNode { pat: int64, is_block: bool, body: int64 }
+
+export struct BlockNode { off: int64, len: int64 }
+
+// A name and type pair, shared by record fields, variant fields, and params,
+// which are all the same FieldDecl production.
+export struct FieldNode { name: int64, ty: int64 }
+
+// An attribute key and its literal value, the value stored as a literal expr.
+export struct AttrNode { key: int64, val: int64 }
+
+export struct ImportNode { path: int64, lo: int64, hi: int64 }
+export struct RecordNode { name: int64, lo: int64, hi: int64, fields_off: int64, fields_len: int64 }
+export struct VariantNode { name: int64, fields_off: int64, fields_len: int64 }
+export struct SumNode { name: int64, lo: int64, hi: int64, variants_off: int64, variants_len: int64 }
+export struct ClauseSigNode { name: int64, params_off: int64, params_len: int64, ret: int64 }
+export struct ProvNode { internal: bool, name: int64, lo: int64, hi: int64, sigs_off: int64, sigs_len: int64 }
+export struct VowNode { name: int64, ty: int64, init: int64 }
+export struct PledgeNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, attrs_off: int64, attrs_len: int64, body: int64 }
+export struct ClauseNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, body: int64 }
+export struct SubNode { name: int64, lo: int64, hi: int64, pledges_off: int64, pledges_len: int64 }
+export struct ReqNode { kind: int64, a: int64, b: int64 }
+export struct ReqBlockNode { lo: int64, hi: int64, fulfill: int64, partial: int64, brk: int64 }
+export struct IncNode { name: int64, lo: int64, hi: int64 }
+
+// A contract. Members live in kids as (member kind, arena id) pairs in source
+// order, so the dump and the checker both walk them the way they were written.
+export struct ContractNode { internal: bool, name: int64, lo: int64, hi: int64, attrs_off: int64, attrs_len: int64, members_off: int64, members_len: int64 }
+
+export struct DeclNode { kind: int64, id: int64 }
+
+export struct Ast {
+    interner: *Interner,
+    exprs: *Vector<ExprNode>,
+    stmts: *Vector<StmtNode>,
+    types: *Vector<TypeNode>,
+    patterns: *Vector<PatternNode>,
+    args: *Vector<ArgNode>,
+    arms: *Vector<ArmNode>,
+    blocks: *Vector<BlockNode>,
+    fields: *Vector<FieldNode>,
+    attrs: *Vector<AttrNode>,
+    imports: *Vector<ImportNode>,
+    records: *Vector<RecordNode>,
+    variants: *Vector<VariantNode>,
+    sums: *Vector<SumNode>,
+    clause_sigs: *Vector<ClauseSigNode>,
+    provs: *Vector<ProvNode>,
+    vows: *Vector<VowNode>,
+    pledges: *Vector<PledgeNode>,
+    clauses: *Vector<ClauseNode>,
+    subs: *Vector<SubNode>,
+    reqs: *Vector<ReqNode>,
+    reqblocks: *Vector<ReqBlockNode>,
+    incs: *Vector<IncNode>,
+    contracts: *Vector<ContractNode>,
+    decls: *Vector<DeclNode>,
+    kids: *Vector<int64>,
+}
+
+// Expression kinds. Variant construction with arguments parses as a call and
+// bare variant names parse as identifiers; only Some, None, Ok, Err, record
+// literals, and mut() are syntactic constructors, exactly the CtorExpr forms
+// the grammar can tell apart without name resolution.
+export func xk_int() -> int64 { return 0 }
+export func xk_float() -> int64 { return 1 }
+export func xk_str() -> int64 { return 2 }
+export func xk_char() -> int64 { return 3 }
+export func xk_bool() -> int64 { return 4 }
+export func xk_ident() -> int64 { return 5 }
+export func xk_unary() -> int64 { return 6 }
+export func xk_binary() -> int64 { return 7 }
+export func xk_call() -> int64 { return 8 }
+export func xk_index() -> int64 { return 9 }
+export func xk_member() -> int64 { return 10 }
+export func xk_question() -> int64 { return 11 }
+export func xk_tuple() -> int64 { return 12 }
+export func xk_list() -> int64 { return 13 }
+export func xk_record_lit() -> int64 { return 14 }
+export func xk_match() -> int64 { return 15 }
+export func xk_some() -> int64 { return 16 }
+export func xk_none() -> int64 { return 17 }
+export func xk_ok() -> int64 { return 18 }
+export func xk_err() -> int64 { return 19 }
+export func xk_mut() -> int64 { return 20 }
+
+export func uop_neg() -> int64 { return 0 }
+export func uop_not() -> int64 { return 1 }
+
+export func bop_add() -> int64 { return 0 }
+export func bop_sub() -> int64 { return 1 }
+export func bop_mul() -> int64 { return 2 }
+export func bop_div() -> int64 { return 3 }
+export func bop_mod() -> int64 { return 4 }
+export func bop_eq() -> int64 { return 5 }
+export func bop_ne() -> int64 { return 6 }
+export func bop_lt() -> int64 { return 7 }
+export func bop_le() -> int64 { return 8 }
+export func bop_gt() -> int64 { return 9 }
+export func bop_ge() -> int64 { return 10 }
+export func bop_and() -> int64 { return 11 }
+export func bop_or() -> int64 { return 12 }
+
+export func sk_let() -> int64 { return 0 }
+export func sk_assign() -> int64 { return 1 }
+export func sk_return() -> int64 { return 2 }
+export func sk_if() -> int64 { return 3 }
+export func sk_while() -> int64 { return 4 }
+export func sk_for() -> int64 { return 5 }
+export func sk_break() -> int64 { return 6 }
+export func sk_continue() -> int64 { return 7 }
+export func sk_expr() -> int64 { return 8 }
+
+// Type kinds. Tuple<..> is a named type in the surface grammar, so only the
+// named form and the first class pledge type exist here.
+export func tk_named() -> int64 { return 0 }
+export func tk_pledge() -> int64 { return 1 }
+
+export func pk_wildcard() -> int64 { return 0 }
+export func pk_lit() -> int64 { return 1 }
+export func pk_bind() -> int64 { return 2 }
+export func pk_variant() -> int64 { return 3 }
+export func pk_some() -> int64 { return 4 }
+export func pk_none() -> int64 { return 5 }
+export func pk_ok() -> int64 { return 6 }
+export func pk_err() -> int64 { return 7 }
+
+export func dk_record() -> int64 { return 0 }
+export func dk_sum() -> int64 { return 1 }
+export func dk_prov() -> int64 { return 2 }
+export func dk_contract() -> int64 { return 3 }
+
+export func mk_incorporate() -> int64 { return 0 }
+export func mk_vow() -> int64 { return 1 }
+export func mk_pledge() -> int64 { return 2 }
+export func mk_clause() -> int64 { return 3 }
+export func mk_subcontract() -> int64 { return 4 }
+export func mk_requirements() -> int64 { return 5 }
+
+export func rk_atom() -> int64 { return 0 }
+export func rk_not() -> int64 { return 1 }
+export func rk_and() -> int64 { return 2 }
+export func rk_or() -> int64 { return 3 }
+
+export func ast_new() -> *Ast {
+    exprs: *Vector<ExprNode> = alloc(vec_new())
+    stmts: *Vector<StmtNode> = alloc(vec_new())
+    types: *Vector<TypeNode> = alloc(vec_new())
+    patterns: *Vector<PatternNode> = alloc(vec_new())
+    args: *Vector<ArgNode> = alloc(vec_new())
+    arms: *Vector<ArmNode> = alloc(vec_new())
+    blocks: *Vector<BlockNode> = alloc(vec_new())
+    fields: *Vector<FieldNode> = alloc(vec_new())
+    attrs: *Vector<AttrNode> = alloc(vec_new())
+    imports: *Vector<ImportNode> = alloc(vec_new())
+    records: *Vector<RecordNode> = alloc(vec_new())
+    variants: *Vector<VariantNode> = alloc(vec_new())
+    sums: *Vector<SumNode> = alloc(vec_new())
+    clause_sigs: *Vector<ClauseSigNode> = alloc(vec_new())
+    provs: *Vector<ProvNode> = alloc(vec_new())
+    vows: *Vector<VowNode> = alloc(vec_new())
+    pledges: *Vector<PledgeNode> = alloc(vec_new())
+    clauses: *Vector<ClauseNode> = alloc(vec_new())
+    subs: *Vector<SubNode> = alloc(vec_new())
+    reqs: *Vector<ReqNode> = alloc(vec_new())
+    reqblocks: *Vector<ReqBlockNode> = alloc(vec_new())
+    incs: *Vector<IncNode> = alloc(vec_new())
+    contracts: *Vector<ContractNode> = alloc(vec_new())
+    decls: *Vector<DeclNode> = alloc(vec_new())
+    kids: *Vector<int64> = alloc(vec_new())
+    return alloc(Ast {
+        interner: intern_new(),
+        exprs: exprs, stmts: stmts, types: types, patterns: patterns,
+        args: args, arms: arms, blocks: blocks, fields: fields, attrs: attrs,
+        imports: imports, records: records, variants: variants, sums: sums,
+        clause_sigs: clause_sigs, provs: provs, vows: vows, pledges: pledges,
+        clauses: clauses, subs: subs, reqs: reqs, reqblocks: reqblocks,
+        incs: incs, contracts: contracts, decls: decls, kids: kids,
+    })
+}
+
+// Copies a scratch id vector into the shared kids arena and returns its slice.
+export func ast_kids(a: *Ast, src: *Vector<int64>) -> (int64, int64) {
+    kids: *Vector<int64> = (*a).kids
+    off: int64 = vec_len(kids)
+    mut i: int64 = 0
+    while i < vec_len(src) {
+        vec_push(kids, vec_get(src, i))
+        i = i + 1
+    }
+    return (off, vec_len(src))
+}
+
+export func ast_expr(a: *Ast, kind: int64, lo: int64, hi: int64, x: int64, y: int64, z: int64, w: int64) -> int64 {
+    v: *Vector<ExprNode> = (*a).exprs
+    id: int64 = vec_len(v)
+    vec_push(v, ExprNode { kind: kind, lo: lo, hi: hi, a: x, b: y, c: z, d: w })
+    return id
+}
+
+export func ast_stmt(a: *Ast, kind: int64, x: int64, y: int64, z: int64, w: int64) -> int64 {
+    v: *Vector<StmtNode> = (*a).stmts
+    id: int64 = vec_len(v)
+    vec_push(v, StmtNode { kind: kind, a: x, b: y, c: z, d: w })
+    return id
+}
+
+export func ast_type(a: *Ast, kind: int64, x: int64, y: int64, z: int64) -> int64 {
+    v: *Vector<TypeNode> = (*a).types
+    id: int64 = vec_len(v)
+    vec_push(v, TypeNode { kind: kind, a: x, b: y, c: z })
+    return id
+}
+
+export func ast_pattern(a: *Ast, kind: int64, x: int64, y: int64, z: int64) -> int64 {
+    v: *Vector<PatternNode> = (*a).patterns
+    id: int64 = vec_len(v)
+    vec_push(v, PatternNode { kind: kind, a: x, b: y, c: z })
+    return id
+}
+
+export func ast_arg(a: *Ast, label: int64, expr: int64) -> int64 {
+    v: *Vector<ArgNode> = (*a).args
+    id: int64 = vec_len(v)
+    vec_push(v, ArgNode { label: label, expr: expr })
+    return id
+}
+
+export func ast_arm(a: *Ast, pat: int64, is_block: bool, body: int64) -> int64 {
+    v: *Vector<ArmNode> = (*a).arms
+    id: int64 = vec_len(v)
+    vec_push(v, ArmNode { pat: pat, is_block: is_block, body: body })
+    return id
+}
+
+export func ast_block(a: *Ast, ids: *Vector<int64>) -> int64 {
+    off, len := ast_kids(a, ids)
+    v: *Vector<BlockNode> = (*a).blocks
+    id: int64 = vec_len(v)
+    vec_push(v, BlockNode { off: off, len: len })
+    return id
+}
+
+export func ast_field(a: *Ast, name: int64, ty: int64) -> int64 {
+    v: *Vector<FieldNode> = (*a).fields
+    id: int64 = vec_len(v)
+    vec_push(v, FieldNode { name: name, ty: ty })
+    return id
+}
+
+export func ast_attr(a: *Ast, key: int64, val: int64) -> int64 {
+    v: *Vector<AttrNode> = (*a).attrs
+    id: int64 = vec_len(v)
+    vec_push(v, AttrNode { key: key, val: val })
+    return id
+}
+
+export func ast_import(a: *Ast, n: ImportNode) -> void {
+    vec_push((*a).imports, n)
+}
+
+export func ast_record(a: *Ast, n: RecordNode) -> int64 {
+    v: *Vector<RecordNode> = (*a).records
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_variant(a: *Ast, n: VariantNode) -> int64 {
+    v: *Vector<VariantNode> = (*a).variants
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_sum(a: *Ast, n: SumNode) -> int64 {
+    v: *Vector<SumNode> = (*a).sums
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_clause_sig(a: *Ast, n: ClauseSigNode) -> int64 {
+    v: *Vector<ClauseSigNode> = (*a).clause_sigs
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_prov(a: *Ast, n: ProvNode) -> int64 {
+    v: *Vector<ProvNode> = (*a).provs
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_vow(a: *Ast, n: VowNode) -> int64 {
+    v: *Vector<VowNode> = (*a).vows
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_pledge(a: *Ast, n: PledgeNode) -> int64 {
+    v: *Vector<PledgeNode> = (*a).pledges
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_clause(a: *Ast, n: ClauseNode) -> int64 {
+    v: *Vector<ClauseNode> = (*a).clauses
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_sub(a: *Ast, n: SubNode) -> int64 {
+    v: *Vector<SubNode> = (*a).subs
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_req(a: *Ast, kind: int64, x: int64, y: int64) -> int64 {
+    v: *Vector<ReqNode> = (*a).reqs
+    id: int64 = vec_len(v)
+    vec_push(v, ReqNode { kind: kind, a: x, b: y })
+    return id
+}
+
+export func ast_reqblock(a: *Ast, n: ReqBlockNode) -> int64 {
+    v: *Vector<ReqBlockNode> = (*a).reqblocks
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_inc(a: *Ast, n: IncNode) -> int64 {
+    v: *Vector<IncNode> = (*a).incs
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_contract(a: *Ast, n: ContractNode) -> int64 {
+    v: *Vector<ContractNode> = (*a).contracts
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_decl(a: *Ast, kind: int64, id: int64) -> void {
+    vec_push((*a).decls, DeclNode { kind: kind, id: id })
+}
+
+export func ast_name(a: *Ast, id: int64) -> string {
+    return intern_get((*a).interner, id)
+}
+
+export func ast_intern(a: *Ast, name: string) -> int64 {
+    return intern_id((*a).interner, name)
+}

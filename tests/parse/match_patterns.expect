@@ -1,0 +1,193 @@
+File {
+    imports: [],
+    decls: [
+        Sum {
+            name: "MathError",
+            variants: [
+                Variant {
+                    name: "DivByZero",
+                    fields: [],
+                },
+                Variant {
+                    name: "Overflow",
+                    fields: [
+                        Field {
+                            name: "detail",
+                            ty: Named("String"),
+                        },
+                    ],
+                },
+            ],
+        },
+        Contract {
+            internal: false,
+            name: "Matcher",
+            attrs: [],
+            members: [
+                Clause {
+                    name: "classify",
+                    params: [
+                        Field {
+                            name: "n",
+                            ty: Named("Int"),
+                        },
+                    ],
+                    ret: Named("String"),
+                    body: Block {
+                        stmts: [
+                            Let {
+                                mutable: false,
+                                name: "word",
+                                ty: None,
+                                value: Match {
+                                    scrutinee: Ident("n"),
+                                    arms: [
+                                        Arm {
+                                            pat: Lit(Int(0)),
+                                            body: Str("zero"),
+                                        },
+                                        Arm {
+                                            pat: Lit(Int(1)),
+                                            body: Block {
+                                                stmts: [
+                                                    Expr(
+                                                        Str("one"),
+                                                    ),
+                                                ],
+                                            },
+                                        },
+                                        Arm {
+                                            pat: Wildcard,
+                                            body: Str("many"),
+                                        },
+                                    ],
+                                },
+                            },
+                            Return(
+                                Ident("word"),
+                            ),
+                        ],
+                    },
+                },
+                Clause {
+                    name: "unwrap",
+                    params: [
+                        Field {
+                            name: "o",
+                            ty: Named("Option", [
+                                Named("Int"),
+                            ]),
+                        },
+                        Field {
+                            name: "r",
+                            ty: Named("Result", [
+                                Named("Int"),
+                                Named("MathError"),
+                            ]),
+                        },
+                    ],
+                    ret: Named("Int"),
+                    body: Block {
+                        stmts: [
+                            Let {
+                                mutable: false,
+                                name: "x",
+                                ty: None,
+                                value: Match {
+                                    scrutinee: Ident("o"),
+                                    arms: [
+                                        Arm {
+                                            pat: Some(
+                                                Bind("v"),
+                                            ),
+                                            body: Ident("v"),
+                                        },
+                                        Arm {
+                                            pat: None,
+                                            body: Int(0),
+                                        },
+                                    ],
+                                },
+                            },
+                            Let {
+                                mutable: false,
+                                name: "y",
+                                ty: None,
+                                value: Match {
+                                    scrutinee: Ident("r"),
+                                    arms: [
+                                        Arm {
+                                            pat: Ok(
+                                                Bind("v"),
+                                            ),
+                                            body: Binary(
+                                                Add,
+                                                Ident("v"),
+                                                Int(1),
+                                            ),
+                                        },
+                                        Arm {
+                                            pat: Err(
+                                                Bind("DivByZero"),
+                                            ),
+                                            body: Unary(
+                                                Neg,
+                                                Int(1),
+                                            ),
+                                        },
+                                        Arm {
+                                            pat: Err(
+                                                Variant("Overflow", [
+                                                    Bind("detail"),
+                                                ]),
+                                            ),
+                                            body: Unary(
+                                                Neg,
+                                                Int(2),
+                                            ),
+                                        },
+                                        Arm {
+                                            pat: Bind("other"),
+                                            body: Int(0),
+                                        },
+                                    ],
+                                },
+                            },
+                            Expr(
+                                Match {
+                                    scrutinee: Ident("x"),
+                                    arms: [
+                                        Arm {
+                                            pat: Lit(Int(0)),
+                                            body: Block {
+                                                stmts: [
+                                                    Return(
+                                                        Ident("y"),
+                                                    ),
+                                                ],
+                                            },
+                                        },
+                                        Arm {
+                                            pat: Wildcard,
+                                            body: Block {
+                                                stmts: [
+                                                    Return(
+                                                        Binary(
+                                                            Add,
+                                                            Ident("x"),
+                                                            Ident("y"),
+                                                        ),
+                                                    ),
+                                                ],
+                                            },
+                                        },
+                                    ],
+                                },
+                            ),
+                        ],
+                    },
+                },
+            ],
+        },
+    ],
+}

@@ -1,0 +1,126 @@
+// parsety: the type grammar. A type is a named form with optional angle
+// bracket arguments, Tuple<..> included since it is spelled as a named type,
+// or the first class pledge type pledge(T, ...) -> R. The lexer never fuses
+// '>>', so nested arguments close one '>' at a time and no token splitting is
+// needed. Shared here too is the parameter list parser, because params,
+// record fields, and variant fields are all the same FieldDecl production.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import token
+@import intern
+@import ast
+@import parse
+
+export func parse_type(p: *Parser) -> int64 {
+    mut ty: int64 = -1
+    if p_enter_nesting(p) {
+        ty = parse_type_inner(p)
+    } else {
+        ty = ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+    }
+    p_leave_nesting(p)
+    return ty
+}
+
+func parse_type_inner(p: *Parser) -> int64 {
+    if p_kw(p, "pledge") {
+        return parse_pledge_type(p)
+    }
+    if p_at(p, k_ident()) {
+        name: int64 = p_ident(p)
+        if p_at(p, k_lt()) {
+            off, len := parse_type_args(p)
+            return ast_type(p_ast(p), tk_named(), name, off, len)
+        }
+        return ast_type(p_ast(p), tk_named(), name, 0, 0)
+    }
+    p_error(p, expected_found(p, "a type"))
+    return ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+}
+
+// The angle bracket argument list of a named type. The brackets count as a
+// group so a long instantiation can wrap across lines.
+func parse_type_args(p: *Parser) -> (int64, int64) {
+    args: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lt(), "'<'")
+    p_group_enter(p)
+    if !p_at(p, k_gt()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_eof(p) {
+                reading = false
+            } else {
+                vec_push(args, parse_type(p))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    p_group_leave(p)
+    p_expect(p, k_gt(), "'>'")
+    return ast_kids(p_ast(p), args)
+}
+
+// pledge "(" [ Type { "," Type } ] ")" "->" Type, the type of a first class
+// pledge value bound to a signed instance.
+func parse_pledge_type(p: *Parser) -> int64 {
+    p_bump(p)
+    params: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lparen(), "'('")
+    p_group_enter(p)
+    if !p_at(p, k_rparen()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_eof(p) {
+                reading = false
+            } else {
+                vec_push(params, parse_type(p))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    mut ret: int64 = -1
+    if p_eat(p, k_arrow()) {
+        ret = parse_type(p)
+    } else {
+        p_error(p, "a pledge type declares its return type with '->'")
+        ret = ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+    }
+    off, len := ast_kids(p_ast(p), params)
+    return ast_type(p_ast(p), tk_pledge(), off, len, ret)
+}
+
+// "(" [ Param { "," Param } ] ")" with Param ::= IDENT ":" Type. Returns the
+// kids slice of field ids. Used by pledges, clauses, and clause signatures.
+export func parse_params(p: *Parser) -> (int64, int64) {
+    ps: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lparen(), "'('")
+    p_group_enter(p)
+    if !p_at(p, k_rparen()) {
+        mut reading: bool = true
+        while reading {
+            if p_at_eof(p) {
+                reading = false
+            } else {
+                name: int64 = p_ident(p)
+                p_expect(p, k_colon(), "':' between the parameter name and its type")
+                ty: int64 = parse_type(p)
+                vec_push(ps, ast_field(p_ast(p), name, ty))
+                if !p_eat(p, k_comma()) {
+                    reading = false
+                }
+            }
+        }
+    }
+    p_group_leave(p)
+    p_expect(p, k_rparen(), "')'")
+    return ast_kids(p_ast(p), ps)
+}

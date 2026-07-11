@@ -1,0 +1,340 @@
+File {
+    imports: [],
+    decls: [
+        Contract {
+            internal: false,
+            name: "Calc",
+            attrs: [],
+            members: [
+                Pledge {
+                    name: "run",
+                    params: [
+                        Field {
+                            name: "args",
+                            ty: Named("List", [
+                                Named("String"),
+                            ]),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("Int"),
+                        Named("MathError"),
+                    ]),
+                    attrs: [],
+                    body: Block {
+                        stmts: [
+                            Let {
+                                mutable: false,
+                                name: "a",
+                                ty: None,
+                                value: Binary(
+                                    Sub,
+                                    Binary(
+                                        Add,
+                                        Int(1),
+                                        Binary(
+                                            Mul,
+                                            Int(2),
+                                            Int(3),
+                                        ),
+                                    ),
+                                    Binary(
+                                        Mod,
+                                        Binary(
+                                            Div,
+                                            Int(4),
+                                            Int(5),
+                                        ),
+                                        Int(6),
+                                    ),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "b",
+                                ty: None,
+                                value: Binary(
+                                    Add,
+                                    Unary(
+                                        Neg,
+                                        Ident("a"),
+                                    ),
+                                    Int(2),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "c",
+                                ty: None,
+                                value: Binary(
+                                    Eq,
+                                    Unary(
+                                        Not,
+                                        Bool(true),
+                                    ),
+                                    Bool(false),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "d",
+                                ty: None,
+                                value: Binary(
+                                    Or,
+                                    Binary(
+                                        And,
+                                        Binary(
+                                            Lt,
+                                            Ident("a"),
+                                            Int(3),
+                                        ),
+                                        Binary(
+                                            Ge,
+                                            Ident("b"),
+                                            Int(1),
+                                        ),
+                                    ),
+                                    Unary(
+                                        Not,
+                                        Binary(
+                                            Ne,
+                                            Ident("c"),
+                                            Bool(true),
+                                        ),
+                                    ),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "e",
+                                ty: None,
+                                value: Binary(
+                                    Mul,
+                                    Binary(
+                                        Add,
+                                        Int(1),
+                                        Int(2),
+                                    ),
+                                    Int(3),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "t",
+                                ty: None,
+                                value: Tuple([
+                                    Int(1),
+                                    Str("two"),
+                                    Float("3.5"),
+                                ]),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "l",
+                                ty: None,
+                                value: List([
+                                    Int(1),
+                                    Int(2),
+                                    Int(3),
+                                ]),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "empty",
+                                ty: None,
+                                value: List([]),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "m",
+                                ty: None,
+                                value: Mut(
+                                    Ident("a"),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "q",
+                                ty: None,
+                                value: Some(
+                                    Binary(
+                                        Add,
+                                        Ident("a"),
+                                        Int(1),
+                                    ),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "r",
+                                ty: None,
+                                value: None,
+                            },
+                            Let {
+                                mutable: false,
+                                name: "s",
+                                ty: None,
+                                value: Ok(
+                                    Str("fine"),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "u",
+                                ty: None,
+                                value: Err(
+                                    Ident("overflow"),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "pt",
+                                ty: None,
+                                value: RecordLit {
+                                    name: "Point",
+                                    fields: [
+                                        FieldInit {
+                                            name: "x",
+                                            expr: Int(1),
+                                        },
+                                        FieldInit {
+                                            name: "y",
+                                            expr: Int(2),
+                                        },
+                                    ],
+                                },
+                            },
+                            Let {
+                                mutable: false,
+                                name: "box",
+                                ty: None,
+                                value: RecordLit {
+                                    name: "Rect",
+                                    fields: [
+                                        FieldInit {
+                                            name: "corner",
+                                            expr: RecordLit {
+                                                name: "Point",
+                                                fields: [
+                                                    FieldInit {
+                                                        name: "x",
+                                                        expr: Int(0),
+                                                    },
+                                                    FieldInit {
+                                                        name: "y",
+                                                        expr: Int(0),
+                                                    },
+                                                ],
+                                            },
+                                        },
+                                        FieldInit {
+                                            name: "wide",
+                                            expr: Bool(true),
+                                        },
+                                    ],
+                                },
+                            },
+                            Let {
+                                mutable: false,
+                                name: "inst",
+                                ty: None,
+                                value: Call {
+                                    callee: Member(
+                                        Ident("Calc"),
+                                        "sign",
+                                    ),
+                                    args: [
+                                        Arg {
+                                            label: "precision",
+                                            expr: Int(2),
+                                        },
+                                        Arg {
+                                            label: "mode",
+                                            expr: Str("fast"),
+                                        },
+                                    ],
+                                },
+                            },
+                            Let {
+                                mutable: false,
+                                name: "handle",
+                                ty: None,
+                                value: Member(
+                                    Ident("inst"),
+                                    "run",
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "deep",
+                                ty: None,
+                                value: Member(
+                                    Question(
+                                        Call {
+                                            callee: Member(
+                                                Index(
+                                                    Index(
+                                                        Ident("grid"),
+                                                        Int(1),
+                                                    ),
+                                                    Int(2),
+                                                ),
+                                                "cell",
+                                            ),
+                                            args: [
+                                                Arg {
+                                                    label: None,
+                                                    expr: Int(3),
+                                                },
+                                            ],
+                                        },
+                                    ),
+                                    "value",
+                                ),
+                            },
+                            Let {
+                                mutable: false,
+                                name: "torn",
+                                ty: None,
+                                value: Call {
+                                    callee: Member(
+                                        Ident("payment"),
+                                        "break",
+                                    ),
+                                    args: [],
+                                },
+                            },
+                            Let {
+                                mutable: false,
+                                name: "wrapped",
+                                ty: None,
+                                value: Call {
+                                    callee: Ident("combine"),
+                                    args: [
+                                        Arg {
+                                            label: None,
+                                            expr: Int(1),
+                                        },
+                                        Arg {
+                                            label: None,
+                                            expr: Binary(
+                                                Add,
+                                                Int(2),
+                                                Int(3),
+                                            ),
+                                        },
+                                    ],
+                                },
+                            },
+                            Return(
+                                Ok(
+                                    Ident("a"),
+                                ),
+                            ),
+                        ],
+                    },
+                },
+            ],
+        },
+    ],
+}

@@ -1,0 +1,645 @@
+// astdumpexpr: the dump renderers for the body grammar: types, expressions,
+// patterns, statements, and blocks. The format is the byte stable golden form
+// tests/parse diffs: four space indentation, one field or element per line,
+// trailing commas, and a leaf literal on a single line. String payloads were
+// canonicalized at intern time, so equal programs dump to equal bytes however
+// their literals were spelled. The declaration renderers in astdump build on
+// the exports here.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import ast
+
+func ind(out: *StringBuilder, n: int64) -> void {
+    mut i: int64 = 0
+    while i < n {
+        sb_push(out, "    ")
+        i = i + 1
+    }
+}
+
+func push_string(out: *StringBuilder, s: string) -> void {
+    sb_push_char(out, 34)
+    sb_push(out, s)
+    sb_push_char(out, 34)
+}
+
+func push_bool(out: *StringBuilder, b: bool) -> void {
+    if b {
+        sb_push(out, "true")
+    } else {
+        sb_push(out, "false")
+    }
+}
+
+// The lowercase minimal hex digits of v, the digits inside a \u{...} escape.
+func push_hex_min(out: *StringBuilder, v: int64) -> void {
+    if v == 0 {
+        sb_push_char(out, 48)
+        return
+    }
+    mut nib: int64 = 0
+    mut t: int64 = v
+    while t > 0 {
+        t = t / 16
+        nib = nib + 1
+    }
+    mut i: int64 = nib - 1
+    while i >= 0 {
+        d: int64 = (v >> (4 * i)) & 15
+        mut ch: int64 = 48 + d
+        if d >= 10 {
+            ch = 87 + d
+        }
+        sb_push_char(out, ch)
+        i = i - 1
+    }
+}
+
+// One scalar in the canonical char form: printable ASCII raw, the quote and
+// the backslash escaped, everything else as a \u{hex} escape, the same shape
+// the lex dump prints so the two dumps never disagree about a character.
+func push_char_scalar(out: *StringBuilder, cp: int64) -> void {
+    if cp == 92 {
+        sb_push(out, "\\\\")
+        return
+    }
+    if cp == 39 {
+        sb_push(out, "\\'")
+        return
+    }
+    if cp >= 32 {
+        if cp <= 126 {
+            sb_push_char(out, cp)
+            return
+        }
+    }
+    sb_push(out, "\\u{")
+    push_hex_min(out, cp)
+    sb_push_char(out, 125)
+}
+
+export func render_type(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    t: TypeNode = vec_get((*a).types, id)
+    if t.kind == tk_named() {
+        sb_push(out, "Named(")
+        push_string(out, ast_name(a, t.a))
+        if t.c > 0 {
+            sb_push(out, ", [\n")
+            mut i: int64 = 0
+            while i < t.c {
+                ind(out, level + 1)
+                render_type(out, a, vec_get((*a).kids, t.b + i), level + 1)
+                sb_push(out, ",\n")
+                i = i + 1
+            }
+            ind(out, level)
+            sb_push_char(out, 93)
+        }
+        sb_push_char(out, 41)
+        return
+    }
+    sb_push(out, "PledgeType {\n")
+    ind(out, level + 1)
+    sb_push(out, "params: ")
+    render_type_list(out, a, t.a, t.b, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "ret: ")
+    render_type(out, a, t.c, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+export func render_type_list(out: *StringBuilder, a: *Ast, off: int64, len: int64, level: int64) -> void {
+    if len == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < len {
+        ind(out, level + 1)
+        render_type(out, a, vec_get((*a).kids, off + i), level + 1)
+        sb_push(out, ",\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+func uop_name(op: int64) -> string {
+    if op == uop_neg() {
+        return "Neg"
+    }
+    return "Not"
+}
+
+func bop_name(op: int64) -> string {
+    if op == bop_add() { return "Add" }
+    if op == bop_sub() { return "Sub" }
+    if op == bop_mul() { return "Mul" }
+    if op == bop_div() { return "Div" }
+    if op == bop_mod() { return "Mod" }
+    if op == bop_eq() { return "Eq" }
+    if op == bop_ne() { return "Ne" }
+    if op == bop_lt() { return "Lt" }
+    if op == bop_le() { return "Le" }
+    if op == bop_gt() { return "Gt" }
+    if op == bop_ge() { return "Ge" }
+    if op == bop_and() { return "And" }
+    return "Or"
+}
+
+// A one argument wrapper form: Name(\n <inner>,\n ).
+func open_wrap(out: *StringBuilder, name: string, level: int64) -> void {
+    sb_push(out, name)
+    sb_push(out, "(\n")
+    ind(out, level + 1)
+}
+
+func close_wrap(out: *StringBuilder, level: int64) -> void {
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 41)
+}
+
+export func render_expr(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    e: ExprNode = vec_get((*a).exprs, id)
+    k: int64 = e.kind
+    if k == xk_int() {
+        sb_push(out, "Int(")
+        sb_push_int(out, e.a)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_float() {
+        sb_push(out, "Float(")
+        push_string(out, ast_name(a, e.a))
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_str() {
+        sb_push(out, "Str(")
+        push_string(out, ast_name(a, e.a))
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_char() {
+        sb_push(out, "Char('")
+        push_char_scalar(out, e.a)
+        sb_push(out, "')")
+        return
+    }
+    if k == xk_bool() {
+        sb_push(out, "Bool(")
+        push_bool(out, e.a != 0)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_ident() {
+        sb_push(out, "Ident(")
+        push_string(out, ast_name(a, e.a))
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_none() {
+        sb_push(out, "None")
+        return
+    }
+    if k == xk_unary() {
+        sb_push(out, "Unary(\n")
+        ind(out, level + 1)
+        sb_push(out, uop_name(e.a))
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.b, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_binary() {
+        sb_push(out, "Binary(\n")
+        ind(out, level + 1)
+        sb_push(out, bop_name(e.a))
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.b, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.c, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_call() {
+        render_call(out, a, e, level)
+        return
+    }
+    if k == xk_index() {
+        sb_push(out, "Index(\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.a, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.b, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_member() {
+        sb_push(out, "Member(\n")
+        ind(out, level + 1)
+        render_expr(out, a, e.a, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        push_string(out, ast_name(a, e.b))
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_question() {
+        open_wrap(out, "Question", level)
+        render_expr(out, a, e.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_tuple() {
+        sb_push(out, "Tuple(")
+        render_expr_list(out, a, e.a, e.b, level)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_list() {
+        sb_push(out, "List(")
+        render_expr_list(out, a, e.a, e.b, level)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == xk_record_lit() {
+        render_record_lit(out, a, e, level)
+        return
+    }
+    if k == xk_match() {
+        render_match(out, a, e, level)
+        return
+    }
+    if k == xk_some() {
+        open_wrap(out, "Some", level)
+        render_expr(out, a, e.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_ok() {
+        open_wrap(out, "Ok", level)
+        render_expr(out, a, e.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == xk_err() {
+        open_wrap(out, "Err", level)
+        render_expr(out, a, e.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    open_wrap(out, "Mut", level)
+    render_expr(out, a, e.a, level + 1)
+    close_wrap(out, level)
+}
+
+func render_expr_list(out: *StringBuilder, a: *Ast, off: int64, len: int64, level: int64) -> void {
+    if len == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < len {
+        ind(out, level + 1)
+        render_expr(out, a, vec_get((*a).kids, off + i), level + 1)
+        sb_push(out, ",\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+func render_call(out: *StringBuilder, a: *Ast, e: ExprNode, level: int64) -> void {
+    sb_push(out, "Call {\n")
+    ind(out, level + 1)
+    sb_push(out, "callee: ")
+    render_expr(out, a, e.a, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "args: ")
+    if e.c == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < e.c {
+            arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+            ind(out, level + 2)
+            sb_push(out, "Arg {\n")
+            ind(out, level + 3)
+            sb_push(out, "label: ")
+            if arg.label < 0 {
+                sb_push(out, "None")
+            } else {
+                push_string(out, ast_name(a, arg.label))
+            }
+            sb_push(out, ",\n")
+            ind(out, level + 3)
+            sb_push(out, "expr: ")
+            render_expr(out, a, arg.expr, level + 3)
+            sb_push(out, ",\n")
+            ind(out, level + 2)
+            sb_push(out, "},\n")
+            i = i + 1
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_record_lit(out: *StringBuilder, a: *Ast, e: ExprNode, level: int64) -> void {
+    sb_push(out, "RecordLit {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, e.a))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "fields: ")
+    if e.c == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < e.c {
+            ind(out, level + 2)
+            sb_push(out, "FieldInit {\n")
+            ind(out, level + 3)
+            sb_push(out, "name: ")
+            push_string(out, ast_name(a, vec_get((*a).kids, e.b + i)))
+            sb_push(out, ",\n")
+            ind(out, level + 3)
+            sb_push(out, "expr: ")
+            render_expr(out, a, vec_get((*a).kids, e.b + i + 1), level + 3)
+            sb_push(out, ",\n")
+            ind(out, level + 2)
+            sb_push(out, "},\n")
+            i = i + 2
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_match(out: *StringBuilder, a: *Ast, e: ExprNode, level: int64) -> void {
+    sb_push(out, "Match {\n")
+    ind(out, level + 1)
+    sb_push(out, "scrutinee: ")
+    render_expr(out, a, e.a, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "arms: ")
+    if e.c == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < e.c {
+            arm: ArmNode = vec_get((*a).arms, vec_get((*a).kids, e.b + i))
+            ind(out, level + 2)
+            sb_push(out, "Arm {\n")
+            ind(out, level + 3)
+            sb_push(out, "pat: ")
+            render_pattern(out, a, arm.pat, level + 3)
+            sb_push(out, ",\n")
+            ind(out, level + 3)
+            sb_push(out, "body: ")
+            if arm.is_block {
+                render_block(out, a, arm.body, level + 3)
+            } else {
+                render_expr(out, a, arm.body, level + 3)
+            }
+            sb_push(out, ",\n")
+            ind(out, level + 2)
+            sb_push(out, "},\n")
+            i = i + 1
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_pattern(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    pt: PatternNode = vec_get((*a).patterns, id)
+    k: int64 = pt.kind
+    if k == pk_wildcard() {
+        sb_push(out, "Wildcard")
+        return
+    }
+    if k == pk_lit() {
+        sb_push(out, "Lit(")
+        render_expr(out, a, pt.a, level)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == pk_bind() {
+        sb_push(out, "Bind(")
+        push_string(out, ast_name(a, pt.a))
+        sb_push_char(out, 41)
+        return
+    }
+    if k == pk_none() {
+        sb_push(out, "None")
+        return
+    }
+    if k == pk_some() {
+        open_wrap(out, "Some", level)
+        render_pattern(out, a, pt.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == pk_ok() {
+        open_wrap(out, "Ok", level)
+        render_pattern(out, a, pt.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == pk_err() {
+        open_wrap(out, "Err", level)
+        render_pattern(out, a, pt.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    sb_push(out, "Variant(")
+    push_string(out, ast_name(a, pt.a))
+    sb_push(out, ", [\n")
+    mut i: int64 = 0
+    while i < pt.c {
+        ind(out, level + 1)
+        render_pattern(out, a, vec_get((*a).kids, pt.b + i), level + 1)
+        sb_push(out, ",\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push(out, "])")
+}
+
+export func render_block(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    b: BlockNode = vec_get((*a).blocks, id)
+    sb_push(out, "Block {\n")
+    ind(out, level + 1)
+    sb_push(out, "stmts: ")
+    if b.len == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < b.len {
+            ind(out, level + 2)
+            render_stmt(out, a, vec_get((*a).kids, b.off + i), level + 2)
+            sb_push(out, ",\n")
+            i = i + 1
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_stmt(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    s: StmtNode = vec_get((*a).stmts, id)
+    k: int64 = s.kind
+    if k == sk_let() {
+        render_let(out, a, s, level)
+        return
+    }
+    if k == sk_assign() {
+        sb_push(out, "Assign(\n")
+        ind(out, level + 1)
+        render_expr(out, a, s.a, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        render_expr(out, a, s.b, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == sk_return() {
+        if s.a < 0 {
+            sb_push(out, "Return(None)")
+            return
+        }
+        open_wrap(out, "Return", level)
+        render_expr(out, a, s.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
+    if k == sk_if() {
+        render_if(out, a, s, level)
+        return
+    }
+    if k == sk_while() {
+        sb_push(out, "While {\n")
+        ind(out, level + 1)
+        sb_push(out, "cond: ")
+        render_expr(out, a, s.a, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "body: ")
+        render_block(out, a, s.b, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level)
+        sb_push_char(out, 125)
+        return
+    }
+    if k == sk_for() {
+        sb_push(out, "For {\n")
+        ind(out, level + 1)
+        sb_push(out, "var: ")
+        push_string(out, ast_name(a, s.a))
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "iter: ")
+        render_expr(out, a, s.b, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "body: ")
+        render_block(out, a, s.c, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level)
+        sb_push_char(out, 125)
+        return
+    }
+    if k == sk_break() {
+        sb_push(out, "Break")
+        return
+    }
+    if k == sk_continue() {
+        sb_push(out, "Continue")
+        return
+    }
+    open_wrap(out, "Expr", level)
+    render_expr(out, a, s.a, level + 1)
+    close_wrap(out, level)
+}
+
+func render_let(out: *StringBuilder, a: *Ast, s: StmtNode, level: int64) -> void {
+    sb_push(out, "Let {\n")
+    ind(out, level + 1)
+    sb_push(out, "mutable: ")
+    push_bool(out, (s.d & 1) != 0)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, s.a))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "ty: ")
+    if s.b < 0 {
+        sb_push(out, "None")
+    } else {
+        render_type(out, a, s.b, level + 1)
+    }
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "value: ")
+    render_expr(out, a, s.c, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_if(out: *StringBuilder, a: *Ast, s: StmtNode, level: int64) -> void {
+    sb_push(out, "If {\n")
+    ind(out, level + 1)
+    sb_push(out, "cond: ")
+    render_expr(out, a, s.a, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "then: ")
+    render_block(out, a, s.b, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "els: ")
+    if s.c < 0 {
+        sb_push(out, "None")
+    } else {
+        render_block(out, a, s.c, level + 1)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}

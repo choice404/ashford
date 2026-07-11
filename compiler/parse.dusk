@@ -1,0 +1,413 @@
+// parse: shared parser state and the low level operations the grammar files
+// build on. The grammar entry points live in parseitem, parsety, and
+// parseexpr; this file owns token navigation, diagnostics, the newline
+// discipline, the grouping depth that lets a newline inside parentheses or
+// brackets mean nothing, the nesting ceiling that keeps a hostile input from
+// overflowing the stack, and the literal payload helpers.
+//
+// Diagnostic messages built here are heap strings that are deliberately never
+// freed: a Located borrows its message, and the parser lives exactly as long
+// as the process that prints its errors.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import bytes
+@import escape
+@import token
+@import diag
+@import lexdump
+@import intern
+@import ast
+
+export struct Parser {
+    toks: *Vector<Token>,
+    pos: int64,
+    errors: *Vector<Located>,
+    ast: *Ast,
+    src: string,
+    n: int64,
+    group_depth: int64,
+    depth: int64,
+    hit_depth_limit: bool,
+    no_record: bool,
+}
+
+export func parser_new(toks: *Vector<Token>, src: string, n: int64) -> *Parser {
+    errs: *Vector<Located> = alloc(vec_new())
+    return alloc(Parser {
+        toks: toks,
+        pos: 0,
+        errors: errs,
+        ast: ast_new(),
+        src: src,
+        n: n,
+        group_depth: 0,
+        depth: 0,
+        hit_depth_limit: false,
+        no_record: false,
+    })
+}
+
+export func p_ast(p: *Parser) -> *Ast { return (*p).ast }
+export func p_errors(p: *Parser) -> *Vector<Located> { return (*p).errors }
+
+export func p_tok(p: *Parser) -> Token {
+    toks: *Vector<Token> = (*p).toks
+    return vec_get(toks, (*p).pos)
+}
+
+// The token after the current one, or a synthetic Eof when the stream ends,
+// so a two token lookahead never needs a bounds check at its call site.
+export func p_tok2(p: *Parser) -> Token {
+    toks: *Vector<Token> = (*p).toks
+    if (*p).pos + 1 >= vec_len(toks) {
+        return Token { kind: k_eof(), lo: p_prev_hi(p), hi: p_prev_hi(p), nl_before: false }
+    }
+    return vec_get(toks, (*p).pos + 1)
+}
+
+export func p_kind(p: *Parser) -> int64 { return p_tok(p).kind }
+export func p_kind2(p: *Parser) -> int64 { return p_tok2(p).kind }
+export func p_lo(p: *Parser) -> int64 { return p_tok(p).lo }
+export func p_hi(p: *Parser) -> int64 { return p_tok(p).hi }
+export func p_at(p: *Parser, k: int64) -> bool { return p_kind(p) == k }
+export func p_at_eof(p: *Parser) -> bool { return p_kind(p) == k_eof() }
+
+// The raw newline flag on the current token, consulted where a newline
+// matters regardless of grouping, such as deciding that an attribute list or
+// a pledge body must open on the same line as its header.
+export func p_nl_here(p: *Parser) -> bool { return p_tok(p).nl_before }
+
+// The newline flag as a statement terminator: a newline ends a statement or
+// an expression only outside every open parenthesis and bracket, which is the
+// rule that lets a long signature or argument list wrap freely. A halted
+// parser terminates everything, so the expression loops wind down instead of
+// re-descending to the ceiling they already reported.
+export func p_nl_term(p: *Parser) -> bool {
+    if (*p).hit_depth_limit {
+        return true
+    }
+    if (*p).group_depth > 0 {
+        return false
+    }
+    return p_tok(p).nl_before
+}
+
+export func p_prev_hi(p: *Parser) -> int64 {
+    if (*p).pos > 0 {
+        toks: *Vector<Token> = (*p).toks
+        return vec_get(toks, (*p).pos - 1).hi
+    }
+    return 0
+}
+
+// Records a fault at the current token. After the nesting ceiling has been
+// hit every further diagnostic is noise from the abandoned parse, so it is
+// dropped and the ceiling report stands alone.
+export func p_error(p: *Parser, msg: string) -> void {
+    if (*p).hit_depth_limit {
+        return
+    }
+    vec_push((*p).errors, located(p_lo(p), p_hi(p), msg))
+}
+
+export func p_error_span(p: *Parser, lo: int64, hi: int64, msg: string) -> void {
+    if (*p).hit_depth_limit {
+        return
+    }
+    vec_push((*p).errors, located(lo, hi, msg))
+}
+
+export func p_bump(p: *Parser) -> void {
+    if !p_at_eof(p) {
+        (*p).pos = (*p).pos + 1
+    }
+}
+
+export func p_eat(p: *Parser, k: int64) -> bool {
+    if p_at(p, k) {
+        (*p).pos = (*p).pos + 1
+        return true
+    }
+    return false
+}
+
+// The current token rendered for an "expected x, found y" message: its source
+// text in single quotes, or a fixed name for end of input. A fresh heap
+// string the message builder absorbs.
+export func token_found(p: *Parser) -> string {
+    t: Token = p_tok(p)
+    b: *StringBuilder = alloc(sb_new())
+    if t.kind == k_eof() {
+        sb_push(b, "end of input")
+    } else {
+        sb_push_char(b, 39)
+        s: string = substring_n((*p).src, (*p).n, t.lo, t.hi)
+        sb_push(b, s)
+        free(s)
+        sb_push_char(b, 39)
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// "expected <what>, found <token>" as a heap string that lives as long as the
+// error vector referencing it.
+export func expected_found(p: *Parser, what: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "expected ")
+    sb_push(b, what)
+    sb_push(b, ", found ")
+    found: string = token_found(p)
+    sb_push(b, found)
+    free(found)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Consumes a token of kind k or records "expected <what>" against the token
+// found, without consuming it, so the caller's recovery sees the same stream.
+export func p_expect(p: *Parser, k: int64, what: string) -> bool {
+    if p_eat(p, k) {
+        return true
+    }
+    p_error(p, expected_found(p, what))
+    return false
+}
+
+export func p_kw(p: *Parser, lit: string) -> bool {
+    t: Token = p_tok(p)
+    if t.kind != k_kw() {
+        return false
+    }
+    return str_eq_range((*p).src, t.lo, t.hi, lit)
+}
+
+export func p_kw2(p: *Parser, lit: string) -> bool {
+    t: Token = p_tok2(p)
+    if t.kind != k_kw() {
+        return false
+    }
+    return str_eq_range((*p).src, t.lo, t.hi, lit)
+}
+
+export func p_eat_kw(p: *Parser, lit: string) -> bool {
+    if p_kw(p, lit) {
+        p_bump(p)
+        return true
+    }
+    return false
+}
+
+export func p_expect_kw(p: *Parser, lit: string, what: string) -> bool {
+    if p_eat_kw(p, lit) {
+        return true
+    }
+    p_error(p, expected_found(p, what))
+    return false
+}
+
+// Whether the current token is an ordinary identifier spelling lit, the test
+// behind the contextual keywords fulfill and partial.
+export func p_ident_is(p: *Parser, lit: string) -> bool {
+    t: Token = p_tok(p)
+    if t.kind != k_ident() {
+        return false
+    }
+    return str_eq_range((*p).src, t.lo, t.hi, lit)
+}
+
+export func p_ident(p: *Parser) -> int64 {
+    t: Token = p_tok(p)
+    if t.kind == k_ident() {
+        id: int64 = intern_range((*(*p).ast).interner, (*p).src, (*p).n, t.lo, t.hi)
+        p_bump(p)
+        return id
+    }
+    p_error(p, expected_found(p, "an identifier"))
+    return intern_id((*(*p).ast).interner, "")
+}
+
+// A member name after a dot. The grammar accepts any keyword here, which is
+// the carve out that lets payment.break() parse while break stays a hard
+// keyword for loop control; true and false ride along since they are keywords
+// that happen to carry their own token kind.
+export func p_member_name(p: *Parser) -> int64 {
+    t: Token = p_tok(p)
+    mut ok: bool = false
+    if t.kind == k_ident() { ok = true }
+    if t.kind == k_kw() { ok = true }
+    if t.kind == k_bool() { ok = true }
+    if ok {
+        id: int64 = intern_range((*(*p).ast).interner, (*p).src, (*p).n, t.lo, t.hi)
+        p_bump(p)
+        return id
+    }
+    p_error(p, expected_found(p, "a member name after '.'"))
+    return intern_id((*(*p).ast).interner, "")
+}
+
+// The grouping depth. Entered on every parenthesis and bracket opened by the
+// expression and signature grammar, so a newline inside them stops acting as
+// a terminator.
+export func p_group_enter(p: *Parser) -> void {
+    (*p).group_depth = (*p).group_depth + 1
+}
+
+export func p_group_leave(p: *Parser) -> void {
+    if (*p).group_depth > 0 {
+        (*p).group_depth = (*p).group_depth - 1
+    }
+}
+
+// Braces reset the grouping depth: a block or a match body inside an argument
+// list contains statements and arms again, and their newlines terminate. The
+// caller saves the depth on the way in and restores it on the way out.
+export func p_brace_save(p: *Parser) -> int64 {
+    d: int64 = (*p).group_depth
+    (*p).group_depth = 0
+    return d
+}
+
+export func p_brace_restore(p: *Parser, d: int64) -> void {
+    (*p).group_depth = d
+}
+
+// The nesting ceiling. Recursive entry points call this on the way in; a
+// false return means the ceiling was hit, one diagnostic was recorded, and
+// the caller must produce a placeholder without recursing. The flag also
+// silences every later diagnostic, so a pathological input reports the
+// ceiling once and stops rather than flooding.
+export func p_enter_nesting(p: *Parser) -> bool {
+    (*p).depth = (*p).depth + 1
+    if (*p).depth > 500 {
+        if !(*p).hit_depth_limit {
+            vec_push((*p).errors, located(p_lo(p), p_hi(p), "nesting is too deep; the parser stopped here"))
+            (*p).hit_depth_limit = true
+        }
+        return false
+    }
+    return true
+}
+
+export func p_leave_nesting(p: *Parser) -> void {
+    (*p).depth = (*p).depth - 1
+}
+
+// Whether the nesting ceiling has been hit. Every parse loop treats this as
+// end of input: after the one ceiling diagnostic the parser stops cold,
+// because continuing to recover inside an adversarial nest re-descends to the
+// ceiling from every unwound frame and turns the parse quadratic.
+export func p_halted(p: *Parser) -> bool {
+    return (*p).hit_depth_limit
+}
+
+// End of input as the grammar loops see it: the real end, or the halt after
+// the nesting ceiling, which ends every construct at once. p_bump does not
+// consult this, so recovery code that steps a token still terminates.
+export func p_at_end(p: *Parser) -> bool {
+    if (*p).hit_depth_limit {
+        return true
+    }
+    return p_at_eof(p)
+}
+
+// The stall guard for recovery loops: when a whole element parse consumed
+// nothing, report the stuck token once and step over it so the loop always
+// makes progress toward the closing brace or end of input.
+export func p_guard_progress(p: *Parser, before: int64, ctx: string) -> void {
+    if (*p).pos == before {
+        b: *StringBuilder = alloc(sb_new())
+        sb_push(b, ctx)
+        sb_push(b, ": ")
+        found: string = token_found(p)
+        sb_push(b, found)
+        free(found)
+        msg: string = substring(sb_cstr(b), 0, sb_size(b))
+        sb_free(b)
+        free(b)
+        p_error(p, msg)
+        p_bump(p)
+    }
+}
+
+// The statement separator check. After an element that the grammar ends with
+// NL, the next token must open on a new line unless it closes the enclosing
+// block or ends the input. The check consumes nothing; the element parser
+// that follows supplies the recovery.
+export func p_sep(p: *Parser, msg: string) -> void {
+    if p_at_eof(p) {
+        return
+    }
+    if p_at(p, k_rbrace()) {
+        return
+    }
+    if p_nl_term(p) {
+        return
+    }
+    p_error(p, msg)
+}
+
+// Consumes the closing brace of a body, or reports. At end of input the
+// message names the construct left open, the diagnostic an unterminated file
+// actually needs; anywhere else the generic expected form points at the
+// stray token.
+export func p_expect_close(p: *Parser, eof_msg: string) -> void {
+    if p_eat(p, k_rbrace()) {
+        return
+    }
+    if p_at_eof(p) {
+        p_error(p, eof_msg)
+    } else {
+        p_error(p, expected_found(p, "'}'"))
+    }
+}
+
+// The decoded value of an integer token, via the same guarded accumulation
+// the lex dump renders with, so the parser and the dump can never disagree.
+export func p_int_value(p: *Parser, t: Token) -> int64 {
+    return int_value((*p).src, (*p).n, t.lo, t.hi)
+}
+
+// The interned canonical body of a string token: decoded through the shared
+// escape scanner and re-escaped into the dump's canonical form, quotes
+// stripped, so equal strings intern to equal ids however they were spelled.
+export func p_string_body_id(p: *Parser, t: Token) -> int64 {
+    q: string = debug_string((*p).src, (*p).n, t.lo, t.hi)
+    qn: int64 = str_len(q)
+    body: string = substring(q, 1, qn - 1)
+    free(q)
+    return intern_owned((*(*p).ast).interner, body)
+}
+
+// The interned source text of a float token. A float is kept as its spelling
+// so the dump never depends on float formatting.
+export func p_float_text_id(p: *Parser, t: Token) -> int64 {
+    return intern_range((*(*p).ast).interner, (*p).src, (*p).n, t.lo, t.hi)
+}
+
+// The scalar of a char token body starting just after the opening quote. A
+// faulted literal decodes to 0, the same recovery value the lexer dump uses.
+export func p_char_scalar(p: *Parser, bstart: int64) -> int64 {
+    b: int64 = byte_at((*p).src, (*p).n, bstart)
+    if b < 0 { return 0 }
+    if b == 39 { return 0 }
+    if b == 92 {
+        res: Escape = scan_escape((*p).src, (*p).n, bstart + 1)
+        if res.scalar < 0 {
+            return 0
+        }
+        return res.scalar
+    }
+    if b < 128 {
+        return b
+    }
+    d: Decoded = decode_utf8((*p).src, (*p).n, bstart)
+    return d.scalar
+}

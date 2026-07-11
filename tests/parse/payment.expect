@@ -1,0 +1,153 @@
+File {
+    imports: [],
+    decls: [
+        Provisional {
+            internal: false,
+            name: "Loggable",
+            sigs: [
+                ClauseSig {
+                    name: "log",
+                    params: [
+                        Field {
+                            name: "message",
+                            ty: Named("String"),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("Unit"),
+                        Named("LogError"),
+                    ]),
+                },
+            ],
+        },
+        Contract {
+            internal: false,
+            name: "PaymentService",
+            attrs: [],
+            members: [
+                Incorporate("Loggable"),
+                Vow {
+                    name: "currency",
+                    ty: Named("String"),
+                    init: Str("USD"),
+                },
+                Subcontract {
+                    name: "Validation",
+                    pledges: [
+                        Pledge {
+                            name: "validate_card",
+                            params: [
+                                Field {
+                                    name: "card",
+                                    ty: Named("Card"),
+                                },
+                            ],
+                            ret: Named("Result", [
+                                Named("Bool"),
+                                Named("ValidationError"),
+                            ]),
+                            attrs: [],
+                            body: None,
+                        },
+                        Pledge {
+                            name: "validate_amount",
+                            params: [
+                                Field {
+                                    name: "amount",
+                                    ty: Named("Float"),
+                                },
+                            ],
+                            ret: Named("Result", [
+                                Named("Bool"),
+                                Named("ValidationError"),
+                            ]),
+                            attrs: [],
+                            body: None,
+                        },
+                    ],
+                },
+                Subcontract {
+                    name: "Processing",
+                    pledges: [
+                        Pledge {
+                            name: "charge",
+                            params: [
+                                Field {
+                                    name: "card",
+                                    ty: Named("Card"),
+                                },
+                                Field {
+                                    name: "amount",
+                                    ty: Named("Float"),
+                                },
+                            ],
+                            ret: Named("Result", [
+                                Named("Receipt"),
+                                Named("PaymentError"),
+                            ]),
+                            attrs: [],
+                            body: None,
+                        },
+                    ],
+                },
+                Pledge {
+                    name: "notify_user",
+                    params: [
+                        Field {
+                            name: "receipt",
+                            ty: Named("Receipt"),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("Unit"),
+                        Named("NotifyError"),
+                    ]),
+                    attrs: [],
+                    body: None,
+                },
+                Requirements {
+                    fulfill: And(
+                        And(
+                            Atom("Validation"),
+                            Atom("Processing"),
+                        ),
+                        Atom("notify_user"),
+                    ),
+                    partial: Or(
+                        Atom("Validation"),
+                        Atom("Processing"),
+                    ),
+                    break: And(
+                        And(
+                            Not(
+                                Atom("Validation"),
+                            ),
+                            Not(
+                                Atom("Processing"),
+                            ),
+                        ),
+                        Not(
+                            Atom("notify_user"),
+                        ),
+                    ),
+                },
+                Clause {
+                    name: "log",
+                    params: [
+                        Field {
+                            name: "message",
+                            ty: Named("String"),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("Unit"),
+                        Named("LogError"),
+                    ]),
+                    body: Block {
+                        stmts: [],
+                    },
+                },
+            ],
+        },
+    ],
+}

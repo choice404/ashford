@@ -1,0 +1,155 @@
+File {
+    imports: [
+        Import("ashstd.math"),
+    ],
+    decls: [
+        Contract {
+            internal: false,
+            name: "Meter",
+            attrs: [
+                Attr {
+                    key: "version",
+                    value: Int(2),
+                },
+            ],
+            members: [
+                Vow {
+                    name: "scale",
+                    ty: Named("Float"),
+                    init: None,
+                },
+                Subcontract {
+                    name: None,
+                    pledges: [
+                        Pledge {
+                            name: "tick",
+                            params: [
+                                Field {
+                                    name: "count",
+                                    ty: Named("Int"),
+                                },
+                            ],
+                            ret: Named("Result", [
+                                Named("Unit"),
+                                Named("MeterError"),
+                            ]),
+                            attrs: [],
+                            body: None,
+                        },
+                    ],
+                },
+                Pledge {
+                    name: "read",
+                    params: [],
+                    ret: Named("Result", [
+                        Named("Float"),
+                        Named("MeterError"),
+                    ]),
+                    attrs: [
+                        Attr {
+                            key: "abi",
+                            value: Str("c"),
+                        },
+                        Attr {
+                            key: "symbol",
+                            value: Str("meter_read"),
+                        },
+                    ],
+                    body: None,
+                },
+                Pledge {
+                    name: "helper",
+                    params: [
+                        Field {
+                            name: "x",
+                            ty: Named("Int"),
+                        },
+                    ],
+                    ret: Named("Option", [
+                        Named("Int"),
+                    ]),
+                    attrs: [],
+                    body: Block {
+                        stmts: [
+                            Let {
+                                mutable: false,
+                                name: "v",
+                                ty: None,
+                                value: Question(
+                                    Call {
+                                        callee: Member(
+                                            Ident("math"),
+                                            "clamp",
+                                        ),
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                expr: Ident("x"),
+                                            },
+                                            Arg {
+                                                label: None,
+                                                expr: Int(0),
+                                            },
+                                            Arg {
+                                                label: None,
+                                                expr: Int(10),
+                                            },
+                                        ],
+                                    },
+                                ),
+                            },
+                            Return(
+                                Some(
+                                    Ident("v"),
+                                ),
+                            ),
+                        ],
+                    },
+                },
+                Requirements {
+                    fulfill: And(
+                        Atom("read"),
+                        Atom("helper"),
+                    ),
+                    partial: Or(
+                        Atom("read"),
+                        And(
+                            Atom("helper"),
+                            Not(
+                                Atom("read"),
+                            ),
+                        ),
+                    ),
+                    break: None,
+                },
+            ],
+        },
+        Contract {
+            internal: true,
+            name: "Scratch",
+            attrs: [],
+            members: [
+                Pledge {
+                    name: "poke",
+                    params: [],
+                    ret: Named("Unit"),
+                    attrs: [],
+                    body: None,
+                },
+            ],
+        },
+        Sum {
+            name: "MeterError",
+            variants: [
+                Variant {
+                    name: "Cold",
+                    fields: [],
+                },
+                Variant {
+                    name: "Hot",
+                    fields: [],
+                },
+            ],
+        },
+    ],
+}

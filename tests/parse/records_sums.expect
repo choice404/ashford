@@ -1,0 +1,144 @@
+File {
+    imports: [],
+    decls: [
+        Record {
+            name: "Card",
+            fields: [
+                Field {
+                    name: "number",
+                    ty: Named("String"),
+                },
+                Field {
+                    name: "expiry",
+                    ty: Named("String"),
+                },
+            ],
+        },
+        Record {
+            name: "Point",
+            fields: [
+                Field {
+                    name: "x",
+                    ty: Named("Int"),
+                },
+                Field {
+                    name: "y",
+                    ty: Named("Int"),
+                },
+            ],
+        },
+        Sum {
+            name: "LogLevel",
+            variants: [
+                Variant {
+                    name: "Debug",
+                    fields: [],
+                },
+                Variant {
+                    name: "Info",
+                    fields: [],
+                },
+                Variant {
+                    name: "Error",
+                    fields: [],
+                },
+            ],
+        },
+        Sum {
+            name: "MathError",
+            variants: [
+                Variant {
+                    name: "DivByZero",
+                    fields: [],
+                },
+                Variant {
+                    name: "Overflow",
+                    fields: [
+                        Field {
+                            name: "detail",
+                            ty: Named("String"),
+                        },
+                    ],
+                },
+            ],
+        },
+        Sum {
+            name: "Shape",
+            variants: [
+                Variant {
+                    name: "Circle",
+                    fields: [
+                        Field {
+                            name: "radius",
+                            ty: Named("Float"),
+                        },
+                    ],
+                },
+                Variant {
+                    name: "Rect",
+                    fields: [
+                        Field {
+                            name: "w",
+                            ty: Named("Float"),
+                        },
+                        Field {
+                            name: "h",
+                            ty: Named("Float"),
+                        },
+                    ],
+                },
+            ],
+        },
+        Record {
+            name: "Holder",
+            fields: [
+                Field {
+                    name: "cards",
+                    ty: Named("List", [
+                        Named("Card"),
+                    ]),
+                },
+                Field {
+                    name: "lookup",
+                    ty: Named("Map", [
+                        Named("String"),
+                        Named("Int"),
+                    ]),
+                },
+                Field {
+                    name: "maybe",
+                    ty: Named("Option", [
+                        Named("Card"),
+                    ]),
+                },
+                Field {
+                    name: "outcome",
+                    ty: Named("Result", [
+                        Named("Card"),
+                        Named("MathError"),
+                    ]),
+                },
+                Field {
+                    name: "pair",
+                    ty: Named("Tuple", [
+                        Named("Int"),
+                        Named("String"),
+                    ]),
+                },
+                Field {
+                    name: "hook",
+                    ty: PledgeType {
+                        params: [
+                            Named("Int"),
+                            Named("String"),
+                        ],
+                        ret: Named("Result", [
+                            Named("Unit"),
+                            Named("MathError"),
+                        ]),
+                    },
+                },
+            ],
+        },
+    ],
+}

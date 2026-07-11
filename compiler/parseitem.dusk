@@ -1,0 +1,625 @@
+// parseitem: the file and declaration grammar. A file is imports first, then
+// top level declarations: records, sum declarations, provisional clauses, and
+// contracts, each terminated by a newline. Contract members are dispatched on
+// their leading hard keyword and collected in source order as (kind, id)
+// pairs. The requirements block carries its own tiny boolean grammar over
+// atoms, and fulfill and partial are contextual labels while break is the
+// hard keyword doing double duty.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import bytes
+@import token
+@import intern
+@import ast
+@import parse
+@import parsety
+@import parseexpr
+
+// The whole file. Imports must come first; one that appears after a
+// declaration is reported and still recorded, so the rest of the file parses
+// against the names it was written against.
+export func parse_file(p: *Parser) -> *Ast {
+    mut reading: bool = true
+    while reading {
+        if p_kw(p, "import") {
+            parse_import(p)
+            p_sep(p, "expected a newline after the import")
+        } else {
+            reading = false
+        }
+    }
+    mut more: bool = true
+    while more {
+        if p_at_end(p) {
+            more = false
+        } else {
+            before: int64 = (*p).pos
+            parse_decl(p)
+            p_sep(p, "expected a newline after the declaration")
+            p_guard_progress(p, before, "expected a declaration at the top level")
+        }
+    }
+    return p_ast(p)
+}
+
+// import IDENT { "." IDENT }, the dotted module path interned as one string.
+func parse_import(p: *Parser) -> void {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    b: *StringBuilder = alloc(sb_new())
+    first: int64 = p_ident(p)
+    sb_push(b, ast_name(p_ast(p), first))
+    mut reading: bool = true
+    while reading {
+        if p_eat(p, k_dot()) {
+            sb_push_char(b, 46)
+            part: int64 = p_ident(p)
+            sb_push(b, ast_name(p_ast(p), part))
+        } else {
+            reading = false
+        }
+    }
+    s: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    path: int64 = intern_owned((*p_ast(p)).interner, s)
+    ast_import(p_ast(p), ImportNode { path: path, lo: lo, hi: p_prev_hi(p) })
+}
+
+func parse_decl(p: *Parser) -> void {
+    if p_kw(p, "import") {
+        p_error(p, "imports must appear before every declaration")
+        parse_import(p)
+        return
+    }
+    if p_kw(p, "record") {
+        id: int64 = parse_record(p)
+        ast_decl(p_ast(p), dk_record(), id)
+        return
+    }
+    if p_kw(p, "internal") {
+        p_bump(p)
+        if p_kw(p, "provisional") {
+            id2: int64 = parse_prov(p, true)
+            ast_decl(p_ast(p), dk_prov(), id2)
+        } else if p_kw(p, "contract") {
+            id3: int64 = parse_contract(p, true)
+            ast_decl(p_ast(p), dk_contract(), id3)
+        } else {
+            p_error(p, "'internal' applies to a contract or a provisional clause")
+        }
+        return
+    }
+    if p_kw(p, "provisional") {
+        id4: int64 = parse_prov(p, false)
+        ast_decl(p_ast(p), dk_prov(), id4)
+        return
+    }
+    if p_kw(p, "contract") {
+        id5: int64 = parse_contract(p, false)
+        ast_decl(p_ast(p), dk_contract(), id5)
+        return
+    }
+    if p_at(p, k_ident()) {
+        if p_kw2(p, "is") {
+            id6: int64 = parse_sum(p)
+            ast_decl(p_ast(p), dk_sum(), id6)
+            return
+        }
+    }
+    p_error(p, expected_found(p, "a declaration"))
+    p_bump(p)
+}
+
+// record IDENT "{" NL { FieldDecl NL } "}".
+func parse_record(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    fields: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the record body")
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            fname: int64 = p_ident(p)
+            p_expect(p, k_colon(), "':' between the field name and its type")
+            ty: int64 = parse_type(p)
+            vec_push(fields, ast_field(p_ast(p), fname, ty))
+            p_sep(p, "expected a newline after the record field")
+            p_guard_progress(p, before, "expected a field in the record body")
+        }
+    }
+    p_expect_close(p, "the record body is not closed; expected '}' before end of input")
+    off, len := ast_kids(p_ast(p), fields)
+    return ast_record(p_ast(p), RecordNode { name: name, lo: lo, hi: hi, fields_off: off, fields_len: len })
+}
+
+// IDENT "is" "either" Variant { "or" Variant }. The chain of variants stays
+// on one logical line; an 'or' opening a new line belongs to nothing, since
+// the newline already terminated the declaration.
+func parse_sum(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    name: int64 = p_ident(p)
+    p_bump(p)
+    p_expect_kw(p, "either", "'either' after 'is'")
+    vars: *Vector<int64> = alloc(vec_new())
+    vec_push(vars, parse_variant(p))
+    mut reading: bool = true
+    while reading {
+        if p_kw(p, "or") {
+            if p_nl_term(p) {
+                reading = false
+            } else {
+                p_bump(p)
+                vec_push(vars, parse_variant(p))
+            }
+        } else {
+            reading = false
+        }
+    }
+    off, len := ast_kids(p_ast(p), vars)
+    return ast_sum(p_ast(p), SumNode { name: name, lo: lo, hi: p_prev_hi(p), variants_off: off, variants_len: len })
+}
+
+// Variant ::= IDENT [ "(" FieldDecl { "," FieldDecl } ")" ].
+func parse_variant(p: *Parser) -> int64 {
+    name: int64 = p_ident(p)
+    fields: *Vector<int64> = alloc(vec_new())
+    if p_at(p, k_lparen()) {
+        if !p_nl_term(p) {
+            p_bump(p)
+            p_group_enter(p)
+            mut reading: bool = true
+            while reading {
+                if p_at(p, k_rparen()) {
+                    reading = false
+                } else if p_at_end(p) {
+                    reading = false
+                } else {
+                    fname: int64 = p_ident(p)
+                    p_expect(p, k_colon(), "':' between the field name and its type")
+                    ty: int64 = parse_type(p)
+                    vec_push(fields, ast_field(p_ast(p), fname, ty))
+                    if !p_eat(p, k_comma()) {
+                        reading = false
+                    }
+                }
+            }
+            p_group_leave(p)
+            p_expect(p, k_rparen(), "')'")
+        }
+    }
+    off, len := ast_kids(p_ast(p), fields)
+    return ast_variant(p_ast(p), VariantNode { name: name, fields_off: off, fields_len: len })
+}
+
+// [ internal ] provisional clause IDENT "{" NL { ClauseSig NL } "}" with
+// ClauseSig ::= clause IDENT "(" [ Params ] ")" "->" Type. Signatures only;
+// a body here belongs to the incorporating contract.
+func parse_prov(p: *Parser, internal: bool) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    p_expect_kw(p, "clause", "'clause' after 'provisional'")
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    sigs: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the provisional clause body")
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            if p_eat_kw(p, "clause") {
+                sname: int64 = p_ident(p)
+                poff, plen := parse_params(p)
+                mut ret: int64 = -1
+                if p_eat(p, k_arrow()) {
+                    ret = parse_type(p)
+                } else {
+                    p_error(p, "a clause signature declares its return type with '->'")
+                    ret = ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+                }
+                vec_push(sigs, ast_clause_sig(p_ast(p), ClauseSigNode { name: sname, params_off: poff, params_len: plen, ret: ret }))
+                p_sep(p, "expected a newline after the clause signature")
+            } else {
+                p_error(p, "expected a 'clause' signature inside the provisional clause")
+            }
+            p_guard_progress(p, before, "unexpected token in the provisional clause")
+        }
+    }
+    p_expect_close(p, "the provisional clause body is not closed; expected '}' before end of input")
+    off, len := ast_kids(p_ast(p), sigs)
+    return ast_prov(p_ast(p), ProvNode { internal: internal, name: name, lo: lo, hi: hi, sigs_off: off, sigs_len: len })
+}
+
+// [ internal ] contract IDENT [ Attrs ] "{" NL { Member NL } "}".
+func parse_contract(p: *Parser, internal: bool) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    mut aoff: int64 = 0
+    mut alen: int64 = 0
+    if p_at(p, k_lbracket()) {
+        if !p_nl_here(p) {
+            o, l := parse_attrs(p)
+            aoff = o
+            alen = l
+        }
+    }
+    members: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the contract body")
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            parse_member(p, members)
+            p_sep(p, "expected a newline after the contract member")
+            p_guard_progress(p, before, "expected a contract member")
+        }
+    }
+    p_expect_close(p, "the contract body is not closed; expected '}' before end of input")
+    moff, mlen := ast_kids(p_ast(p), members)
+    return ast_contract(p_ast(p), ContractNode {
+        internal: internal, name: name, lo: lo, hi: hi,
+        attrs_off: aoff, attrs_len: alen,
+        members_off: moff, members_len: mlen,
+    })
+}
+
+// One contract member, pushed into the pairs vector as (kind, id).
+func parse_member(p: *Parser, members: *Vector<int64>) -> void {
+    if p_kw(p, "incorporate") {
+        lo: int64 = p_lo(p)
+        p_bump(p)
+        name: int64 = p_ident(p)
+        id: int64 = ast_inc(p_ast(p), IncNode { name: name, lo: lo, hi: p_prev_hi(p) })
+        vec_push(members, mk_incorporate())
+        vec_push(members, id)
+        return
+    }
+    if p_kw(p, "vow") {
+        p_bump(p)
+        name2: int64 = p_ident(p)
+        p_expect(p, k_colon(), "':' between the vow name and its type")
+        ty: int64 = parse_type(p)
+        mut init: int64 = -1
+        if p_eat(p, k_assign()) {
+            init = parse_expr(p)
+        }
+        id2: int64 = ast_vow(p_ast(p), VowNode { name: name2, ty: ty, init: init })
+        vec_push(members, mk_vow())
+        vec_push(members, id2)
+        return
+    }
+    if p_kw(p, "pledge") {
+        id3: int64 = parse_pledge(p)
+        vec_push(members, mk_pledge())
+        vec_push(members, id3)
+        return
+    }
+    if p_kw(p, "clause") {
+        id4: int64 = parse_clause(p)
+        vec_push(members, mk_clause())
+        vec_push(members, id4)
+        return
+    }
+    if p_kw(p, "subcontract") {
+        id5: int64 = parse_subcontract(p)
+        vec_push(members, mk_subcontract())
+        vec_push(members, id5)
+        return
+    }
+    if p_kw(p, "requirements") {
+        id6: int64 = parse_requirements(p)
+        vec_push(members, mk_requirements())
+        vec_push(members, id6)
+        return
+    }
+    p_error(p, expected_found(p, "a contract member"))
+    p_bump(p)
+}
+
+// pledge IDENT "(" [ Params ] ")" "->" Type [ Attrs ] [ Block ]. The body is
+// optional and, like the attribute list, must open on the same line as the
+// signature it belongs to; a brace on a fresh line is the next construct's
+// problem. A missing arrow is reported once and the pledge is kept abstract
+// with a placeholder return, so one mistake does not cascade.
+func parse_pledge(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    poff, plen := parse_params(p)
+    mut ret: int64 = -1
+    if p_eat(p, k_arrow()) {
+        ret = parse_type(p)
+    } else {
+        p_error(p, "a pledge declares its return type with '->'")
+        ret = ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+    }
+    mut aoff: int64 = 0
+    mut alen: int64 = 0
+    if p_at(p, k_lbracket()) {
+        if !p_nl_here(p) {
+            o, l := parse_attrs(p)
+            aoff = o
+            alen = l
+        }
+    }
+    mut body: int64 = -1
+    if p_at(p, k_lbrace()) {
+        if !p_nl_here(p) {
+            body = parse_block(p)
+        }
+    }
+    return ast_pledge(p_ast(p), PledgeNode {
+        name: name, lo: lo, hi: hi,
+        params_off: poff, params_len: plen, ret: ret,
+        attrs_off: aoff, attrs_len: alen, body: body,
+    })
+}
+
+// clause IDENT "(" [ Params ] ")" "->" Type Block. The body is mandatory; a
+// clause is contract internal code, never abstract.
+func parse_clause(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    poff, plen := parse_params(p)
+    mut ret: int64 = -1
+    if p_eat(p, k_arrow()) {
+        ret = parse_type(p)
+    } else {
+        p_error(p, "a clause declares its return type with '->'")
+        ret = ast_type(p_ast(p), tk_named(), ast_intern(p_ast(p), ""), 0, 0)
+    }
+    mut body: int64 = -1
+    if p_at(p, k_lbrace()) {
+        if !p_nl_here(p) {
+            body = parse_block(p)
+        }
+    }
+    if body < 0 {
+        p_error(p, "a clause needs a body block after its return type")
+        empty: *Vector<int64> = alloc(vec_new())
+        body = ast_block(p_ast(p), empty)
+    }
+    return ast_clause(p_ast(p), ClauseNode {
+        name: name, lo: lo, hi: hi,
+        params_off: poff, params_len: plen, ret: ret, body: body,
+    })
+}
+
+// subcontract [ IDENT ] "{" NL { PledgeDecl NL } "}". Only pledges live
+// inside; a nested subcontract is reported and then parsed and discarded, so
+// the diagnostic lands once and the parse resumes after the whole intruder.
+func parse_subcontract(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    mut name: int64 = -1
+    if p_at(p, k_ident()) {
+        name = p_ident(p)
+    }
+    hi: int64 = p_prev_hi(p)
+    pledges: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the subcontract body")
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            if p_kw(p, "pledge") {
+                vec_push(pledges, parse_pledge(p))
+                p_sep(p, "expected a newline after the pledge")
+            } else if p_kw(p, "subcontract") {
+                p_error(p, "a subcontract cannot contain another subcontract")
+                parse_subcontract(p)
+            } else {
+                p_error(p, expected_found(p, "a pledge inside the subcontract"))
+            }
+            p_guard_progress(p, before, "unexpected token in the subcontract")
+        }
+    }
+    p_expect_close(p, "the subcontract body is not closed; expected '}' before end of input")
+    off, len := ast_kids(p_ast(p), pledges)
+    return ast_sub(p_ast(p), SubNode { name: name, lo: lo, hi: hi, pledges_off: off, pledges_len: len })
+}
+
+// Attrs ::= "[" IDENT ":" Literal { "," IDENT ":" Literal } "]". The known
+// keys are fixed by the grammar, so an unknown key is rejected here rather
+// than surviving to confuse the checker.
+func parse_attrs(p: *Parser) -> (int64, int64) {
+    p_bump(p)
+    p_group_enter(p)
+    attrs: *Vector<int64> = alloc(vec_new())
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbracket()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            key: int64 = p_ident(p)
+            if !attr_key_known(p_ast(p), key) {
+                p_error(p, "unknown attribute key; the known keys are version, abi, and symbol")
+            }
+            p_expect(p, k_colon(), "':' between the attribute key and its value")
+            val: int64 = parse_literal_expr(p)
+            if val < 0 {
+                p_error(p, "an attribute value must be a literal")
+                p_bump(p)
+            } else {
+                vec_push(attrs, ast_attr(p_ast(p), key, val))
+            }
+            if !p_eat(p, k_comma()) {
+                reading = false
+            }
+        }
+    }
+    p_group_leave(p)
+    p_expect(p, k_rbracket(), "']'")
+    return ast_kids(p_ast(p), attrs)
+}
+
+func attr_key_known(a: *Ast, key: int64) -> bool {
+    name: string = ast_name(a, key)
+    if str_eq(name, "version") { return true }
+    if str_eq(name, "abi") { return true }
+    if str_eq(name, "symbol") { return true }
+    return false
+}
+
+// requirements "{" NL [ fulfill ":" ReqExpr NL ] [ partial ":" ReqExpr NL ]
+// [ break ":" ReqExpr NL ] "}". fulfill and partial are contextual labels,
+// break is the hard keyword reused. An unknown label consumes its whole line
+// so it is reported exactly once.
+func parse_requirements(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    hi: int64 = p_hi(p)
+    p_bump(p)
+    p_expect(p, k_lbrace(), "'{' to open the requirements block")
+    mut ful: int64 = -1
+    mut par: int64 = -1
+    mut brk: int64 = -1
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            if p_ident_is(p, "fulfill") {
+                p_bump(p)
+                e: int64 = parse_req_line(p)
+                if ful >= 0 {
+                    p_error(p, "duplicate 'fulfill' line in the requirements block")
+                } else {
+                    ful = e
+                }
+            } else if p_ident_is(p, "partial") {
+                p_bump(p)
+                e2: int64 = parse_req_line(p)
+                if par >= 0 {
+                    p_error(p, "duplicate 'partial' line in the requirements block")
+                } else {
+                    par = e2
+                }
+            } else if p_kw(p, "break") {
+                p_bump(p)
+                e3: int64 = parse_req_line(p)
+                if brk >= 0 {
+                    p_error(p, "duplicate 'break' line in the requirements block")
+                } else {
+                    brk = e3
+                }
+            } else {
+                p_error(p, "unknown requirements label; expected 'fulfill', 'partial', or 'break'")
+                p_bump(p)
+                if p_eat(p, k_colon()) {
+                    parse_req_or(p)
+                }
+            }
+            p_guard_progress(p, before, "unexpected token in the requirements block")
+        }
+    }
+    p_expect_close(p, "the requirements block is not closed; expected '}' before end of input")
+    return ast_reqblock(p_ast(p), ReqBlockNode { lo: lo, hi: hi, fulfill: ful, partial: par, brk: brk })
+}
+
+func parse_req_line(p: *Parser) -> int64 {
+    p_expect(p, k_colon(), "':' after the requirements label")
+    e: int64 = parse_req_or(p)
+    p_sep(p, "expected a newline after the requirements line")
+    return e
+}
+
+// ReqExpr ::= ReqOr with '!' binding tighter than '&&', which binds tighter
+// than '||', all over bare atoms and parentheses.
+func parse_req_or(p: *Parser) -> int64 {
+    mut e: int64 = -1
+    if p_enter_nesting(p) {
+        e = parse_req_or_inner(p)
+    } else {
+        e = ast_req(p_ast(p), rk_atom(), ast_intern(p_ast(p), ""), 0)
+    }
+    p_leave_nesting(p)
+    return e
+}
+
+func parse_req_or_inner(p: *Parser) -> int64 {
+    mut lhs: int64 = parse_req_and(p)
+    mut going: bool = true
+    while going {
+        if p_nl_term(p) {
+            going = false
+        } else if p_eat(p, k_or_or()) {
+            rhs: int64 = parse_req_and(p)
+            lhs = ast_req(p_ast(p), rk_or(), lhs, rhs)
+        } else {
+            going = false
+        }
+    }
+    return lhs
+}
+
+func parse_req_and(p: *Parser) -> int64 {
+    mut lhs: int64 = parse_req_not(p)
+    mut going: bool = true
+    while going {
+        if p_nl_term(p) {
+            going = false
+        } else if p_eat(p, k_and_and()) {
+            rhs: int64 = parse_req_not(p)
+            lhs = ast_req(p_ast(p), rk_and(), lhs, rhs)
+        } else {
+            going = false
+        }
+    }
+    return lhs
+}
+
+func parse_req_not(p: *Parser) -> int64 {
+    if p_eat(p, k_bang()) {
+        return ast_req(p_ast(p), rk_not(), parse_req_atom(p), 0)
+    }
+    return parse_req_atom(p)
+}
+
+func parse_req_atom(p: *Parser) -> int64 {
+    if p_at(p, k_lparen()) {
+        p_bump(p)
+        p_group_enter(p)
+        e: int64 = parse_req_or(p)
+        p_group_leave(p)
+        p_expect(p, k_rparen(), "')'")
+        return e
+    }
+    if p_at(p, k_ident()) {
+        return ast_req(p_ast(p), rk_atom(), p_ident(p), 0)
+    }
+    p_error(p, expected_found(p, "a subcontract or pledge name"))
+    p_bump(p)
+    return ast_req(p_ast(p), rk_atom(), ast_intern(p_ast(p), ""), 0)
+}

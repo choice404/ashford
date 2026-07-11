@@ -1,0 +1,53 @@
+File {
+    imports: [],
+    decls: [
+        Sum {
+            name: "GreetError",
+            variants: [
+                Variant {
+                    name: "Empty",
+                    fields: [],
+                },
+            ],
+        },
+        Contract {
+            internal: false,
+            name: "Greeter",
+            attrs: [],
+            members: [
+                Vow {
+                    name: "prefix",
+                    ty: Named("String"),
+                    init: Str("hello, "),
+                },
+                Pledge {
+                    name: "greet",
+                    params: [
+                        Field {
+                            name: "name",
+                            ty: Named("String"),
+                        },
+                    ],
+                    ret: Named("Result", [
+                        Named("String"),
+                        Named("GreetError"),
+                    ]),
+                    attrs: [],
+                    body: Block {
+                        stmts: [
+                            Return(
+                                Ok(
+                                    Binary(
+                                        Add,
+                                        Ident("prefix"),
+                                        Ident("name"),
+                                    ),
+                                ),
+                            ),
+                        ],
+                    },
+                },
+            ],
+        },
+    ],
+}

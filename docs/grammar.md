@@ -145,6 +145,8 @@ MathError is either DivByZero or Overflow(detail: String)
 
 Both get a deterministic C compatible layout, a tag plus a union for sums. Error types are ordinary sums used in the `E` slot of `Result`.
 
+A sum declaration is one statement, so its `or` chain stays on one line; a newline ends the declaration and a leading `or` on the next line is an error.
+
 ## Provisional clauses
 
 ```text
@@ -257,6 +259,8 @@ CtorExpr  ::= "Some" "(" Expr ")" | "None"
 ```
 
 There is no map literal in the first version. Maps are built through `ashstd`.
+
+A record literal is ambiguous where a block can follow, so two rules keep the parse deterministic. A bare record literal is not allowed in the head expression of `if`, `while`, `for`, or `match`; wrap it in parentheses to opt back in. And the `{` of a record literal must sit on the same line as the name, since a line ending before `{` reads as the name alone with the brace opening a block.
 
 ### Calls and contract operations
 

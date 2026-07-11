@@ -1,0 +1,70 @@
+// intern: the append only string interner behind every name in the AST. The id
+// of a string is its first insertion index, and every later lookup of the same
+// text returns that id, so a name comparison anywhere downstream is an integer
+// compare. The parser keeps the interner alive for the whole run, so interned
+// strings are deliberately never freed; the arena owns them until exit.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import bytes
+
+export struct Interner {
+    vals: *Vector<string>,
+    ids: *Map<int64>,
+}
+
+export func intern_new() -> *Interner {
+    vals: *Vector<string> = alloc(vec_new())
+    ids: *Map<int64> = alloc(map_new())
+    return alloc(Interner { vals: vals, ids: ids })
+}
+
+func str_copy(s: string) -> string {
+    return substring(s, 0, str_len(s))
+}
+
+// Interns a borrowed string, copying it only when it is new to the table.
+export func intern_id(i: *Interner, s: string) -> int64 {
+    ids: *Map<int64> = (*i).ids
+    vals: *Vector<string> = (*i).vals
+    if map_has(ids, s) {
+        return unwrap_or(map_get(ids, s), -1)
+    }
+    owned: string = str_copy(s)
+    id: int64 = vec_len(vals)
+    vec_push(vals, owned)
+    map_put(ids, owned, id)
+    return id
+}
+
+// Interns a string the caller already owns; the table takes ownership.
+export func intern_owned(i: *Interner, s: string) -> int64 {
+    ids: *Map<int64> = (*i).ids
+    vals: *Vector<string> = (*i).vals
+    if map_has(ids, s) {
+        return unwrap_or(map_get(ids, s), -1)
+    }
+    id: int64 = vec_len(vals)
+    vec_push(vals, s)
+    map_put(ids, s, id)
+    return id
+}
+
+// Interns the source range src[lo, hi), the form the parser uses for every
+// identifier so the token text is copied out of the source exactly once.
+export func intern_range(i: *Interner, src: string, n: int64, lo: int64, hi: int64) -> int64 {
+    s: string = substring_n(src, n, lo, hi)
+    return intern_owned(i, s)
+}
+
+export func intern_get(i: *Interner, id: int64) -> string {
+    if id < 0 {
+        return ""
+    }
+    vals: *Vector<string> = (*i).vals
+    return vec_get(vals, id)
+}

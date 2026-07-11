@@ -1,0 +1,478 @@
+// astdump: the declaration level of the parse dump and its entry point. The
+// dump walks the file in source order, imports then declarations, and leans
+// on astdumpexpr for every type, expression, and block. The result is the
+// byte stable golden text tests/parse diffs, so the formatting rules here are
+// frozen: change them and every golden regenerates.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import ast
+@import astdumpexpr
+
+func ind(out: *StringBuilder, n: int64) -> void {
+    mut i: int64 = 0
+    while i < n {
+        sb_push(out, "    ")
+        i = i + 1
+    }
+}
+
+func push_string(out: *StringBuilder, s: string) -> void {
+    sb_push_char(out, 34)
+    sb_push(out, s)
+    sb_push_char(out, 34)
+}
+
+func push_bool(out: *StringBuilder, b: bool) -> void {
+    if b {
+        sb_push(out, "true")
+    } else {
+        sb_push(out, "false")
+    }
+}
+
+// The field lists of records, variants, and parameter lists, all the same
+// FieldDecl production and all rendered the same way.
+func render_field_list(out: *StringBuilder, a: *Ast, off: int64, len: int64, level: int64) -> void {
+    if len == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, off + i))
+        ind(out, level + 1)
+        sb_push(out, "Field {\n")
+        ind(out, level + 2)
+        sb_push(out, "name: ")
+        push_string(out, ast_name(a, f.name))
+        sb_push(out, ",\n")
+        ind(out, level + 2)
+        sb_push(out, "ty: ")
+        render_type(out, a, f.ty, level + 2)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "},\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+func render_attr_list(out: *StringBuilder, a: *Ast, off: int64, len: int64, level: int64) -> void {
+    if len == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < len {
+        at: AttrNode = vec_get((*a).attrs, vec_get((*a).kids, off + i))
+        ind(out, level + 1)
+        sb_push(out, "Attr {\n")
+        ind(out, level + 2)
+        sb_push(out, "key: ")
+        push_string(out, ast_name(a, at.key))
+        sb_push(out, ",\n")
+        ind(out, level + 2)
+        sb_push(out, "value: ")
+        render_expr(out, a, at.val, level + 2)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "},\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+func render_record(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    r: RecordNode = vec_get((*a).records, id)
+    sb_push(out, "Record {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, r.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "fields: ")
+    render_field_list(out, a, r.fields_off, r.fields_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_sum(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    s: SumNode = vec_get((*a).sums, id)
+    sb_push(out, "Sum {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, s.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "variants: [\n")
+    mut i: int64 = 0
+    while i < s.variants_len {
+        v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, s.variants_off + i))
+        ind(out, level + 2)
+        sb_push(out, "Variant {\n")
+        ind(out, level + 3)
+        sb_push(out, "name: ")
+        push_string(out, ast_name(a, v.name))
+        sb_push(out, ",\n")
+        ind(out, level + 3)
+        sb_push(out, "fields: ")
+        render_field_list(out, a, v.fields_off, v.fields_len, level + 3)
+        sb_push(out, ",\n")
+        ind(out, level + 2)
+        sb_push(out, "},\n")
+        i = i + 1
+    }
+    ind(out, level + 1)
+    sb_push(out, "],\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_prov(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    pv: ProvNode = vec_get((*a).provs, id)
+    sb_push(out, "Provisional {\n")
+    ind(out, level + 1)
+    sb_push(out, "internal: ")
+    push_bool(out, pv.internal)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, pv.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "sigs: ")
+    if pv.sigs_len == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < pv.sigs_len {
+            sig: ClauseSigNode = vec_get((*a).clause_sigs, vec_get((*a).kids, pv.sigs_off + i))
+            ind(out, level + 2)
+            sb_push(out, "ClauseSig {\n")
+            ind(out, level + 3)
+            sb_push(out, "name: ")
+            push_string(out, ast_name(a, sig.name))
+            sb_push(out, ",\n")
+            ind(out, level + 3)
+            sb_push(out, "params: ")
+            render_field_list(out, a, sig.params_off, sig.params_len, level + 3)
+            sb_push(out, ",\n")
+            ind(out, level + 3)
+            sb_push(out, "ret: ")
+            render_type(out, a, sig.ret, level + 3)
+            sb_push(out, ",\n")
+            ind(out, level + 2)
+            sb_push(out, "},\n")
+            i = i + 1
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_pledge(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    pl: PledgeNode = vec_get((*a).pledges, id)
+    sb_push(out, "Pledge {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, pl.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "params: ")
+    render_field_list(out, a, pl.params_off, pl.params_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "ret: ")
+    render_type(out, a, pl.ret, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "attrs: ")
+    render_attr_list(out, a, pl.attrs_off, pl.attrs_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "body: ")
+    if pl.body < 0 {
+        sb_push(out, "None")
+    } else {
+        render_block(out, a, pl.body, level + 1)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_clause_decl(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    c: ClauseNode = vec_get((*a).clauses, id)
+    sb_push(out, "Clause {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, c.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "params: ")
+    render_field_list(out, a, c.params_off, c.params_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "ret: ")
+    render_type(out, a, c.ret, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "body: ")
+    render_block(out, a, c.body, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_sub(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    s: SubNode = vec_get((*a).subs, id)
+    sb_push(out, "Subcontract {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    if s.name < 0 {
+        sb_push(out, "None")
+    } else {
+        push_string(out, ast_name(a, s.name))
+    }
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "pledges: ")
+    if s.pledges_len == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < s.pledges_len {
+            ind(out, level + 2)
+            render_pledge(out, a, vec_get((*a).kids, s.pledges_off + i), level + 2)
+            sb_push(out, ",\n")
+            i = i + 1
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_req(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    r: ReqNode = vec_get((*a).reqs, id)
+    if r.kind == rk_atom() {
+        sb_push(out, "Atom(")
+        push_string(out, ast_name(a, r.a))
+        sb_push_char(out, 41)
+        return
+    }
+    if r.kind == rk_not() {
+        sb_push(out, "Not(\n")
+        ind(out, level + 1)
+        render_req(out, a, r.a, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level)
+        sb_push_char(out, 41)
+        return
+    }
+    if r.kind == rk_and() {
+        sb_push(out, "And(\n")
+    } else {
+        sb_push(out, "Or(\n")
+    }
+    ind(out, level + 1)
+    render_req(out, a, r.a, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    render_req(out, a, r.b, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 41)
+}
+
+func render_req_slot(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    if id < 0 {
+        sb_push(out, "None")
+    } else {
+        render_req(out, a, id, level)
+    }
+}
+
+func render_reqblock(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    rb: ReqBlockNode = vec_get((*a).reqblocks, id)
+    sb_push(out, "Requirements {\n")
+    ind(out, level + 1)
+    sb_push(out, "fulfill: ")
+    render_req_slot(out, a, rb.fulfill, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "partial: ")
+    render_req_slot(out, a, rb.partial, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "break: ")
+    render_req_slot(out, a, rb.brk, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_member(out: *StringBuilder, a: *Ast, kind: int64, id: int64, level: int64) -> void {
+    if kind == mk_incorporate() {
+        inc: IncNode = vec_get((*a).incs, id)
+        sb_push(out, "Incorporate(")
+        push_string(out, ast_name(a, inc.name))
+        sb_push_char(out, 41)
+        return
+    }
+    if kind == mk_vow() {
+        v: VowNode = vec_get((*a).vows, id)
+        sb_push(out, "Vow {\n")
+        ind(out, level + 1)
+        sb_push(out, "name: ")
+        push_string(out, ast_name(a, v.name))
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "ty: ")
+        render_type(out, a, v.ty, level + 1)
+        sb_push(out, ",\n")
+        ind(out, level + 1)
+        sb_push(out, "init: ")
+        if v.init < 0 {
+            sb_push(out, "None")
+        } else {
+            render_expr(out, a, v.init, level + 1)
+        }
+        sb_push(out, ",\n")
+        ind(out, level)
+        sb_push_char(out, 125)
+        return
+    }
+    if kind == mk_pledge() {
+        render_pledge(out, a, id, level)
+        return
+    }
+    if kind == mk_clause() {
+        render_clause_decl(out, a, id, level)
+        return
+    }
+    if kind == mk_subcontract() {
+        render_sub(out, a, id, level)
+        return
+    }
+    render_reqblock(out, a, id, level)
+}
+
+func render_contract(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    c: ContractNode = vec_get((*a).contracts, id)
+    sb_push(out, "Contract {\n")
+    ind(out, level + 1)
+    sb_push(out, "internal: ")
+    push_bool(out, c.internal)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, c.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "attrs: ")
+    render_attr_list(out, a, c.attrs_off, c.attrs_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "members: ")
+    if c.members_len == 0 {
+        sb_push(out, "[]")
+    } else {
+        sb_push(out, "[\n")
+        mut i: int64 = 0
+        while i < c.members_len {
+            mk: int64 = vec_get((*a).kids, c.members_off + i)
+            mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+            ind(out, level + 2)
+            render_member(out, a, mk, mid, level + 2)
+            sb_push(out, ",\n")
+            i = i + 2
+        }
+        ind(out, level + 1)
+        sb_push_char(out, 93)
+    }
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
+func render_imports(out: *StringBuilder, a: *Ast, level: int64) -> void {
+    imps: *Vector<ImportNode> = (*a).imports
+    if vec_len(imps) == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < vec_len(imps) {
+        im: ImportNode = vec_get(imps, i)
+        ind(out, level + 1)
+        sb_push(out, "Import(")
+        push_string(out, ast_name(a, im.path))
+        sb_push(out, "),\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+func render_decls(out: *StringBuilder, a: *Ast, level: int64) -> void {
+    decls: *Vector<DeclNode> = (*a).decls
+    if vec_len(decls) == 0 {
+        sb_push(out, "[]")
+        return
+    }
+    sb_push(out, "[\n")
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        ind(out, level + 1)
+        if d.kind == dk_record() {
+            render_record(out, a, d.id, level + 1)
+        } else if d.kind == dk_sum() {
+            render_sum(out, a, d.id, level + 1)
+        } else if d.kind == dk_prov() {
+            render_prov(out, a, d.id, level + 1)
+        } else {
+            render_contract(out, a, d.id, level + 1)
+        }
+        sb_push(out, ",\n")
+        i = i + 1
+    }
+    ind(out, level)
+    sb_push_char(out, 93)
+}
+
+// The whole dump as a fresh heap string the caller owns and frees.
+export func ast_dump(a: *Ast) -> string {
+    out: *StringBuilder = alloc(sb_new())
+    sb_push(out, "File {\n")
+    ind(out, 1)
+    sb_push(out, "imports: ")
+    render_imports(out, a, 1)
+    sb_push(out, ",\n")
+    ind(out, 1)
+    sb_push(out, "decls: ")
+    render_decls(out, a, 1)
+    sb_push(out, ",\n")
+    sb_push(out, "}")
+    r: string = substring(sb_cstr(out), 0, sb_size(out))
+    sb_free(out)
+    free(out)
+    return r
+}
