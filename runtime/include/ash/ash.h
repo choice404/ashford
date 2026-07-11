@@ -1,15 +1,17 @@
 /* ash.h: the host API of libashrt, the Ashford intermediary runtime. A host
  * loads compiled .ash modules through the runtime, signs contracts with vow
  * overrides, fulfills pledges through futures or synchronously, and breaks
- * what it signed. The future form is the API's real shape; today it runs the
- * pledge before it returns and the future only carries the outcome, but a
- * host written against it keeps working when the threading milestone makes
- * fulfillment concurrent for real.
+ * what it signed. Fulfillment is concurrent for real: the fulfill validates
+ * and copies in on the calling thread, a pool worker runs the pledge body,
+ * and the wait blocks until the outcome exists. Fulfillments against one
+ * instance serialize; distinct instances run in parallel.
  *
  * Ownership is one rule deep. Everything a pledge allocates hangs off the
- * contract instance it ran against and is freed by ash_contract_break. That
- * covers futures too, so a future must be waited before its instance breaks.
- * A host that wants to keep a result copies it out before breaking. */
+ * contract instance it ran against and is freed by ash_contract_break. A
+ * future must be waited before its instance breaks if the host wants the
+ * outcome: breaking forfeits every unwaited future to ASH_ERR_STATE, safely
+ * but irrevocably. A host that wants to keep a result copies it out before
+ * breaking. */
 
 #ifndef ASH_H
 #define ASH_H
@@ -26,8 +28,17 @@ typedef struct AshFuture   AshFuture;
 
 /* ---- runtime lifecycle ---- */
 
-/* cfg is reserved and NULL today. */
-AshStatus ash_runtime_init(const void* cfg, AshRuntime** out);
+/* Pool sizing. max_threads of 0 selects the default of 4 workers; a value
+ * beyond 256 is refused with ASH_ERR_TYPE rather than obeyed blindly. */
+typedef struct AshRuntimeConfig {
+    uint32_t max_threads;
+} AshRuntimeConfig;
+
+/* Brings up the runtime and its worker pool. NULL cfg means all defaults. */
+AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out);
+
+/* Drains the task queue, joins every worker, then frees every instance and
+ * future and unloads every module. Nothing else may be calling in. */
 void      ash_runtime_shutdown(AshRuntime* rt);
 
 /* dlopens a compiled module and calls its ash_module_register. The module
@@ -58,7 +69,10 @@ int64_t  ash_contract_signed_at(const AshContract* c);
 
 /* Frees every allocation the instance owns and latches the state at Broken.
  * Every later fulfillment on it reports ASH_ERR_STATE. The instance itself
- * stays valid for state queries until shutdown. */
+ * stays valid for state queries until shutdown. A break races in-flight
+ * fulfillments safely: a thunk mid-run finishes first, a task not yet run
+ * never runs, and every future not yet waited is forfeited so its wait
+ * reports ASH_ERR_STATE instead of touching freed memory. */
 AshStatus ash_contract_break(AshContract* c);
 
 /* ---- pledges ---- */
@@ -76,12 +90,13 @@ AshStatus ash_contract_break(AshContract* c);
 AshStatus ash_pledge_bind(AshRuntime* rt, const char* pledge_name,
                           AshPledgeFn fn);
 
-/* Starts a fulfillment and hands back its future. Today the pledge runs to
- * completion inside this call; the future carries the outcome either way, so
- * every error a fulfillment can hit, wrong state, unknown pledge, argument
- * mismatch, is reported by the wait, not here. Returns NULL only when c or
- * pledge_name is NULL or the future itself cannot be allocated. The future
- * is owned by the instance and dies with it at break.
+/* Starts a fulfillment and hands back its future. The pledge body runs on a
+ * pool worker; every error a fulfillment can hit, wrong state, unknown
+ * pledge, argument mismatch, is reported by the wait, not here. Returns NULL
+ * only when c or pledge_name is NULL or the future itself cannot be
+ * allocated. The future struct is tracked by the instance and freed at
+ * runtime shutdown; everything its value points at is instance owned and
+ * dies at break, so wait before you break.
  *
  * Every value argument is deep copied onto the instance at this call, on the
  * caller's thread, so nothing the host owns needs to outlive the call. refs
@@ -93,12 +108,13 @@ AshFuture* ash_pledge_fulfill(AshContract* c, const char* pledge_name,
                               const AshValue* args, size_t nargs,
                               const AshRef* refs, size_t nrefs);
 
-/* Delivers a future's outcome exactly once. out receives the pledge's value
- * on ASH_OK; everything inside it is owned by the instance. A second wait on
- * the same future is ASH_ERR_STATE. When the fulfillment carried refs their
- * slots are written back to host memory here, before the value is delivered;
- * a slot whose type no longer matches its ref is ASH_ERR_TYPE and nothing is
- * written. */
+/* Blocks until the fulfillment completes, then delivers its outcome exactly
+ * once. out receives the pledge's value on ASH_OK; everything inside it is
+ * owned by the instance. A second wait on the same future is ASH_ERR_STATE,
+ * as is any wait on a future its instance broke out from under. When the
+ * fulfillment carried refs their slots are written back to host memory here,
+ * on this thread, before the value is delivered; a slot whose type no longer
+ * matches its ref is ASH_ERR_TYPE and nothing is written. */
 AshStatus ash_future_wait(AshFuture* f, AshValue* out);
 
 /* The synchronous form: fulfill and wait in one call. Ref write back happens
@@ -112,10 +128,16 @@ AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
 
 /* The signed value of a vow, or NULL when the instance has no vow by that
  * name. The pointer is owned by the instance and dies at break; compiled
- * thunks read their contract's vows through this. */
+ * thunks read their contract's vows through this. Safe from any thread, but
+ * a host that holds the pointer across a break holds a dangling pointer. */
 const AshValue* ash_vow_ref(AshContract* c, const char* name);
 
 /* ---- allocation helpers for pledge bodies ---- */
+
+/* Every helper below is safe both inside a thunk, where the worker already
+ * holds the instance lock, and from a host thread outside any fulfillment;
+ * the instance lock is recursive and the helpers take it themselves. Two
+ * threads mutating the same AshValue remain a host bug. */
 
 /* Instance owned bytes, freed at break. Returns NULL on OOM. */
 uint8_t*  ash_bytes(AshContract* c, uint64_t n);

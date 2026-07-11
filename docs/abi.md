@@ -127,11 +127,11 @@ AshFuture* ash_pledge_fulfill(AshContract* c, const char* pledge_name,
 AshStatus  ash_future_wait(AshFuture* f, AshValue* out);
 ```
 
-`ash_pledge_fulfill` starts a fulfillment and hands back its receipt. Today the pledge runs to completion inside the call and the future only carries the outcome; when the threading milestone arrives the same two calls bracket real concurrency, which is why every fulfillment error, wrong state, unknown pledge, argument mismatch, is delivered by the wait rather than the fulfill. The fulfill returns NULL only when its own arguments are null or the future cannot be allocated.
+`ash_pledge_fulfill` starts a fulfillment and hands back its receipt. The two calls bracket real concurrency: the fulfill validates and copies in on the caller's thread, a pool worker runs the pledge body, and the wait blocks until the outcome exists. Every fulfillment error, wrong state, unknown pledge, argument mismatch, is delivered by the wait rather than the fulfill, so a host's error handling has one place to live. The fulfill returns NULL only when its own arguments are null or the future cannot be allocated.
 
 Every value argument is deep copied onto the instance at the fulfill call, on the caller's thread, so host argument lifetimes end when the call returns; the pledge body sees only the instance owned frame. `refs` pass trailing parameters by reference, `NULL` and 0 for none; the count rule is `nargs + nrefs == ` the pledge's declared parameter count, with the refs occupying the trailing slots.
 
-A future delivers exactly once. The first `ash_future_wait` writes any ref slots back to host memory, then copies the value out and returns the fulfillment's status; every later wait on the same future is `ASH_ERR_STATE`. The future is owned by the instance that produced it, so wait before you break. `ash_pledge_fulfill_sync` remains as the two calls fused, on the same internal path, its write back happening before it returns.
+A future delivers exactly once. The first `ash_future_wait` blocks until the fulfillment completes, writes any ref slots back to host memory on the waiting thread, then copies the value out and returns the fulfillment's status; every later wait on the same future is `ASH_ERR_STATE`. The value's contents are owned by the instance that produced it, so wait before you break. `ash_pledge_fulfill_sync` remains as the two calls fused, on the same internal path, its write back happening before it returns.
 
 ## By-reference arguments
 
@@ -156,11 +156,25 @@ The protocol has exactly two moments, both on a thread the host is blocked in an
 
 The default write back writes scalars in place and writes a whole `AshString` struct for strings. The string bytes it points at are instance owned and die at break; a host that wants the shouted bytes to outlive the instance supplies a `write_back` that copies them out, which is also where a capacity declared in `cap` gets honored. Write back happens only when the fulfillment itself reported `ASH_OK`; a thunk error leaves host memory untouched. Every slot's type is checked against its ref before anything is written, so a pledge that swapped a slot's type writes nothing and the wait reports `ASH_ERR_TYPE`.
 
+## Threading
+
+The runtime owns a worker pool. `ash_runtime_init` takes an `AshRuntimeConfig` whose `max_threads` sizes it, 0 or a NULL config selecting the default of 4 workers; a request beyond 256 is refused with `ASH_ERR_TYPE`. The pool drains one unbounded queue, intrusive through the future itself so queuing allocates nothing. `ash_runtime_shutdown` stops intake, drains what is queued, joins every worker, and only then frees instances, futures, and modules; nothing else may be calling into the runtime by then.
+
+The moments a fulfillment touches host memory are unchanged from the single threaded ABI, and that is the whole point of the copy boundary: copy-in happens inside `ash_pledge_fulfill` on the caller's thread, write back happens inside the delivering `ash_future_wait` on the waiting thread, and the pool worker in between only ever sees instance owned memory.
+
+**Serialization.** Every instance carries one recursive mutex. It covers fulfillment validation and copy-in, the whole thunk run, the outcome latch, every block list allocation, and break, so fulfillments against one instance serialize in queue order while distinct instances run truly in parallel. The allocation helpers, `ash_bytes` and everything built on it, take the instance lock themselves: recursive acquisition makes them safe inside a thunk, where the worker already holds the lock, and cold acquisition makes them safe from a host thread outside any fulfillment. A single `AshValue` is still not a shared object; two threads mutating the same value is a host bug. `ash_vow_ref` is safe from any thread, with the standing caveat that the pointer it returns is instance owned and dangles after break.
+
+**Wait semantics.** `ash_future_wait` blocks on the future's condition variable until the outcome exists, delivers exactly once, and performs the ref write back under the future's mutex on the waiting thread. A second wait is `ASH_ERR_STATE`. The future struct itself is heap memory the runtime tracks per instance and frees at shutdown, which is what makes a late wait safe; everything the delivered value points at is instance owned and dies at break, which is what keeps wait-before-break the rule for a host that wants the bytes.
+
+**Break against in-flight work.** `ash_contract_break` takes the instance lock, so a thunk mid-run finishes and latches before the break proceeds; a task still queued finds the state already Broken when its worker arrives and never touches the freed heap. Before freeing anything the break forfeits every future not yet waited, delivered or not, to `ASH_ERR_STATE` and clears its pointers into the instance heap. A fulfillment racing a break therefore resolves to exactly one of two outcomes: delivered before the break won, or `ASH_ERR_STATE`; never a crash, never freed memory. An unwaited outcome is forfeited even if the pledge ran, so a host that wants a result waits before it breaks.
+
+**Lock ordering.** Three lock levels, always taken downward, never upward: the runtime lock over the descriptor, instance, and binding tables (sign, register, bind, load); the per-instance mutex; the per-future mutex. The pool's queue lock is a leaf taken with no other lock held. `ash_future_wait` takes only the future mutex, so a waiter can never hold up an instance. v1 ships no deadlock detector and `ASH_ERR_DEADLOCK` stays reserved: a thunk cannot start a fulfillment (emitted C has no such path), the instance lock is only taken by the runtime itself, and no path holds two instance locks at once, so a lock cycle cannot be constructed.
+
 ## Ownership
 
-One rule, stated once: everything a fulfillment builds hangs off the contract instance it ran against, and `ash_contract_break` frees all of it in one walk. That covers thunk allocations, boxed payloads, concatenated strings, copied vow values, argument frames, ref slots, and futures. A host that wants to keep a result copies it out before breaking; `ash_value_deep_copy` against another instance is one way. Arguments are deep copied at fulfillment entry, so the runtime holds nothing the host owns once the fulfill call returns, and the host may free or reuse its argument memory immediately. The instance struct itself stays valid for state queries until runtime shutdown; only its heap is gone.
+One rule, stated once: everything a fulfillment builds hangs off the contract instance it ran against, and `ash_contract_break` frees all of it in one walk. That covers thunk allocations, boxed payloads, concatenated strings, copied vow values, argument frames, and ref slots. A host that wants to keep a result copies it out before breaking; `ash_value_deep_copy` against another instance is one way. Arguments are deep copied at fulfillment entry, so the runtime holds nothing the host owns once the fulfill call returns, and the host may free or reuse its argument memory immediately. The instance struct itself stays valid for state queries until runtime shutdown; only its heap is gone. The future struct rides the same rule as the instance: tracked per instance, valid for its one wait even after break, freed at shutdown, while the value inside it follows the instance heap.
 
-Breaking latches the state at Broken and every later fulfillment on the instance reports `ASH_ERR_STATE` through its future or its synchronous return.
+Breaking latches the state at Broken, forfeits every unwaited future to `ASH_ERR_STATE`, and every later fulfillment on the instance reports `ASH_ERR_STATE` through its future or its synchronous return.
 
 ## Mangling
 
@@ -191,11 +205,11 @@ A host that passes the expected hash to `ash_contract_sign` gets `ASH_ERR_VERSIO
 | status | meaning |
 |---|---|
 | `ASH_OK` | the operation ran; a pledge's Err is still `ASH_OK` |
-| `ASH_ERR_STATE` | illegal in the contract's current state, or a second wait |
-| `ASH_ERR_TYPE` | argument count or type mismatch, at a thunk, at sign, or at a ref |
+| `ASH_ERR_STATE` | illegal in the contract's current state, a second wait, or a future a break forfeited |
+| `ASH_ERR_TYPE` | argument count or type mismatch, at a thunk, at sign, at a ref, or an oversized pool request |
 | `ASH_ERR_VERSION` | shape hash disagreed at sign |
 | `ASH_ERR_UNBOUND` | an abstract pledge or an unsupplied vow at sign |
 | `ASH_ERR_NAME` | no contract, pledge, or vow under that name |
-| `ASH_ERR_DEADLOCK` | reserved for the threading milestone |
+| `ASH_ERR_DEADLOCK` | reserved; v1 constructs no lock cycles and ships no detector |
 | `ASH_ERR_OOM` | allocation failed |
 | `ASH_ERR_LOAD` | dlopen or registrar failure on a module |

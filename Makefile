@@ -1,7 +1,9 @@
-# The M0 build. Four artifacts: the ashc binary built by the dusk toolchain,
+# The M5 build. Four artifacts: the ashc binary built by the dusk toolchain,
 # the runtime shared library, the compiled hello module, and the C host that
 # drives them. make smoke runs the whole pipeline and is the walking skeleton
-# gate every later milestone keeps green.
+# gate every later milestone keeps green. The runtime is threaded now, so
+# every gate builds with -pthread and the tsan gate reruns the concurrency
+# surface under ThreadSanitizer.
 #
 # DUSK points at the dusk compiler. The PATH binary can lag the toolchain
 # repo; override with DUSK="cargo run --quiet --bin dusk --" run from the
@@ -17,15 +19,15 @@ ASHC    := target/dusk-out/ashc
 MODULE  := $(OUT)/libhello.ash.so
 HOST    := $(OUT)/host
 
-.PHONY: all smoke runtime compiler module host test-runtime clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread tsan clean
 
-all: smoke test-runtime
+all: smoke test-runtime test-thread tsan
 
 runtime: $(RT_SO)
 
 $(RT_SO): runtime/src/runtime.c runtime/include/ash/ash.h runtime/include/ash/ash_abi.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -I runtime/include runtime/src/runtime.c -ldl -o $(RT_SO)
+	$(CC) $(CFLAGS) -shared -pthread -I runtime/include runtime/src/runtime.c -ldl -o $(RT_SO)
 
 compiler: $(ASHC)
 
@@ -40,7 +42,7 @@ $(MODULE): $(ASHC) skeleton/hello.ash runtime/include/ash/ash_abi.h
 host: $(HOST)
 
 $(HOST): skeleton/host.c $(RT_SO)
-	$(CC) $(CFLAGS) -I runtime/include skeleton/host.c -L $(OUT) -lashrt \
+	$(CC) $(CFLAGS) -pthread -I runtime/include skeleton/host.c -L $(OUT) -lashrt \
 	    -Wl,-rpath,'$$ORIGIN' -o $(HOST)
 
 smoke: $(RT_SO) $(MODULE) $(HOST)
@@ -54,12 +56,33 @@ smoke: $(RT_SO) $(MODULE) $(HOST)
 # one binary under ASan and LSan so every instance allocation is watched.
 test-runtime:
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -I runtime/include \
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
 	    tests/runtime/test_value.c runtime/src/runtime.c -ldl -o $(OUT)/test_value
 	./$(OUT)/test_value
 
+# The threading gate under ASan: the pool, the per-instance serialization,
+# out-of-order waits, and the break race, with every allocation watched.
+test-thread:
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
+	    tests/runtime/test_thread.c runtime/src/runtime.c -ldl -o $(OUT)/test_thread
+	./$(OUT)/test_thread
+
+# The same concurrency surface under ThreadSanitizer: the stress gate and the
+# full host walk, runtime compiled into each binary so TSan sees every lock.
+# The dlopened module is not instrumented, which TSan tolerates; the runtime
+# and host side of every race is.
+tsan: $(MODULE)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -I runtime/include \
+	    tests/runtime/test_thread.c runtime/src/runtime.c -ldl -o $(OUT)/test_thread_tsan
+	./$(OUT)/test_thread_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic -I runtime/include \
+	    skeleton/host.c runtime/src/runtime.c -ldl -o $(OUT)/host_tsan
+	./$(OUT)/host_tsan
+
 smoke-asan: $(MODULE)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -rdynamic -I runtime/include \
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
 	    skeleton/host.c runtime/src/runtime.c -ldl -o $(OUT)/host_asan
 	./$(OUT)/host_asan
 

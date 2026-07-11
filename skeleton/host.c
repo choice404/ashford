@@ -9,11 +9,15 @@
  * through a callback, fulfill through a future and wait it exactly once,
  * prove a second wait is a state error, read the signature the instance
  * carries and prove a wrong expected hash is refused, and exercise the
- * lifecycle errors on both sides of break. It exits zero only when every
- * check held. valgrind runs this and expects silence. */
+ * lifecycle errors on both sides of break. M5 adds the concurrency half:
+ * two host threads hammering one instance, two instances running in
+ * parallel, and a break racing an in-flight fulfillment whose wait must
+ * land on Ok or ASH_ERR_STATE and nothing else. It exits zero only when
+ * every check held. valgrind runs this and expects silence. */
 
 #include <ash/ash.h>
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -77,6 +81,50 @@ static int check_ok_string(const AshValue* out, const char* want) {
     if (!inner || inner->ty != ASH_TY_STRING) return 0;
     if (inner->as.s.len != strlen(want)) return 0;
     return memcmp(inner->as.s.ptr, want, inner->as.s.len) == 0;
+}
+
+/* ---- the M5 concurrency workers ---- */
+
+#define GREET_ITERS 32
+
+/* One host thread's share of the hammering: fulfill greet synchronously
+ * over and over against one instance and demand the exact greeting every
+ * time. Failures are counted, never asserted mid-thread, so every thread
+ * runs to completion and the main thread reports once. */
+typedef struct GreetJob {
+    AshContract* c;
+    const char*  want;
+    int          iters;
+    int          failures;
+} GreetJob;
+
+static void* greet_worker(void* arg) {
+    GreetJob* job = (GreetJob*)arg;
+    AshValue name = str_arg("world");
+    for (int i = 0; i < job->iters; i++) {
+        AshValue out;
+        if (ash_pledge_fulfill_sync(job->c, "greet", &name, 1, NULL, 0,
+                                    &out) != ASH_OK ||
+            !check_ok_string(&out, job->want)) {
+            job->failures++;
+        }
+    }
+    return NULL;
+}
+
+/* The waiter half of the break race. It waits one future and records the
+ * status; the main thread breaks the instance concurrently. On ASH_OK it
+ * must not read the payload, the instance heap may already be gone. */
+typedef struct WaitJob {
+    AshFuture* f;
+    AshStatus  status;
+} WaitJob;
+
+static void* wait_worker(void* arg) {
+    WaitJob* job = (WaitJob*)arg;
+    AshValue out;
+    job->status = ash_future_wait(job->f, &out);
+    return NULL;
 }
 
 int main(void) {
@@ -328,6 +376,85 @@ int main(void) {
     if (!f2 || ash_future_wait(f2, &scratch) != ASH_ERR_STATE) {
         ash_runtime_shutdown(rt);
         return fail("future after break did not report ASH_ERR_STATE");
+    }
+
+    /* ---- two host threads, one instance: fulfillments serialize ---- */
+
+    AshContract* tc1 = NULL;
+    AshContract* tc2 = NULL;
+    if (ash_contract_sign(rt, "Greeter", NULL, 0, 0, &tc1) != ASH_OK ||
+        ash_contract_sign(rt, "Greeter", NULL, 0, 0, &tc2) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("sign the concurrency instances");
+    }
+
+    GreetJob same[2] = {
+        { tc1, "hello, world", GREET_ITERS, 0 },
+        { tc1, "hello, world", GREET_ITERS, 0 },
+    };
+    pthread_t th[2];
+    if (pthread_create(&th[0], NULL, greet_worker, &same[0]) != 0 ||
+        pthread_create(&th[1], NULL, greet_worker, &same[1]) != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("spawning the same-instance workers");
+    }
+    pthread_join(th[0], NULL);
+    pthread_join(th[1], NULL);
+    if (same[0].failures || same[1].failures) {
+        ash_runtime_shutdown(rt);
+        return fail("concurrent fulfillments on one instance");
+    }
+
+    /* ---- two instances in parallel ---- */
+
+    GreetJob apart[2] = {
+        { tc1, "hello, world", GREET_ITERS, 0 },
+        { tc2, "hello, world", GREET_ITERS, 0 },
+    };
+    if (pthread_create(&th[0], NULL, greet_worker, &apart[0]) != 0 ||
+        pthread_create(&th[1], NULL, greet_worker, &apart[1]) != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("spawning the cross-instance workers");
+    }
+    pthread_join(th[0], NULL);
+    pthread_join(th[1], NULL);
+    if (apart[0].failures || apart[1].failures) {
+        ash_runtime_shutdown(rt);
+        return fail("parallel fulfillments across instances");
+    }
+
+    /* ---- the break race: fulfill in flight, break, wait ---- */
+
+    /* The fulfillment is queued, a waiter thread races the break for it.
+     * The runtime promises exactly two outcomes and no third: the pledge
+     * delivered before the break won, or the break forfeited the future and
+     * the wait reports ASH_ERR_STATE. Either way nothing crashes and no
+     * freed memory is touched, which is what ASan and TSan are watching. */
+    AshContract* rc = NULL;
+    if (ash_contract_sign(rt, "Greeter", NULL, 0, 0, &rc) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("sign the race instance");
+    }
+    WaitJob race;
+    race.f = ash_pledge_fulfill(rc, "greet", &name, 1, NULL, 0);
+    race.status = ASH_ERR_OOM;
+    if (!race.f) {
+        ash_runtime_shutdown(rt);
+        return fail("race fulfill returned no future");
+    }
+    if (pthread_create(&th[0], NULL, wait_worker, &race) != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("spawning the race waiter");
+    }
+    if (ash_contract_break(rc) != ASH_OK) {
+        pthread_join(th[0], NULL);
+        ash_runtime_shutdown(rt);
+        return fail("break during an in-flight fulfillment");
+    }
+    pthread_join(th[0], NULL);
+    if (race.status != ASH_OK && race.status != ASH_ERR_STATE) {
+        ash_runtime_shutdown(rt);
+        return fail("break race produced a status outside {Ok, ERR_STATE}");
     }
 
     ash_runtime_shutdown(rt);
