@@ -1,0 +1,171 @@
+// token: the lexed token and the tables that name its kind. A token is a flat
+// value, a kind tag plus its half open byte span and the newline flag the parser
+// reads as a statement break. The kind is an integer; the payload of an Ident,
+// Int, Str, and the rest is recovered from the source span when a token is
+// rendered, which keeps the token itself small and free of owned heap. The
+// keyword set is the hard keyword table of docs/grammar.md; soft keywords like
+// fulfill and abi are ordinary identifiers here and the parser gives them
+// meaning by position.
+
+@paradigm procedural
+
+@import std.string
+@import bytes
+
+// A lexed token: its kind tag, the half open byte span [lo, hi) it covers, and
+// whether a newline preceded it, the flag the parser treats as a terminator.
+export struct Token {
+    kind: int64,
+    lo: int64,
+    hi: int64,
+    nl_before: bool,
+}
+
+// The special kinds, whose rendering reads the source span for a literal value
+// or a keyword name rather than a fixed variant name.
+export func k_ident() -> int64 { return 0 }
+export func k_int() -> int64 { return 1 }
+export func k_float() -> int64 { return 2 }
+export func k_str() -> int64 { return 3 }
+export func k_char() -> int64 { return 4 }
+export func k_bool() -> int64 { return 5 }
+export func k_kw() -> int64 { return 6 }
+
+// The operator, punctuation, and end kinds, each rendered by its fixed name.
+export func k_arrow() -> int64 { return 10 }
+export func k_eq_eq() -> int64 { return 11 }
+export func k_ne() -> int64 { return 12 }
+export func k_le() -> int64 { return 13 }
+export func k_ge() -> int64 { return 14 }
+export func k_and_and() -> int64 { return 15 }
+export func k_or_or() -> int64 { return 16 }
+export func k_assign() -> int64 { return 17 }
+export func k_plus() -> int64 { return 18 }
+export func k_minus() -> int64 { return 19 }
+export func k_star() -> int64 { return 20 }
+export func k_slash() -> int64 { return 21 }
+export func k_percent() -> int64 { return 22 }
+export func k_lt() -> int64 { return 23 }
+export func k_gt() -> int64 { return 24 }
+export func k_bang() -> int64 { return 25 }
+export func k_question() -> int64 { return 26 }
+export func k_colon() -> int64 { return 27 }
+export func k_comma() -> int64 { return 28 }
+export func k_dot() -> int64 { return 29 }
+export func k_underscore() -> int64 { return 30 }
+export func k_lparen() -> int64 { return 31 }
+export func k_rparen() -> int64 { return 32 }
+export func k_lbrace() -> int64 { return 33 }
+export func k_rbrace() -> int64 { return 34 }
+export func k_lbracket() -> int64 { return 35 }
+export func k_rbracket() -> int64 { return 36 }
+export func k_eof() -> int64 { return 37 }
+
+// The fixed name of an operator, punctuation, or end kind, the text the lex
+// dump prints. Returns the empty string for a special kind, whose renderer
+// reads the source span instead.
+export func kind_name(kind: int64) -> string {
+    if kind == 10 { return "Arrow" }
+    if kind == 11 { return "EqEq" }
+    if kind == 12 { return "Ne" }
+    if kind == 13 { return "Le" }
+    if kind == 14 { return "Ge" }
+    if kind == 15 { return "AndAnd" }
+    if kind == 16 { return "OrOr" }
+    if kind == 17 { return "Assign" }
+    if kind == 18 { return "Plus" }
+    if kind == 19 { return "Minus" }
+    if kind == 20 { return "Star" }
+    if kind == 21 { return "Slash" }
+    if kind == 22 { return "Percent" }
+    if kind == 23 { return "Lt" }
+    if kind == 24 { return "Gt" }
+    if kind == 25 { return "Bang" }
+    if kind == 26 { return "Question" }
+    if kind == 27 { return "Colon" }
+    if kind == 28 { return "Comma" }
+    if kind == 29 { return "Dot" }
+    if kind == 30 { return "Underscore" }
+    if kind == 31 { return "LParen" }
+    if kind == 32 { return "RParen" }
+    if kind == 33 { return "LBrace" }
+    if kind == 34 { return "RBrace" }
+    if kind == 35 { return "LBracket" }
+    if kind == 36 { return "RBracket" }
+    if kind == 37 { return "Eof" }
+    return ""
+}
+
+// The dump name of a hard keyword given its source text, or the empty string
+// when the text is an ordinary identifier. This is both the keyword table and
+// the renderer's lookup; the lexer classifies on is_keyword_range below so the
+// hot path never allocates a substring.
+export func keyword_name(text: string) -> string {
+    if str_eq(text, "contract") { return "Contract" }
+    if str_eq(text, "vow") { return "Vow" }
+    if str_eq(text, "pledge") { return "Pledge" }
+    if str_eq(text, "clause") { return "Clause" }
+    if str_eq(text, "provisional") { return "Provisional" }
+    if str_eq(text, "subcontract") { return "Subcontract" }
+    if str_eq(text, "requirements") { return "Requirements" }
+    if str_eq(text, "incorporate") { return "Incorporate" }
+    if str_eq(text, "internal") { return "Internal" }
+    if str_eq(text, "record") { return "Record" }
+    if str_eq(text, "import") { return "Import" }
+    if str_eq(text, "let") { return "Let" }
+    if str_eq(text, "mut") { return "Mut" }
+    if str_eq(text, "return") { return "Return" }
+    if str_eq(text, "if") { return "If" }
+    if str_eq(text, "else") { return "Else" }
+    if str_eq(text, "match") { return "Match" }
+    if str_eq(text, "while") { return "While" }
+    if str_eq(text, "for") { return "For" }
+    if str_eq(text, "in") { return "In" }
+    if str_eq(text, "break") { return "Break" }
+    if str_eq(text, "continue") { return "Continue" }
+    if str_eq(text, "is") { return "Is" }
+    if str_eq(text, "either") { return "Either" }
+    if str_eq(text, "or") { return "Or" }
+    return ""
+}
+
+// Whether the source range s[lo, hi) spells a hard keyword, tested without
+// allocating a substring. The set is the same one keyword_name names, the hard
+// keyword table of docs/grammar.md.
+export func is_keyword_range(s: string, lo: int64, hi: int64) -> bool {
+    if str_eq_range(s, lo, hi, "contract") { return true }
+    if str_eq_range(s, lo, hi, "vow") { return true }
+    if str_eq_range(s, lo, hi, "pledge") { return true }
+    if str_eq_range(s, lo, hi, "clause") { return true }
+    if str_eq_range(s, lo, hi, "provisional") { return true }
+    if str_eq_range(s, lo, hi, "subcontract") { return true }
+    if str_eq_range(s, lo, hi, "requirements") { return true }
+    if str_eq_range(s, lo, hi, "incorporate") { return true }
+    if str_eq_range(s, lo, hi, "internal") { return true }
+    if str_eq_range(s, lo, hi, "record") { return true }
+    if str_eq_range(s, lo, hi, "import") { return true }
+    if str_eq_range(s, lo, hi, "let") { return true }
+    if str_eq_range(s, lo, hi, "mut") { return true }
+    if str_eq_range(s, lo, hi, "return") { return true }
+    if str_eq_range(s, lo, hi, "if") { return true }
+    if str_eq_range(s, lo, hi, "else") { return true }
+    if str_eq_range(s, lo, hi, "match") { return true }
+    if str_eq_range(s, lo, hi, "while") { return true }
+    if str_eq_range(s, lo, hi, "for") { return true }
+    if str_eq_range(s, lo, hi, "in") { return true }
+    if str_eq_range(s, lo, hi, "break") { return true }
+    if str_eq_range(s, lo, hi, "continue") { return true }
+    if str_eq_range(s, lo, hi, "is") { return true }
+    if str_eq_range(s, lo, hi, "either") { return true }
+    if str_eq_range(s, lo, hi, "or") { return true }
+    return false
+}
+
+// Whether the source range s[lo, hi) spells a boolean literal. true and false
+// are hard keywords in the grammar but they carry a value, so they get their
+// own kind rather than riding the keyword table.
+export func is_bool_range(s: string, lo: int64, hi: int64) -> bool {
+    if str_eq_range(s, lo, hi, "true") { return true }
+    if str_eq_range(s, lo, hi, "false") { return true }
+    return false
+}

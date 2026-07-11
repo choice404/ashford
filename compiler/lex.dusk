@@ -1,0 +1,628 @@
+// lex: the ashford lexer. It walks a source buffer by byte offset, pushing
+// tokens and recording faults, so its position and its two output vectors live
+// in one heap value passed by pointer. The token grammar it implements is the
+// lexical section of docs/grammar.md: hard keywords, the operator set, decimal,
+// hex, and binary integers with underscore separators, floats with a fraction
+// and an optional exponent, string and char literals over the shared escape
+// scanner, and both comment forms. Newlines are significant in the surface
+// grammar, so a newline never becomes a token of its own; it sets a flag the
+// next token carries, and the parser decides whether that flag terminates a
+// statement, which is what lets a newline inside parentheses mean nothing.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import bytes
+@import diag
+@import escape
+@import token
+
+// The lexer state: the source and its byte length, the current offset, whether
+// a newline has been seen since the last token, and the collected tokens and
+// faults.
+export struct Lexer {
+    src: string,
+    n: int64,
+    pos: int64,
+    pending_nl: bool,
+    tokens: *Vector<Token>,
+    errors: *Vector<Located>,
+}
+
+export func lx_new(src: string, n: int64) -> *Lexer {
+    tv: *Vector<Token> = alloc(vec_new())
+    ev: *Vector<Located> = alloc(vec_new())
+    return alloc(Lexer {
+        src: src,
+        n: n,
+        pos: 0,
+        pending_nl: false,
+        tokens: tv,
+        errors: ev,
+    })
+}
+
+// The byte at the current offset, the next, and the one after, each -1 at or
+// past the end so a scan can look ahead without a length guard.
+func lx_peek(lx: *Lexer) -> int64 {
+    return bytes.byte_at((*lx).src, (*lx).n, (*lx).pos)
+}
+func lx_peek2(lx: *Lexer) -> int64 {
+    return bytes.byte_at((*lx).src, (*lx).n, (*lx).pos + 1)
+}
+func lx_peek3(lx: *Lexer) -> int64 {
+    return bytes.byte_at((*lx).src, (*lx).n, (*lx).pos + 2)
+}
+
+func lx_pos(lx: *Lexer) -> int64 {
+    return (*lx).pos
+}
+
+// The tokens and faults collected by a finished lexer.
+export func lx_tokens(lx: *Lexer) -> *Vector<Token> {
+    return (*lx).tokens
+}
+export func lx_errors(lx: *Lexer) -> *Vector<Located> {
+    return (*lx).errors
+}
+
+// Advances the offset by m bytes.
+func lx_advance(lx: *Lexer, m: int64) -> void {
+    (*lx).pos = (*lx).pos + m
+}
+
+// Moves the offset to an absolute position, used after the escape scanner
+// returns the offset just past the escape it consumed.
+func lx_seek(lx: *Lexer, p: int64) -> void {
+    (*lx).pos = p
+}
+
+// Pushes a token spanning [start, pos) with the pending newline flag, then
+// clears the flag so it attaches to this token only.
+func lx_push(lx: *Lexer, kind: int64, start: int64) -> void {
+    t: Token = Token {
+        kind: kind,
+        lo: start,
+        hi: (*lx).pos,
+        nl_before: (*lx).pending_nl,
+    }
+    vec_push((*lx).tokens, t)
+    (*lx).pending_nl = false
+}
+
+// Records a fault spanning [lo, pos). A recorded fault is what drives the non
+// zero exit; the scan itself always continues to end of input so one bad
+// literal does not hide the faults after it.
+func lx_err(lx: *Lexer, lo: int64, msg: string) -> void {
+    vec_push((*lx).errors, located(lo, (*lx).pos, msg))
+}
+
+// Advances past a full UTF-8 scalar starting at the current lead byte,
+// clamping to the end of the buffer.
+func lx_bump_scalar(lx: *Lexer) -> void {
+    lead: int64 = lx_peek(lx)
+    mut np: int64 = (*lx).pos + bytes.utf8_len(lead)
+    if np > (*lx).n {
+        np = (*lx).n
+    }
+    (*lx).pos = np
+}
+
+// Skips whitespace and comments, setting the pending newline flag when a
+// newline is passed. A line comment runs to just before its newline, so the
+// newline is seen on the next turn and the flag is set. A block comment is
+// consumed whole, and a newline inside it still sets the flag, so a comment
+// spanning lines terminates a statement the way the newline it swallowed would
+// have. Block comments do not nest.
+func lx_skip_trivia(lx: *Lexer) -> void {
+    mut going: bool = true
+    while going {
+        c: int64 = lx_peek(lx)
+        if c == 10 {
+            (*lx).pending_nl = true
+            (*lx).pos = (*lx).pos + 1
+        } else if c == 32 {
+            (*lx).pos = (*lx).pos + 1
+        } else if c == 9 {
+            (*lx).pos = (*lx).pos + 1
+        } else if c == 13 {
+            (*lx).pos = (*lx).pos + 1
+        } else if c == 47 {
+            if lx_peek2(lx) == 47 {
+                lx_skip_line_comment(lx)
+            } else if lx_peek2(lx) == 42 {
+                lx_skip_block_comment(lx)
+            } else {
+                going = false
+            }
+        } else {
+            going = false
+        }
+    }
+}
+
+func lx_skip_line_comment(lx: *Lexer) -> void {
+    mut going: bool = true
+    while going {
+        c: int64 = lx_peek(lx)
+        if c == 10 {
+            going = false
+        } else if c < 0 {
+            going = false
+        } else {
+            (*lx).pos = (*lx).pos + 1
+        }
+    }
+}
+
+// Consumes a /* ... */ comment whose opener sits at the current offset. An
+// unterminated comment is a recorded fault at the opener and the scan stops at
+// end of input rather than hanging.
+func lx_skip_block_comment(lx: *Lexer) -> void {
+    start: int64 = lx_pos(lx)
+    lx_advance(lx, 2)
+    mut going: bool = true
+    while going {
+        c: int64 = lx_peek(lx)
+        if c < 0 {
+            lx_err(lx, start, "unterminated block comment")
+            going = false
+        } else if c == 10 {
+            (*lx).pending_nl = true
+            lx_advance(lx, 1)
+        } else if c == 42 {
+            if lx_peek2(lx) == 47 {
+                lx_advance(lx, 2)
+                going = false
+            } else {
+                lx_advance(lx, 1)
+            }
+        } else {
+            lx_advance(lx, 1)
+        }
+    }
+}
+
+func is_digit(c: int64) -> bool {
+    if c >= 48 {
+        if c <= 57 {
+            return true
+        }
+    }
+    return false
+}
+
+func is_alpha(c: int64) -> bool {
+    if c >= 97 {
+        if c <= 122 {
+            return true
+        }
+    }
+    if c >= 65 {
+        if c <= 90 {
+            return true
+        }
+    }
+    return false
+}
+
+func is_ident_start(c: int64) -> bool {
+    if is_alpha(c) {
+        return true
+    }
+    if c == 95 {
+        return true
+    }
+    return false
+}
+
+func is_ident_continue(c: int64) -> bool {
+    if is_ident_start(c) {
+        return true
+    }
+    return is_digit(c)
+}
+
+// An identifier, keyword, boolean literal, or the pattern wildcard. The word
+// is scanned, then classified: a lone underscore is the wildcard token, true
+// and false are booleans, a hard keyword gets the keyword kind, and the rest
+// is an identifier. The kind alone is stored; the renderer reads the span for
+// the text. A keyword after `.` staying a member name is the parser's carve
+// out, not a lexing distinction.
+func lx_ident(lx: *Lexer, start: int64) -> void {
+    mut going: bool = true
+    while going {
+        if is_ident_continue(lx_peek(lx)) {
+            lx_advance(lx, 1)
+        } else {
+            going = false
+        }
+    }
+    hi: int64 = lx_pos(lx)
+    if str_eq_range((*lx).src, start, hi, "_") {
+        lx_push(lx, k_underscore(), start)
+    } else if is_bool_range((*lx).src, start, hi) {
+        lx_push(lx, k_bool(), start)
+    } else if is_keyword_range((*lx).src, start, hi) {
+        lx_push(lx, k_kw(), start)
+    } else {
+        lx_push(lx, k_ident(), start)
+    }
+}
+
+// Scans a run of digits in the given base, underscores allowed as separators,
+// and returns the count of actual digits, which the callers use to refuse an
+// empty run. Base is 2, 10, or 16; a digit of a larger base ends the run and
+// the trailing junk check after the literal reports it.
+func lx_digit_run(lx: *Lexer, base: int64) -> int64 {
+    mut count: int64 = 0
+    mut going: bool = true
+    while going {
+        c: int64 = lx_peek(lx)
+        if c == 95 {
+            lx_advance(lx, 1)
+        } else if base == 16 {
+            if bytes.is_hex_digit(c) {
+                lx_advance(lx, 1)
+                count = count + 1
+            } else {
+                going = false
+            }
+        } else if base == 2 {
+            if c == 48 {
+                lx_advance(lx, 1)
+                count = count + 1
+            } else if c == 49 {
+                lx_advance(lx, 1)
+                count = count + 1
+            } else {
+                going = false
+            }
+        } else if is_digit(c) {
+            lx_advance(lx, 1)
+            count = count + 1
+        } else {
+            going = false
+        }
+    }
+    return count
+}
+
+// Whether the digits of s[lo, hi) in the given base overflow a signed 64 bit
+// integer, underscores skipped, using guarded accumulation so the test itself
+// never overflows. Int is 64 bit signed on every target, so the lexer rejects
+// what can never be represented rather than letting a later stage truncate.
+func int_overflows(s: string, n: int64, lo: int64, hi: int64, base: int64) -> bool {
+    mut acc: int64 = 0
+    mut i: int64 = lo
+    while i < hi {
+        b: int64 = bytes.byte_at(s, n, i)
+        if b != 95 {
+            dv: int64 = bytes.hex_val(b)
+            if acc > (9223372036854775807 - dv) / base {
+                return true
+            }
+            acc = acc * base + dv
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Consumes any identifier characters trailing a numeric literal and records
+// one fault for them, so `0x1G` or `1.5ex` is a single bad literal rather than
+// a number and a stray identifier the parser trips over later.
+func lx_number_junk(lx: *Lexer, start: int64) -> void {
+    mut junk: bool = false
+    mut going: bool = true
+    while going {
+        if is_ident_continue(lx_peek(lx)) {
+            junk = true
+            lx_advance(lx, 1)
+        } else {
+            going = false
+        }
+    }
+    if junk {
+        lx_err(lx, start, "invalid character in numeric literal")
+    }
+}
+
+// A hex or binary integer: the 0x or 0b prefix is already confirmed and
+// consumed by the caller, so this scans the digit run, requires it non empty,
+// and applies the overflow guard over the digits alone.
+func lx_radix_int(lx: *Lexer, start: int64, base: int64, empty_msg: string) -> void {
+    dstart: int64 = lx_pos(lx)
+    count: int64 = lx_digit_run(lx, base)
+    dend: int64 = lx_pos(lx)
+    lx_number_junk(lx, start)
+    if count == 0 {
+        lx_err(lx, start, empty_msg)
+    } else if int_overflows((*lx).src, (*lx).n, dstart, dend, base) {
+        lx_err(lx, start, "integer literal overflows 64 bits")
+    }
+    lx_push(lx, k_int(), start)
+}
+
+// A numeric literal: a 0x or 0b prefix routes to the radix scan, and otherwise
+// decimal digits, then an optional fraction that makes it a float, then an
+// optional exponent on the float form only, exactly the FLOAT production. A
+// dot not followed by a digit is left alone so member access on a literal
+// still lexes. An exponent marker without digits is left in place and the
+// trailing junk check reports it.
+func lx_number(lx: *Lexer, start: int64) -> void {
+    if lx_peek(lx) == 48 {
+        if lx_peek2(lx) == 120 {
+            lx_advance(lx, 2)
+            lx_radix_int(lx, start, 16, "hex literal needs at least one digit")
+            return
+        }
+        if lx_peek2(lx) == 98 {
+            lx_advance(lx, 2)
+            lx_radix_int(lx, start, 2, "binary literal needs at least one digit")
+            return
+        }
+    }
+    lx_digit_run(lx, 10)
+    int_end: int64 = lx_pos(lx)
+    mut is_float: bool = false
+    if lx_peek(lx) == 46 {
+        if is_digit(lx_peek2(lx)) {
+            is_float = true
+            lx_advance(lx, 1)
+            lx_digit_run(lx, 10)
+        }
+    }
+    if is_float {
+        c: int64 = lx_peek(lx)
+        if c == 101 {
+            lx_exponent(lx)
+        } else if c == 69 {
+            lx_exponent(lx)
+        }
+    }
+    lx_number_junk(lx, start)
+    if !is_float {
+        if int_overflows((*lx).src, (*lx).n, start, int_end, 10) {
+            lx_err(lx, start, "integer literal overflows 64 bits")
+        }
+    }
+    mut kind: int64 = k_int()
+    if is_float {
+        kind = k_float()
+    }
+    lx_push(lx, kind, start)
+}
+
+// Consumes an exponent when one is actually present: the marker, an optional
+// sign, and at least one digit. A marker with no digits after it is not
+// consumed, so `1.5e` lexes the float and the junk check flags the marker.
+func lx_exponent(lx: *Lexer) -> void {
+    c2: int64 = lx_peek2(lx)
+    if is_digit(c2) {
+        lx_advance(lx, 2)
+        lx_digit_run(lx, 10)
+        return
+    }
+    if c2 == 43 {
+        if is_digit(lx_peek3(lx)) {
+            lx_advance(lx, 2)
+            lx_digit_run(lx, 10)
+        }
+        return
+    }
+    if c2 == 45 {
+        if is_digit(lx_peek3(lx)) {
+            lx_advance(lx, 2)
+            lx_digit_run(lx, 10)
+        }
+        return
+    }
+}
+
+// Steps one backslash escape, recording its fault if any. Shared by the string
+// and char scanners. The backslash is at the current offset on entry.
+func scan_one_escape(lx: *Lexer) -> int64 {
+    bs: int64 = lx_pos(lx)
+    lx_advance(lx, 1)
+    res: Escape = scan_escape((*lx).src, (*lx).n, lx_pos(lx))
+    lx_seek(lx, res.next)
+    if res.err != 0 {
+        lx_err(lx, bs, esc_err_msg(res.err))
+    }
+    return res.scalar
+}
+
+// A string literal: consume the opening quote, then bytes until the closing
+// quote, stepping a backslash escape past its whole form so an escaped quote
+// does not end the literal. Newlines are statement terminators in this
+// grammar, so a string does not span lines: a raw newline ends the scan as an
+// unterminated literal and is left for the trivia pass, which keeps the fault
+// on the line it happened and lets the next line lex normally.
+func lx_string(lx: *Lexer, start: int64) -> void {
+    lx_advance(lx, 1)
+    mut going: bool = true
+    while going {
+        c: int64 = lx_peek(lx)
+        if c < 0 {
+            lx_err(lx, start, "unterminated string literal")
+            going = false
+        } else if c == 10 {
+            lx_err(lx, start, "unterminated string literal")
+            going = false
+        } else if c == 34 {
+            lx_advance(lx, 1)
+            going = false
+        } else if c == 92 {
+            scan_one_escape(lx)
+        } else {
+            lx_advance(lx, 1)
+        }
+    }
+    lx_push(lx, k_str(), start)
+}
+
+// A char literal holds exactly one Unicode scalar value, Char being a 32 bit
+// scalar in the type table, so any escape and any multibyte source character
+// fits. An empty or unterminated literal is a fault, and a malformed body
+// recovers to the next quote or line end so the span stays sane.
+func lx_char(lx: *Lexer, start: int64) -> void {
+    lx_advance(lx, 1)
+    c: int64 = lx_peek(lx)
+    if c < 0 {
+        lx_err(lx, start, "unterminated char literal")
+    } else if c == 39 {
+        lx_err(lx, start, "empty char literal")
+    } else if c == 92 {
+        scan_one_escape(lx)
+    } else if c < 128 {
+        lx_advance(lx, 1)
+    } else {
+        lx_bump_scalar(lx)
+    }
+    close_quote(lx, start, "char literal must contain exactly one character")
+    lx_push(lx, k_char(), start)
+}
+
+// Consumes the closing quote of a char literal. When it is missing, scan to
+// the next quote or newline, consume a quote if found, and record the fault,
+// so the literal's span covers the recovery.
+func close_quote(lx: *Lexer, start: int64, msg: string) -> void {
+    if lx_peek(lx) == 39 {
+        lx_advance(lx, 1)
+    } else {
+        mut going: bool = true
+        while going {
+            c: int64 = lx_peek(lx)
+            if c == 39 {
+                going = false
+            } else if c == 10 {
+                going = false
+            } else if c < 0 {
+                going = false
+            } else {
+                lx_advance(lx, 1)
+            }
+        }
+        if lx_peek(lx) == 39 {
+            lx_advance(lx, 1)
+        }
+        lx_err(lx, start, msg)
+    }
+}
+
+// The kind and byte length of the two byte operator that starts with c, given
+// the next byte. A length of 0 means c starts no two byte operator, so the
+// caller falls to the single byte table. The set is exactly the grammar's:
+// ->  ==  !=  <=  >=  &&  ||.
+func match_op(c: int64, n2: int64) -> (int64, int64) {
+    if c == 45 {
+        if n2 == 62 { return (k_arrow(), 2) }
+    }
+    if c == 61 {
+        if n2 == 61 { return (k_eq_eq(), 2) }
+    }
+    if c == 33 {
+        if n2 == 61 { return (k_ne(), 2) }
+    }
+    if c == 60 {
+        if n2 == 61 { return (k_le(), 2) }
+    }
+    if c == 62 {
+        if n2 == 61 { return (k_ge(), 2) }
+    }
+    if c == 38 {
+        if n2 == 38 { return (k_and_and(), 2) }
+    }
+    if c == 124 {
+        if n2 == 124 { return (k_or_or(), 2) }
+    }
+    return (0, 0)
+}
+
+// The single byte token kind for lead byte c, or -1 when c starts no token. A
+// lone & or | is not in the grammar, so it falls to -1 and reports as an
+// unexpected character.
+func one_kind(c: int64) -> int64 {
+    if c == 61 { return k_assign() }
+    if c == 43 { return k_plus() }
+    if c == 45 { return k_minus() }
+    if c == 42 { return k_star() }
+    if c == 47 { return k_slash() }
+    if c == 37 { return k_percent() }
+    if c == 60 { return k_lt() }
+    if c == 62 { return k_gt() }
+    if c == 33 { return k_bang() }
+    if c == 63 { return k_question() }
+    if c == 58 { return k_colon() }
+    if c == 44 { return k_comma() }
+    if c == 46 { return k_dot() }
+    if c == 40 { return k_lparen() }
+    if c == 41 { return k_rparen() }
+    if c == 123 { return k_lbrace() }
+    if c == 125 { return k_rbrace() }
+    if c == 91 { return k_lbracket() }
+    if c == 93 { return k_rbracket() }
+    return -1
+}
+
+// Munches one operator or punctuation token starting at lead byte c, longest
+// form first. A non-ASCII byte here is outside any literal and is an
+// unexpected character; the whole scalar is stepped so the fault is reported
+// once and the scan moves on.
+func lx_symbol(lx: *Lexer, start: int64, c: int64) -> void {
+    if c >= 128 {
+        lx_bump_scalar(lx)
+        lx_err(lx, start, "unexpected character")
+        return
+    }
+    kind, len := match_op(c, lx_peek2(lx))
+    if len > 0 {
+        lx_advance(lx, len)
+        lx_push(lx, kind, start)
+        return
+    }
+    k: int64 = one_kind(c)
+    if k < 0 {
+        lx_advance(lx, 1)
+        lx_err(lx, start, "unexpected character")
+        return
+    }
+    lx_advance(lx, 1)
+    lx_push(lx, k, start)
+}
+
+// Runs the scan loop to end of input, dispatching each lead byte. Every path
+// through a pass advances the offset, so the loop cannot stall on bad input;
+// the worst case is a fault per byte.
+export func lex_run(lx: *Lexer) -> void {
+    mut going: bool = true
+    while going {
+        lx_skip_trivia(lx)
+        start: int64 = lx_pos(lx)
+        c: int64 = lx_peek(lx)
+        if c < 0 {
+            lx_push(lx, k_eof(), start)
+            going = false
+        } else if is_ident_start(c) {
+            lx_ident(lx, start)
+        } else if is_digit(c) {
+            lx_number(lx, start)
+        } else if c == 34 {
+            lx_string(lx, start)
+        } else if c == 39 {
+            lx_char(lx, start)
+        } else {
+            lx_symbol(lx, start, c)
+        }
+    }
+}
+
+// Lexes a source buffer of byte length n, returning the finished lexer with
+// its tokens and faults.
+export func lex(src: string, n: int64) -> *Lexer {
+    lx: *Lexer = lx_new(src, n)
+    lex_run(lx)
+    return lx
+}

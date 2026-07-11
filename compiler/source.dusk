@@ -1,0 +1,75 @@
+// source: loading an .ash file into a buffer the rest of the compiler reads. A
+// Source owns the whole file text as one heap buffer plus its true byte length,
+// so a scan covers every byte even when the file holds an embedded NUL, and the
+// path it came from so a diagnostic can name its file. The read is wrapped so a
+// missing file, an unreadable file, or one that is not valid UTF-8 is a
+// returned error, never a fault; the grammar makes UTF-8 a hard requirement of
+// a source file, so the rejection happens here, before the lexer sees a byte.
+//
+// A Source is a small value passed by value. The text buffer inside it is heap
+// owned; the caller releases it with source_free once the buffer is no longer
+// read. path is borrowed from the caller.
+
+@paradigm procedural
+
+@import std.string
+@import bytes
+
+foreign "C" {
+    func cool_file_size(path: *void) -> int64
+}
+
+// A loaded source file: its path and its full text. len is the true byte
+// length of the file, taken from its size rather than by scanning to a NUL, so
+// a scan covers an embedded NUL too.
+export struct Source {
+    path: string,
+    text: string,
+    len: int64,
+}
+
+// Copies a path into a fresh NUL terminated raw byte buffer for the C
+// boundary, which a string view cannot cross directly. A path is short, so the
+// length scan here is not on any hot path.
+func to_cbuf(s: string) -> *raw char {
+    n: int64 = str_len(s)
+    buf: *raw char = alloc_bytes(n + 1)
+    mut i: int64 = 0
+    while i < n {
+        buf[i] = s[i]
+        i = i + 1
+    }
+    buf[n] = 0
+    return buf
+}
+
+// Loads the file at path into a Source, returning the Source and an error. The
+// error exists on a read failure or when the bytes are not valid UTF-8, so a
+// caller that reports the error prints no dump. The length is the file's byte
+// size, falling back to a NUL scan only when the size is unavailable. On
+// success the Source owns the file text and the caller frees it with
+// source_free.
+export func source_load(path: string) -> (Source, error) {
+    text, e := read_file(path)
+    if e.exists() {
+        return (Source { path: path, text: text, len: 0 }, e)
+    }
+    buf: *raw char = to_cbuf(path)
+    fsz: int64 = cool_file_size(buf)
+    free(buf)
+    mut n: int64 = fsz
+    if n < 0 {
+        n = str_len(text)
+    }
+    if !bytes.valid_utf8(text, n) {
+        return (Source { path: path, text: text, len: 0 }, error { message: "source is not valid UTF-8" })
+    }
+    return (Source { path: path, text: text, len: n }, error {})
+}
+
+// Releases the file text a successful load allocated. Only call this on a
+// Source that loaded cleanly: a failed load leaves text pointing at the shared
+// empty constant, which is not heap owned and must not be freed.
+export func source_free(s: Source) -> void {
+    free(s.text)
+}

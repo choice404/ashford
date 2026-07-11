@@ -1,0 +1,293 @@
+// lexdump: rendering the lex dump, one line per token. A token line is
+// `{lo:>4}..{hi:<4} nl_before={bool} {kind}`, where the kind is either a fixed
+// name or a literal payload rebuilt from the source span, so the dump is a
+// byte stable golden format a test can diff. A string or char body is decoded
+// through the same escape scanner the lexer walked it with, and every scalar
+// outside printable ASCII renders as a \u{hex} escape, a form that needs no
+// Unicode tables and so never shifts under a locale.
+
+@paradigm procedural
+
+@import std.string
+@import bytes
+@import escape
+@import token
+
+// Appends v as decimal, right justified in a field of width w with leading
+// spaces.
+func push_padded_left(out: *StringBuilder, v: int64, w: int64) -> void {
+    s: string = int_to_string(v)
+    mut pad: int64 = w - str_len(s)
+    while pad > 0 {
+        sb_push_char(out, 32)
+        pad = pad - 1
+    }
+    sb_push(out, s)
+    free(s)
+}
+
+// Appends v as decimal, left justified in a field of width w with trailing
+// spaces.
+func push_padded_right(out: *StringBuilder, v: int64, w: int64) -> void {
+    s: string = int_to_string(v)
+    sb_push(out, s)
+    mut pad: int64 = w - str_len(s)
+    free(s)
+    while pad > 0 {
+        sb_push_char(out, 32)
+        pad = pad - 1
+    }
+}
+
+// Appends the lowercase, minimal digit hex of v, the digits inside a \u{...}
+// escape.
+func push_hex_min(out: *StringBuilder, v: int64) -> void {
+    if v == 0 {
+        sb_push_char(out, 48)
+        return
+    }
+    mut nib: int64 = 1
+    mut t: int64 = v
+    while t >= 16 {
+        t = t / 16
+        nib = nib + 1
+    }
+    mut i: int64 = nib - 1
+    while i >= 0 {
+        d: int64 = (v >> (4 * i)) & 15
+        mut ch: int64 = 48 + d
+        if d >= 10 {
+            ch = 87 + d
+        }
+        sb_push_char(out, ch)
+        i = i - 1
+    }
+}
+
+// Appends one scalar in the canonical dump form: a printable ASCII scalar,
+// 0x20 to 0x7E, as its own byte, and every other scalar as a \u{hex} escape.
+// The quote character that delimits the surrounding literal and the backslash
+// are escaped, so the dump line stays unambiguous; the caller passes the quote
+// its literal form uses.
+func push_canonical(out: *StringBuilder, cp: int64, quote: int64) -> void {
+    if cp == 92 {
+        sb_push(out, "\\\\")
+        return
+    }
+    if cp == quote {
+        sb_push_char(out, 92)
+        sb_push_char(out, cp)
+        return
+    }
+    if cp >= 32 {
+        if cp <= 126 {
+            sb_push_char(out, cp)
+            return
+        }
+    }
+    sb_push(out, "\\u{")
+    push_hex_min(out, cp)
+    sb_push_char(out, 125)
+}
+
+// The canonical rendering of a string token's body, quotes included, for the
+// span [lo, hi). The body is decoded the way the lexer walked it, an invalid
+// escape adding nothing, then each scalar is emitted in canonical form. An
+// unterminated literal simply runs out of span here, so the dump still prints
+// what was scanned.
+func debug_string(src: string, n: int64, lo: int64, hi: int64) -> string {
+    out: *StringBuilder = alloc(sb_new())
+    sb_push_char(out, 34)
+    mut p: int64 = lo + 1
+    mut going: bool = true
+    while going {
+        if p >= hi {
+            going = false
+        } else {
+            b: int64 = bytes.byte_at(src, n, p)
+            if b == 34 {
+                going = false
+            } else if b == 92 {
+                res: Escape = scan_escape(src, n, p + 1)
+                if res.scalar >= 0 {
+                    push_canonical(out, res.scalar, 34)
+                }
+                p = res.next
+            } else if b < 128 {
+                push_canonical(out, b, 34)
+                p = p + 1
+            } else {
+                d: Decoded = bytes.decode_utf8(src, n, p)
+                push_canonical(out, d.scalar, 34)
+                p = p + d.len
+            }
+        }
+    }
+    sb_push_char(out, 34)
+    r: string = substring_n(sb_cstr(out), sb_size(out), 0, sb_size(out))
+    sb_free(out)
+    free(out)
+    return r
+}
+
+// The canonical rendering of a char token, quotes included. Only the leading
+// scalar is rendered, the single character the literal holds. An empty body,
+// an end of input where the character should be, and a failed escape all
+// render as the null scalar, the recovery value that keeps a faulted dump
+// deterministic.
+func debug_char(src: string, n: int64, lo: int64) -> string {
+    bstart: int64 = lo + 1
+    out: *StringBuilder = alloc(sb_new())
+    sb_push_char(out, 39)
+    b: int64 = bytes.byte_at(src, n, bstart)
+    if b < 0 {
+        push_canonical(out, 0, 39)
+    } else if b == 39 {
+        push_canonical(out, 0, 39)
+    } else if b == 92 {
+        res: Escape = scan_escape(src, n, bstart + 1)
+        mut sc: int64 = res.scalar
+        if sc < 0 {
+            sc = 0
+        }
+        push_canonical(out, sc, 39)
+    } else if b < 128 {
+        push_canonical(out, b, 39)
+    } else {
+        d: Decoded = bytes.decode_utf8(src, n, bstart)
+        push_canonical(out, d.scalar, 39)
+    }
+    sb_push_char(out, 39)
+    r: string = substring_n(sb_cstr(out), sb_size(out), 0, sb_size(out))
+    sb_free(out)
+    free(out)
+    return r
+}
+
+// The decoded value of an integer span: an optional 0x or 0b prefix, then
+// digits with underscore separators. Accumulation is guarded the same way the
+// lexer's overflow test is, and an overflowing literal renders as 0, a
+// deterministic value beside the fault the lexer already recorded.
+func int_value(src: string, n: int64, lo: int64, hi: int64) -> int64 {
+    mut base: int64 = 10
+    mut p: int64 = lo
+    if bytes.byte_at(src, n, lo) == 48 {
+        b2: int64 = bytes.byte_at(src, n, lo + 1)
+        if b2 == 120 {
+            base = 16
+            p = lo + 2
+        } else if b2 == 98 {
+            base = 2
+            p = lo + 2
+        }
+    }
+    mut acc: int64 = 0
+    mut going: bool = true
+    while going {
+        if p >= hi {
+            going = false
+        } else {
+            b: int64 = bytes.byte_at(src, n, p)
+            if b == 95 {
+                p = p + 1
+            } else {
+                dv: int64 = bytes.hex_val(b)
+                if dv < 0 {
+                    going = false
+                } else if dv >= base {
+                    going = false
+                } else if acc > (9223372036854775807 - dv) / base {
+                    return 0
+                } else {
+                    acc = acc * base + dv
+                    p = p + 1
+                }
+            }
+        }
+    }
+    return acc
+}
+
+// Appends the kind rendering of a token: a literal payload rebuilt from the
+// span, or the fixed name of an operator, keyword, or punctuation kind. A
+// float renders as its source text rather than a decoded value, so the dump
+// never depends on float formatting.
+func push_kind(out: *StringBuilder, src: string, n: int64, t: Token) -> void {
+    k: int64 = t.kind
+    if k == k_ident() {
+        sb_push(out, "Ident(\"")
+        s: string = substring_n(src, n, t.lo, t.hi)
+        sb_push(out, s)
+        free(s)
+        sb_push(out, "\")")
+        return
+    }
+    if k == k_kw() {
+        sb_push(out, "Kw(")
+        s: string = substring_n(src, n, t.lo, t.hi)
+        sb_push(out, keyword_name(s))
+        free(s)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == k_bool() {
+        sb_push(out, "Bool(")
+        s: string = substring_n(src, n, t.lo, t.hi)
+        sb_push(out, s)
+        free(s)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == k_int() {
+        sb_push(out, "Int(")
+        sb_push_int(out, int_value(src, n, t.lo, t.hi))
+        sb_push_char(out, 41)
+        return
+    }
+    if k == k_float() {
+        sb_push(out, "Float(\"")
+        s: string = substring_n(src, n, t.lo, t.hi)
+        sb_push(out, s)
+        free(s)
+        sb_push(out, "\")")
+        return
+    }
+    if k == k_str() {
+        sb_push(out, "Str(")
+        s: string = debug_string(src, n, t.lo, t.hi)
+        sb_push(out, s)
+        free(s)
+        sb_push_char(out, 41)
+        return
+    }
+    if k == k_char() {
+        sb_push(out, "Char(")
+        s: string = debug_char(src, n, t.lo)
+        sb_push(out, s)
+        free(s)
+        sb_push_char(out, 41)
+        return
+    }
+    sb_push(out, kind_name(k))
+}
+
+// The full dump line for one token, without a trailing newline, as a fresh
+// string the caller owns.
+export func render_token(src: string, n: int64, t: Token) -> string {
+    out: *StringBuilder = alloc(sb_new())
+    push_padded_left(out, t.lo, 4)
+    sb_push(out, "..")
+    push_padded_right(out, t.hi, 4)
+    sb_push(out, " nl_before=")
+    if t.nl_before {
+        sb_push(out, "true")
+    } else {
+        sb_push(out, "false")
+    }
+    sb_push_char(out, 32)
+    push_kind(out, src, n, t)
+    r: string = substring_n(sb_cstr(out), sb_size(out), 0, sb_size(out))
+    sb_free(out)
+    free(out)
+    return r
+}

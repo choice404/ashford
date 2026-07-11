@@ -71,6 +71,8 @@ escape ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex "}"
 
 An `INT` literal types as `Int` unless the expected type at its position is `UInt` or `Byte` and the value fits. A `FLOAT` literal types as `Float`. `CHAR` holds one Unicode scalar value. There is no implicit numeric conversion anywhere, widening included.
 
+A raw newline inside a string literal is an error; a string that needs one writes `\n`. An integer literal above the `Int` maximum is a lex error in the first version, so the largest `UInt` values are not writable as literals yet; the guard moves to the checker, where the expected type is known, when that changes. A `\u{...}` escape naming a surrogate or a value above `0x10FFFF` is an error.
+
 The fixed representations, identical on every target:
 
 | Type   | Representation              |

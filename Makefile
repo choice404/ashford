@@ -29,7 +29,7 @@ $(RT_SO): runtime/src/runtime.c runtime/include/ash/ash.h runtime/include/ash/as
 
 compiler: $(ASHC)
 
-$(ASHC): compiler/ashc.dusk compiler/emitc.dusk
+$(ASHC): $(wildcard compiler/*.dusk)
 	$(DUSK) build compiler/ashc.dusk
 
 module: $(MODULE)

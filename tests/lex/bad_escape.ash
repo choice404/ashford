@@ -1,0 +1,5 @@
+let s = "bad \q escape"
+let t = "\u{110000}"
+let u = "\u{d800}"
+let v = "\u{}"
+let w = "\u no brace"

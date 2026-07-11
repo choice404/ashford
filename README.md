@@ -64,16 +64,44 @@ Unsigned -> Signed -> Fulfilled
 
 The runtime is a shared C library. A compiled `.ash` module carries its contract descriptors, and the runtime registers them in the iname table, a queryable registry of every contract and pledge signature with the language of origin, the type signature hash, and the version baked into each mangled name. A version mismatch is a descriptive error at link time instead of silent corruption at run time. A C program, or anything that can load a C library, looks up a contract, signs it, fulfills pledges, and reads results, all through a handful of runtime calls.
 
+## How to use
+
+The toolchain is early, but the whole pipeline already runs: `ashc` compiles a module, the runtime loads it, and a C host signs and fulfills a contract end to end.
+
+```sh
+# build everything and run the end to end check
+make smoke
+
+# the same check under the address and leak sanitizers
+make smoke-asan
+```
+
+`make smoke` builds four things in order: the runtime shared library `libashrt.so` from `runtime/`, the `ashc` binary from `compiler/` through the dusk toolchain, the compiled contract module `libhello.ash.so` from `skeleton/hello.ash`, and the C host from `skeleton/host.c`. Then it runs the host, which loads the module, signs `Greeter`, fulfills `greet("world")`, checks the result is `Ok("hello, world")`, exercises the error paths, and breaks the contract. Everything lands under `target/`.
+
+`ashc` itself has two commands today:
+
+```sh
+target/dusk-out/ashc version
+target/dusk-out/ashc build skeleton/hello.ash
+```
+
+`build` reads the source, emits the module C into `target/ashc-out/`, and links it with cc into a loadable `.ash.so`. Run it from the repository root, since it hands cc the relative include path.
+
+The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 0.6.0 predates `std.os` and cannot build `ashc`; point `DUSK` at a newer build when the installed one lags.
+
+```sh
+make smoke DUSK=~/projects/cool-lang/target/release/dusk
+```
+
 ## Status
 
-Design stage. The language surface is being pinned down in [docs/grammar.md](docs/grammar.md) and nothing compiles yet. The build order is the runtime ABI first, then the lexer and parser, then the type checker, then codegen, with a C host driving a real contract end to end as the first milestone that stays green from then on.
+The walking skeleton is green. `ashc`, written in dusk, compiles the skeleton contract to a shared module, the C runtime loads it, and a C host drives sign, fulfill, and break across the ABI with the sanitizers quiet. The emitted module is still canned: the compiler proves the pipeline, not the language. Next is the front end, the lexer and parser over the full contract grammar in [docs/grammar.md](docs/grammar.md), with golden and compile fail suites pinning every construct.
 
 ## Requirements
 
-Nothing to install yet. When the toolchain lands it will need:
-
-- The dusk toolchain, to build `ashc`.
-- clang, to compile the emitted C and the runtime.
+- The dusk toolchain, 0.6.0 or newer, to build `ashc`.
+- cc and clang, to compile the emitted C and the runtime.
+- make.
 
 ## License
 

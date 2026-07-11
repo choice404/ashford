@@ -1,0 +1,5 @@
+unknown escape
+\u escape is above 0x10FFFF, the Unicode maximum
+\u escape is a surrogate code point, not a scalar value
+\u escape needs 1 to 6 hex digits
+expected '{' after \u

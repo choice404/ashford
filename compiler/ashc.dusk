@@ -1,13 +1,13 @@
 // ashc: the command line entry for the ashford compiler, written in dusk.
-// This is the M0 spike: prove that a dusk built binary can read an .ash file,
-// emit a C module, and drive cc to a shared library the runtime loads. Two
-// commands work today. version prints the build string. build reads the
-// source, emits the canned Greeter module, and links target/ashc-out. The
-// front end arrives at M1 and replaces the canned emission; the driver path
-// it exercises here stays.
+// Three commands work today. version prints the build string. lex is the
+// first real front end stage: it runs the M1 lexer over an .ash file and
+// dumps one token per line to stdout, the golden format tests/lex diffs.
+// build still emits the canned M0 Greeter module and links target/ashc-out;
+// the parser and checker replace it as M1 lands, but the driver path it
+// exercises stays.
 //
-// Progress and error messages go to stderr, so stdout stays quiet for the
-// tools that will one day parse dump output. build expects to run from the
+// Progress and error messages go to stderr, so stdout carries dump output
+// alone and a tool can diff it byte for byte. build expects to run from the
 // repository root, since it hands cc the relative runtime/include path; the
 // M1 driver grows a proper home lookup.
 
@@ -16,7 +16,13 @@
 @import std.io
 @import std.string
 @import std.os
+@import std.vector
 @import emitc
+@import source
+@import diag
+@import token
+@import lex
+@import lexdump
 
 func version_string() -> string {
     return "ashc 0.0.1 (M0 spike)"
@@ -26,7 +32,42 @@ func usage() -> void {
     printerr("usage: ashc <command> [file]")
     printerr("commands:")
     printerr("  version       print the compiler version")
+    printerr("  lex <file>    dump the token stream of a source file")
     printerr("  build <file>  emit the module C and link it into a shared library")
+}
+
+// Runs the lexer on the file at path, printing one line per token to stdout
+// and any faults to stderr. Returns 1 when the file cannot load or the lexer
+// recorded a fault, and 0 otherwise; the dump is printed either way, so a
+// faulted file still shows what was scanned.
+func cmd_lex(path: string) -> int32 {
+    s, e := source_load(path)
+    if e.exists() {
+        printerr("ashc: cannot read source file")
+        return 1
+    }
+    src: string = s.text
+    n: int64 = s.len
+    lx: *Lexer = lex(src, n)
+    toks: *Vector<Token> = lx_tokens(lx)
+    mut i: int64 = 0
+    while i < vec_len(toks) {
+        t: Token = vec_get(toks, i)
+        line: string = render_token(src, n, t)
+        println(line)
+        free(line)
+        i = i + 1
+    }
+    errs: *Vector<Located> = lx_errors(lx)
+    mut j: int64 = 0
+    while j < vec_len(errs) {
+        emit_located(path, src, n, vec_get(errs, j))
+        j = j + 1
+    }
+    if vec_len(errs) > 0 {
+        return 1
+    }
+    return 0
 }
 
 // The directory ashc writes its artifacts to, parallel to dusk's
@@ -169,6 +210,14 @@ func main(argc: int32, argv: string[]) -> int32 {
     if str_eq(cmd, "version") {
         println(version_string())
         return 0
+    }
+    if str_eq(cmd, "lex") {
+        if argv.len < 3 {
+            printerr("ashc: lex needs a file argument")
+            usage()
+            return 1
+        }
+        return cmd_lex(argv[2])
     }
     if str_eq(cmd, "build") {
         if argv.len < 3 {

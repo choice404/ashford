@@ -1,0 +1,136 @@
+// escape: decoding a backslash escape inside a string or char literal. One
+// scanner serves both the lexer, which walks past an escape to find a
+// literal's end and records any fault, and the dump renderer, which decodes
+// the escape to a scalar to reproduce the token value. Keeping the two on one
+// routine is what keeps their spans and their fault sets in agreement. The
+// escape set is exactly the grammar's: \n \t \r \0 \\ \" \' and \u{hex}.
+
+@paradigm procedural
+
+@import std.string
+@import bytes
+
+// The outcome of scanning one escape. next is the byte offset just past the
+// escape, the position the caller resumes from. scalar is the decoded Unicode
+// scalar, or -1 when the escape produced no value, which happens on every
+// error. err is 0 on success or one of the codes below.
+export struct Escape {
+    next: int64,
+    scalar: int64,
+    err: int64,
+}
+
+// Escape error codes. 0 is success; the rest name the rejection so the lexer
+// reports a precise fault. Kept as functions since the language has no module
+// level constant.
+export func esc_ok() -> int64 { return 0 }
+export func esc_unknown() -> int64 { return 1 }
+export func esc_u_no_brace() -> int64 { return 2 }
+export func esc_u_unterm() -> int64 { return 3 }
+export func esc_u_digits() -> int64 { return 4 }
+export func esc_u_surrogate() -> int64 { return 5 }
+export func esc_u_range() -> int64 { return 6 }
+
+// The message printed for an escape error code.
+export func esc_err_msg(code: int64) -> string {
+    if code == 1 {
+        return "unknown escape"
+    }
+    if code == 2 {
+        return "expected '{' after \\u"
+    }
+    if code == 3 {
+        return "unterminated \\u escape; expected '}'"
+    }
+    if code == 4 {
+        return "\\u escape needs 1 to 6 hex digits"
+    }
+    if code == 5 {
+        return "\\u escape is a surrogate code point, not a scalar value"
+    }
+    if code == 6 {
+        return "\\u escape is above 0x10FFFF, the Unicode maximum"
+    }
+    return "invalid escape"
+}
+
+// Scans the body of a \u{...} escape starting at a, the offset just past the
+// u: an opening brace, 1 to 6 hex digits, a closing brace, and a scalar that
+// is neither a surrogate nor above the Unicode maximum. Digits past the sixth
+// are consumed but not accumulated, so a long run still ends at its brace and
+// faults once instead of overflowing.
+func unicode_escape(src: string, n: int64, a: int64) -> Escape {
+    if bytes.byte_at(src, n, a) != 123 {
+        return Escape { next: a, scalar: -1, err: esc_u_no_brace() }
+    }
+    mut p: int64 = a + 1
+    mut value: int64 = 0
+    mut digits: int64 = 0
+    mut looping: bool = true
+    while looping {
+        b: int64 = bytes.byte_at(src, n, p)
+        if b == 125 {
+            p = p + 1
+            looping = false
+        } else if bytes.is_hex_digit(b) {
+            p = p + 1
+            if digits < 6 {
+                value = value * 16 + bytes.hex_val(b)
+            }
+            digits = digits + 1
+        } else {
+            return Escape { next: p, scalar: -1, err: esc_u_unterm() }
+        }
+    }
+    if digits == 0 {
+        return Escape { next: p, scalar: -1, err: esc_u_digits() }
+    }
+    if digits > 6 {
+        return Escape { next: p, scalar: -1, err: esc_u_digits() }
+    }
+    if value >= 55296 {
+        if value <= 57343 {
+            return Escape { next: p, scalar: -1, err: esc_u_surrogate() }
+        }
+    }
+    if value > 1114111 {
+        return Escape { next: p, scalar: -1, err: esc_u_range() }
+    }
+    return Escape { next: p, scalar: value, err: esc_ok() }
+}
+
+// Scans one escape whose backslash sits just before pos, so pos is the escape
+// character itself: the simple one letter forms, the \u scalar escape, and an
+// unknown escape as a recorded fault that yields no value.
+export func scan_escape(src: string, n: int64, pos: int64) -> Escape {
+    c: int64 = bytes.byte_at(src, n, pos)
+    a: int64 = pos + 1
+    if c == 110 {
+        return Escape { next: a, scalar: 10, err: esc_ok() }
+    }
+    if c == 116 {
+        return Escape { next: a, scalar: 9, err: esc_ok() }
+    }
+    if c == 114 {
+        return Escape { next: a, scalar: 13, err: esc_ok() }
+    }
+    if c == 48 {
+        return Escape { next: a, scalar: 0, err: esc_ok() }
+    }
+    if c == 92 {
+        return Escape { next: a, scalar: 92, err: esc_ok() }
+    }
+    if c == 34 {
+        return Escape { next: a, scalar: 34, err: esc_ok() }
+    }
+    if c == 39 {
+        return Escape { next: a, scalar: 39, err: esc_ok() }
+    }
+    if c == 117 {
+        return unicode_escape(src, n, a)
+    }
+    if c < 0 {
+        return Escape { next: pos, scalar: -1, err: esc_unknown() }
+    }
+    return Escape { next: a, scalar: -1, err: esc_unknown() }
+}
