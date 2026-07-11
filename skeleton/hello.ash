@@ -11,4 +11,7 @@ contract Greeter {
     pledge greet(name: String) -> Result<String, GreetError> {
         return Ok(prefix + name)
     }
+
+    // Abstract: no body here, the host binds an implementation before sign.
+    pledge shout(name: String) -> Result<String, GreetError>
 }

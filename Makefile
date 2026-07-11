@@ -17,9 +17,9 @@ ASHC    := target/dusk-out/ashc
 MODULE  := $(OUT)/libhello.ash.so
 HOST    := $(OUT)/host
 
-.PHONY: all smoke runtime compiler module host clean
+.PHONY: all smoke runtime compiler module host test-runtime clean
 
-all: smoke
+all: smoke test-runtime
 
 runtime: $(RT_SO)
 
@@ -49,6 +49,15 @@ smoke: $(RT_SO) $(MODULE) $(HOST)
 # The leak gate. The runtime compiles straight into the host here so LSan sees
 # every allocation, and -rdynamic exports the ash_* symbols the dlopened
 # module resolves against. valgrind covers the same ground where installed.
+# The runtime's own unit gate: the deep value helpers, deep copy, and the
+# copy-in isolation the memory model promises. Compiled with the runtime in
+# one binary under ASan and LSan so every instance allocation is watched.
+test-runtime:
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -I runtime/include \
+	    tests/runtime/test_value.c runtime/src/runtime.c -ldl -o $(OUT)/test_value
+	./$(OUT)/test_value
+
 smoke-asan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -rdynamic -I runtime/include \
 	    skeleton/host.c runtime/src/runtime.c -ldl -o $(OUT)/host_asan

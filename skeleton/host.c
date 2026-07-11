@@ -1,12 +1,16 @@
 /* host.c: the C half of the walking skeleton. This is a foreign program, it
  * knows nothing about ashc, it only links libashrt and speaks the ABI header.
- * It loads the compiled module and walks the whole M3 surface: sign on the
- * declared defaults and demand exactly Ok("hello, world"), sign again with a
- * vow override and demand the override showed up, fulfill through a future
- * and wait it exactly once, prove a second wait is a state error, read the
- * signature the instance carries and prove a wrong expected hash is refused,
- * and exercise the lifecycle errors on both sides of break. It exits zero
- * only when every check held. valgrind runs this and expects silence. */
+ * It loads the compiled module and walks the whole M4 surface: prove the
+ * abstract pledge blocks signing until the host binds an implementation,
+ * bind one, sign on the declared defaults and demand exactly
+ * Ok("hello, world"), sign again with a vow override and demand the override
+ * showed up, drive the bound pledge through a by-reference argument and
+ * watch the write back land in host memory, by the default protocol and
+ * through a callback, fulfill through a future and wait it exactly once,
+ * prove a second wait is a state error, read the signature the instance
+ * carries and prove a wrong expected hash is refused, and exercise the
+ * lifecycle errors on both sides of break. It exits zero only when every
+ * check held. valgrind runs this and expects silence. */
 
 #include <ash/ash.h>
 
@@ -16,6 +20,45 @@
 static int fail(const char* what) {
     fprintf(stderr, "[host] FAIL: %s\n", what);
     return 1;
+}
+
+/* The host implementation bound over Greeter.shout. It runs in the uniform
+ * thunk frame like any compiled body: everything it builds goes through the
+ * instance in ctx, and the name parameter is its own instance owned slot, so
+ * shouting mutates the slot in place and the runtime's write back carries
+ * the change out when the caller passed the name by reference. */
+static AshStatus host_shout(void* ctx, const AshValue* args, size_t nargs,
+                            AshValue* out) {
+    AshContract* c = (AshContract*)ctx;
+    if (nargs != 1) return ASH_ERR_TYPE;
+    if (args[0].ty != ASH_TY_STRING) return ASH_ERR_TYPE;
+    AshValue up = ash_string_copy(c, args[0].as.s.ptr, args[0].as.s.len);
+    if (args[0].as.s.len && !up.as.s.ptr) return ASH_ERR_OOM;
+    for (uint64_t i = 0; i < up.as.s.len; i++) {
+        uint8_t ch = up.as.s.ptr[i];
+        if (ch >= 'a' && ch <= 'z') up.as.s.ptr[i] = (uint8_t)(ch - 32);
+    }
+    ((AshValue*)args)[0] = up;
+    AshValue* box = ash_box(c);
+    if (!box) return ASH_ERR_OOM;
+    *box = up;
+    memset(out, 0, sizeof(*out));
+    out->ty = ASH_TY_RESULT;
+    out->tag = 0;
+    out->as.box = box;
+    return ASH_OK;
+}
+
+/* A write back callback: instead of letting the default point the host's
+ * AshString at instance owned bytes, copy them into a buffer the host owns,
+ * reached through user, so nothing aliases instance memory after the call. */
+#define SHOUT_CAP 32
+static void copy_shout_out(void* host_ptr, const AshValue* v, void* user) {
+    (void)host_ptr;
+    char* buf = (char*)user;
+    size_t n = v->as.s.len < SHOUT_CAP - 1 ? v->as.s.len : SHOUT_CAP - 1;
+    memcpy(buf, v->as.s.ptr, n);
+    buf[n] = '\0';
 }
 
 static AshValue str_arg(const char* s) {
@@ -45,6 +88,22 @@ int main(void) {
         return fail("module load");
     }
 
+    /* ---- the abstract pledge: no sign until the host binds it ---- */
+
+    AshContract* c0 = NULL;
+    if (ash_contract_sign(rt, "Greeter", NULL, 0, 0, &c0) != ASH_ERR_UNBOUND) {
+        ash_runtime_shutdown(rt);
+        return fail("sign before bind did not report ASH_ERR_UNBOUND");
+    }
+    if (ash_pledge_bind(rt, "Greeter.nope", host_shout) != ASH_ERR_NAME) {
+        ash_runtime_shutdown(rt);
+        return fail("binding an unknown pledge did not report ASH_ERR_NAME");
+    }
+    if (ash_pledge_bind(rt, "Greeter.shout", host_shout) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("bind Greeter.shout");
+    }
+
     /* ---- the default path: sign on the declared vow defaults ---- */
 
     AshContract* c = NULL;
@@ -69,7 +128,7 @@ int main(void) {
     AshValue name = str_arg("world");
 
     AshValue out;
-    if (ash_pledge_fulfill_sync(c, "greet", &name, 1, &out) != ASH_OK) {
+    if (ash_pledge_fulfill_sync(c, "greet", &name, 1, NULL, 0, &out) != ASH_OK) {
         ash_runtime_shutdown(rt);
         return fail("fulfill greet");
     }
@@ -80,14 +139,85 @@ int main(void) {
     const AshValue* inner = (const AshValue*)out.as.box;
     printf("%.*s\n", (int)inner->as.s.len, (const char*)inner->as.s.ptr);
 
+    /* One of two pledges has latched Ok; the contract is not fulfilled yet. */
+    if (ash_contract_state(c) != ASH_SIGNED) {
+        ash_runtime_shutdown(rt);
+        return fail("state after a partial fulfill");
+    }
+
+    /* ---- the bound pledge, called with the name by reference ---- */
+
+    /* The host's own storage for the argument. The runtime copies the value
+     * in at fulfill, the bound body shouts its instance owned slot, and the
+     * default write back repoints this struct at the shouted bytes before
+     * the call returns. */
+    AshString by_ref;
+    by_ref.ptr = (uint8_t*)"whisper";
+    by_ref.len = 7;
+
+    AshRef ref;
+    memset(&ref, 0, sizeof(ref));
+    ref.host_ptr = &by_ref;
+    ref.ty = ASH_TY_STRING;
+
+    if (ash_pledge_fulfill_sync(c, "shout", NULL, 0, &ref, 1, &out) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("fulfill shout through a ref");
+    }
+    if (!check_ok_string(&out, "WHISPER")) {
+        ash_runtime_shutdown(rt);
+        return fail("shout result mismatch");
+    }
+    if (by_ref.len != 7 || memcmp(by_ref.ptr, "WHISPER", 7) != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("default write back did not land in host memory");
+    }
+
+    /* Both pledges have latched Ok now. */
     if (ash_contract_state(c) != ASH_FULFILLED) {
         ash_runtime_shutdown(rt);
         return fail("state after fulfill");
     }
 
+    /* The same ref through a future and a write back callback: the shouted
+     * bytes are copied into host owned storage at the wait, and nothing the
+     * host keeps points into the instance. */
+    char sink[SHOUT_CAP] = {0};
+    AshString by_ref2;
+    by_ref2.ptr = (uint8_t*)"quiet";
+    by_ref2.len = 5;
+    AshRef ref2;
+    memset(&ref2, 0, sizeof(ref2));
+    ref2.host_ptr = &by_ref2;
+    ref2.ty = ASH_TY_STRING;
+    ref2.cap = SHOUT_CAP;
+    ref2.write_back = copy_shout_out;
+    ref2.user = sink;
+
+    AshFuture* fr = ash_pledge_fulfill(c, "shout", NULL, 0, &ref2, 1);
+    if (!fr) {
+        ash_runtime_shutdown(rt);
+        return fail("shout fulfill returned no future");
+    }
+    if (strcmp(sink, "") != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("write back ran before the wait collected the outcome");
+    }
+    AshValue rout;
+    if (ash_future_wait(fr, &rout) != ASH_OK ||
+        !check_ok_string(&rout, "QUIET")) {
+        ash_runtime_shutdown(rt);
+        return fail("shout through the future");
+    }
+    if (strcmp(sink, "QUIET") != 0) {
+        ash_runtime_shutdown(rt);
+        return fail("callback write back did not land in host memory");
+    }
+
     /* An unknown pledge is a name error, an unknown contract likewise. */
     AshValue scratch;
-    if (ash_pledge_fulfill_sync(c, "nope", NULL, 0, &scratch) != ASH_ERR_NAME) {
+    if (ash_pledge_fulfill_sync(c, "nope", NULL, 0, NULL, 0, &scratch) !=
+        ASH_ERR_NAME) {
         ash_runtime_shutdown(rt);
         return fail("unknown pledge did not report ASH_ERR_NAME");
     }
@@ -107,7 +237,7 @@ int main(void) {
         ash_runtime_shutdown(rt);
         return fail("sign with vow override");
     }
-    if (ash_pledge_fulfill_sync(c3, "greet", &name, 1, &out) != ASH_OK) {
+    if (ash_pledge_fulfill_sync(c3, "greet", &name, 1, NULL, 0, &out) != ASH_OK) {
         ash_runtime_shutdown(rt);
         return fail("fulfill greet on the override instance");
     }
@@ -145,7 +275,7 @@ int main(void) {
 
     /* ---- the future path: fulfill, wait once, never twice ---- */
 
-    AshFuture* f = ash_pledge_fulfill(c3, "greet", &name, 1);
+    AshFuture* f = ash_pledge_fulfill(c3, "greet", &name, 1, NULL, 0);
     if (!f) {
         ash_runtime_shutdown(rt);
         return fail("fulfill returned no future");
@@ -189,11 +319,12 @@ int main(void) {
         ash_runtime_shutdown(rt);
         return fail("state after break");
     }
-    if (ash_pledge_fulfill_sync(c, "greet", &name, 1, &scratch) != ASH_ERR_STATE) {
+    if (ash_pledge_fulfill_sync(c, "greet", &name, 1, NULL, 0, &scratch) !=
+        ASH_ERR_STATE) {
         ash_runtime_shutdown(rt);
         return fail("fulfill after break did not report ASH_ERR_STATE");
     }
-    AshFuture* f2 = ash_pledge_fulfill(c, "greet", &name, 1);
+    AshFuture* f2 = ash_pledge_fulfill(c, "greet", &name, 1, NULL, 0);
     if (!f2 || ash_future_wait(f2, &scratch) != ASH_ERR_STATE) {
         ash_runtime_shutdown(rt);
         return fail("future after break did not report ASH_ERR_STATE");

@@ -50,6 +50,11 @@ typedef struct AshList {
     uint32_t elem_ty;
 } AshList;
 
+/* Lists carry their elements as a contiguous AshValue array behind data, len
+ * of them live, cap allocated, elem_ty the declared element tag. A tuple
+ * rides the same arm: data is the AshValue array, len is the arity, cap
+ * equals len, and elem_ty is 0 because a tuple's elements need not agree. */
+
 /* The one value shape. ty picks the union arm. tag carries the variant for
  * the sum shaped types: Option 0 None 1 Some, Result 0 Ok 1 Err, and it is 0
  * for everything else. Option and Result payloads ride in box as a pointer to
@@ -95,7 +100,13 @@ struct AshContract;
 /* Every pledge crosses the boundary in this one shape, compiled bodies and
  * host bound implementations alike. ctx is the signed contract instance the
  * fulfillment runs against; allocation helpers take it so everything a pledge
- * builds is owned by that instance and dies at break(). */
+ * builds is owned by that instance and dies at break().
+ *
+ * args is the full frame, one slot per declared parameter, every slot an
+ * instance owned deep copy. When the caller passed AshRefs they occupy the
+ * trailing slots; those slots are mutable on purpose, an implementation that
+ * updates a by-reference parameter casts away the const on its own slot and
+ * writes the new value there. The runtime writes the slots back at delivery. */
 typedef AshStatus (*AshPledgeFn)(void* ctx, const AshValue* args, size_t nargs,
                                  AshValue* out);
 
@@ -119,6 +130,34 @@ typedef struct AshVowDesc {
     uint32_t    has_default;
     AshValue    default_value;
 } AshVowDesc;
+
+/* A by-reference argument a host passes to a fulfillment. host_ptr addresses
+ * the host's storage for a value of type ty: the raw scalar for the numeric
+ * and character types, or an AshString struct for strings. Only those types
+ * cross by reference in v1; anything else is refused with ASH_ERR_TYPE.
+ *
+ * The runtime never holds host_ptr across a call boundary the host is not
+ * blocked inside. At fulfillment entry the referenced value is copied onto
+ * the instance as a mutable slot appended after the value arguments, so the
+ * pledge body mutates instance memory only. At delivery, inside
+ * ash_future_wait or before ash_pledge_fulfill_sync returns, on the caller's
+ * thread, each slot's final value is written back: through write_back when
+ * the host supplied one, with user passed through untouched, or by the
+ * default otherwise. cap declares the byte capacity at host_ptr; the default
+ * write back does not use it, a callback that honors a capacity reaches its
+ * own bookkeeping through user. The default writes scalars in place and
+ * writes a whole AshString struct for strings, whose bytes are instance
+ * owned and die at break; a host that wants the bytes to outlive the
+ * instance supplies a write_back that copies them out. */
+typedef void (*AshWriteBackFn)(void* host_ptr, const AshValue* v, void* user);
+
+typedef struct AshRef {
+    void*          host_ptr;
+    uint32_t       ty;          /* AshTypeTag of the referenced value */
+    uint64_t       cap;         /* byte capacity at host_ptr, for callbacks */
+    AshWriteBackFn write_back;  /* NULL selects the default write back */
+    void*          user;        /* passed through to write_back untouched */
+} AshRef;
 
 typedef struct AshContractDesc {
     const char*          name;
