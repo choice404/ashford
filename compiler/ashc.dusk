@@ -1,0 +1,184 @@
+// ashc: the command line entry for the ashford compiler, written in dusk.
+// This is the M0 spike: prove that a dusk built binary can read an .ash file,
+// emit a C module, and drive cc to a shared library the runtime loads. Two
+// commands work today. version prints the build string. build reads the
+// source, emits the canned Greeter module, and links target/ashc-out. The
+// front end arrives at M1 and replaces the canned emission; the driver path
+// it exercises here stays.
+//
+// Progress and error messages go to stderr, so stdout stays quiet for the
+// tools that will one day parse dump output. build expects to run from the
+// repository root, since it hands cc the relative runtime/include path; the
+// M1 driver grows a proper home lookup.
+
+@paradigm procedural
+
+@import std.io
+@import std.string
+@import std.os
+@import emitc
+
+func version_string() -> string {
+    return "ashc 0.0.1 (M0 spike)"
+}
+
+func usage() -> void {
+    printerr("usage: ashc <command> [file]")
+    printerr("commands:")
+    printerr("  version       print the compiler version")
+    printerr("  build <file>  emit the module C and link it into a shared library")
+}
+
+// The directory ashc writes its artifacts to, parallel to dusk's
+// target/dusk-out. Returned as a literal, never freed.
+func out_dir() -> string {
+    return "target/ashc-out"
+}
+
+// Joins two strings into a fresh heap string the caller frees.
+func join2(a: string, b: string) -> string {
+    sb: *StringBuilder = alloc(sb_new())
+    sb_push(sb, a)
+    sb_push(sb, b)
+    s: string = substring(sb_cstr(sb), 0, sb_size(sb))
+    sb_free(sb)
+    free(sb)
+    return s
+}
+
+func make_out_dir(out: string) -> bool {
+    mk: *StringBuilder = alloc(sb_new())
+    sb_push(mk, "mkdir -p ")
+    mq: string = quote(out)
+    sb_push(mk, mq)
+    mkline: string = substring(sb_cstr(mk), 0, sb_size(mk))
+    mkcode: int64 = run(mkline)
+    free(mkline)
+    free(mq)
+    sb_free(mk)
+    free(mk)
+    if mkcode != 0 {
+        printerr("ashc: could not create the output directory")
+        return false
+    }
+    return true
+}
+
+func stem_of(path: string) -> string {
+    mut start: int64 = 0
+    mut i: int64 = 0
+    while i < str_len(path) {
+        if path[i] == 47 { start = i + 1 }
+        i = i + 1
+    }
+    mut end: int64 = str_len(path)
+    mut j: int64 = start
+    while j < str_len(path) {
+        if path[j] == 46 { end = j }
+        j = j + 1
+    }
+    return substring(path, start, end)
+}
+
+// Appends one shell argument: a leading space, then the argument in single
+// quotes so an awkward path survives the shell as one word.
+func push_arg(cmd: *StringBuilder, arg: string) -> void {
+    sb_push_char(cmd, 32)
+    q: string = quote(arg)
+    sb_push(cmd, q)
+    free(q)
+}
+
+// Compiles the emitted C into a shared library with cc. Returns the cc exit
+// code, zero on success.
+func link_module(cpath: string, sopath: string) -> int64 {
+    cmd: *StringBuilder = alloc(sb_new())
+    sb_push(cmd, "cc -shared -fPIC")
+    push_arg(cmd, cpath)
+    sb_push(cmd, " -I runtime/include -o")
+    push_arg(cmd, sopath)
+    linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))
+    sb_free(cmd)
+    free(cmd)
+    printerr("[ashc] linking with cc")
+    code: int64 = run(linkline)
+    free(linkline)
+    if code != 0 {
+        printerr("ashc: cc failed to link the module")
+    }
+    return code
+}
+
+// Builds one .ash file: read it as a sanity check, emit the module C, write
+// it, and link the shared library beside it.
+func cmd_build(path: string) -> int32 {
+    src, e := read_file(path)
+    if e.exists() {
+        printerr("ashc: could not read the source file")
+        return 1
+    }
+    if str_len(src) == 0 {
+        printerr("ashc: the source file is empty")
+        free(src)
+        return 1
+    }
+    free(src)
+
+    out: string = out_dir()
+    if !make_out_dir(out) { return 1 }
+
+    stem: string = stem_of(path)
+    base: string = join2(out, "/")
+    cname: string = join2(stem, ".c")
+    cpath0: string = join2(base, cname)
+    soname0: string = join2("lib", stem)
+    soname: string = join2(soname0, ".ash.so")
+    sopath: string = join2(base, soname)
+    free(cname)
+    free(soname0)
+    free(soname)
+    free(base)
+    free(stem)
+
+    ccode: string = emit_module_c()
+    werr := write_file(cpath0, ccode)
+    free(ccode)
+    if werr.exists() {
+        printerr("ashc: could not write the module C")
+        free(cpath0)
+        free(sopath)
+        return 1
+    }
+    printerr("[ashc] emitted module C")
+
+    code: int64 = link_module(cpath0, sopath)
+    free(cpath0)
+    free(sopath)
+    if code != 0 { return 1 }
+    printerr("[ashc] wrote the module library")
+    return 0
+}
+
+func main(argc: int32, argv: string[]) -> int32 {
+    if argv.len < 2 {
+        printerr("ashc: no command given")
+        usage()
+        return 1
+    }
+    cmd: string = argv[1]
+    if str_eq(cmd, "version") {
+        println(version_string())
+        return 0
+    }
+    if str_eq(cmd, "build") {
+        if argv.len < 3 {
+            printerr("ashc: build needs a file argument")
+            usage()
+            return 1
+        }
+        return cmd_build(argv[2])
+    }
+    printerr("ashc: unknown command")
+    usage()
+    return 1
+}
