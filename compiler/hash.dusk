@@ -1,0 +1,57 @@
+// hash: FNV-1a 64 over bytes, the one hash in the compiler. A contract's
+// shape hash is FNV-1a 64 of its canonical signature string, and a pledge's
+// sig hash is FNV-1a 64 of its canonical signature spelling, so two builds of
+// the same source agree on every mangled name and every descriptor without
+// sharing anything but this file and the canonical spellings in ty and
+// tysigs. The hash state rides in an int64 whose bit pattern is the unsigned
+// value; xor and multiply both wrap the way the algorithm wants.
+
+@paradigm procedural
+
+@import std.string
+@import bytes
+
+// The FNV-1a 64 offset basis, 0xcbf29ce484222325, written as the signed
+// two's complement value because the language has no unsigned literal.
+func fnv_basis() -> int64 {
+    return -3750763034362895579
+}
+
+// The FNV-1a 64 prime, 0x100000001b3.
+func fnv_prime() -> int64 {
+    return 1099511628211
+}
+
+// The FNV-1a 64 hash of a string, byte by byte.
+export func fnv1a64(s: string) -> int64 {
+    n: int64 = str_len(s)
+    mut h: int64 = fnv_basis()
+    mut i: int64 = 0
+    while i < n {
+        b: int64 = byte_at(s, n, i)
+        h = h ^ b
+        h = h * fnv_prime()
+        i = i + 1
+    }
+    return h
+}
+
+// The 16 lowercase hex digits of a 64 bit hash, high nibble first. A fresh
+// heap string the caller keeps or frees.
+export func hash_hex16(h: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut i: int64 = 15
+    while i >= 0 {
+        d: int64 = (h >> (4 * i)) & 15
+        mut ch: int64 = 48 + d
+        if d >= 10 {
+            ch = 87 + d
+        }
+        sb_push_char(b, ch)
+        i = i - 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}

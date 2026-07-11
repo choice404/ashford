@@ -1,0 +1,309 @@
+// cgenexpr: lowering one expression to C. Every expression becomes a fresh
+// AshValue temporary built by a few statements, and the lowering returns the
+// temporary's name beside its checked type, so the parent reads fields off a
+// value whose shape it knows. The subset lowered here is the M3 set: the
+// literals, parameter and vow reads, let bound names, the unary and binary
+// operators including String concatenation, and the Option and Result
+// constructors. Anything else is a named build error through cg_unsupported,
+// so no thunk ever ships C the emitter was guessing at. The type questions
+// were all settled by the checker before codegen runs; the types read here
+// pick union fields, never report faults.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import cgenstate
+
+export struct CVal { cvar: string, ty: int64 }
+
+func bad_val(g: *Cg) -> CVal {
+    return CVal { cvar: "bad", ty: ty_unknown((*g).ty) }
+}
+
+// Opens a fresh zeroed AshValue temporary and returns its name.
+func new_value(g: *Cg) -> string {
+    v: string = cg_tmp(g)
+    cg_line(g, tmsg3("AshValue ", v, " = {0};"))
+    return v
+}
+
+func set_ty(g: *Cg, v: string, tag: string) -> void {
+    cg_line(g, tmsg5(v, ".ty = ", tag, ";", ""))
+}
+
+func c_op(op: int64) -> string {
+    if op == bop_add() { return "+" }
+    if op == bop_sub() { return "-" }
+    if op == bop_mul() { return "*" }
+    if op == bop_div() { return "/" }
+    if op == bop_mod() { return "%" }
+    if op == bop_eq() { return "==" }
+    if op == bop_ne() { return "!=" }
+    if op == bop_lt() { return "<" }
+    if op == bop_le() { return "<=" }
+    if op == bop_gt() { return ">" }
+    if op == bop_ge() { return ">=" }
+    if op == bop_and() { return "&&" }
+    return "||"
+}
+
+// An integer literal, typed the checker's way: Int unless the position asked
+// for UInt or Byte.
+func gen_int(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    t: *TyArena = (*g).ty
+    mut tyid: int64 = ty_int(t)
+    if want >= 0 {
+        wk: int64 = ty_get(t, want).kind
+        if wk == tyk_uint() { tyid = ty_uint(t) }
+        if wk == tyk_byte() { tyid = ty_byte(t) }
+    }
+    v: string = new_value(g)
+    set_ty(g, v, cg_tag_of(g, tyid))
+    lit: string = int_to_string(e.a)
+    cg_line(g, tmsg5(v, ".as.", cg_field_of(g, tyid), " = ", tmsg2(lit, ";")))
+    return CVal { cvar: v, ty: tyid }
+}
+
+func gen_str(g: *Cg, e: ExprNode) -> CVal {
+    cs: CStr = cg_c_string(g, e.a)
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_STRING")
+    cg_line(g, tmsg5(v, ".as.s.ptr = (uint8_t*)", cs.lit, ";", ""))
+    cg_line(g, tmsg5(v, ".as.s.len = ", int_to_string(cs.len), ";", ""))
+    return CVal { cvar: v, ty: ty_str((*g).ty) }
+}
+
+// A parameter, a let binding, or a vow of the enclosing contract.
+func gen_ident(g: *Cg, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    bind: CBind = cg_lookup(g, e.a)
+    if bind.found {
+        return CVal { cvar: bind.cvar, ty: bind.ty }
+    }
+    text: string = ast_name(a, e.a)
+    if (*g).cur_cid >= 0 {
+        m: MEntry = rs_member((*g).res, (*g).cur_cid, e.a)
+        if m.kind == mk_vow() {
+            vs: VowSigT = sig_vow((*g).sigs, (*g).cur_cid, e.a)
+            p: string = cg_tmp(g)
+            cg_line(g, tmsg5("const AshValue* ", p, " = ash_vow_ref(cc, \"", text, "\");"))
+            cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_NAME;"))
+            v: string = cg_tmp(g)
+            cg_line(g, tmsg5("AshValue ", v, " = *", p, ";"))
+            return CVal { cvar: v, ty: vs.ty }
+        }
+    }
+    cg_unsupported(g, e.lo, e.hi, tmsg3("the name '", text, "' in a pledge body"))
+    return bad_val(g)
+}
+
+func gen_unary(g: *Cg, e: ExprNode) -> CVal {
+    t: *TyArena = (*g).ty
+    x: CVal = gen_expr(g, e.b, -1)
+    if e.a == uop_not() {
+        v: string = new_value(g)
+        set_ty(g, v, "ASH_TY_BOOL")
+        cg_line(g, tmsg5(v, ".as.b = !", x.cvar, ".as.b;", ""))
+        return CVal { cvar: v, ty: ty_bool(t) }
+    }
+    fld: string = cg_field_of(g, x.ty)
+    if str_len(fld) == 0 {
+        cg_unsupported(g, e.lo, e.hi, "unary '-' on this type")
+        return bad_val(g)
+    }
+    v2: string = new_value(g)
+    set_ty(g, v2, cg_tag_of(g, x.ty))
+    cg_line(g, tmsg7(v2, ".as.", fld, " = -", x.cvar, ".as.", tmsg2(fld, ";")))
+    return CVal { cvar: v2, ty: x.ty }
+}
+
+// String concatenation through the runtime helper, which allocates the
+// result on the instance the thunk runs against.
+func gen_concat(g: *Cg, l: CVal, r: CVal) -> CVal {
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_STRING")
+    cg_line(g, tmsg7("if (ash_string_concat(cc, &", l.cvar, ", &", r.cvar, ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    return CVal { cvar: v, ty: ty_str((*g).ty) }
+}
+
+func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    t: *TyArena = (*g).ty
+    op: int64 = e.a
+    if op == bop_and() || op == bop_or() {
+        l: CVal = gen_expr(g, e.b, ty_bool(t))
+        r: CVal = gen_expr(g, e.c, ty_bool(t))
+        v: string = new_value(g)
+        set_ty(g, v, "ASH_TY_BOOL")
+        cg_line(g, tmsg7(v, ".as.b = (", l.cvar, tmsg3(".as.b ", c_op(op), " "), r.cvar, ".as.b);", ""))
+        return CVal { cvar: v, ty: ty_bool(t) }
+    }
+    mut aw: int64 = -1
+    if want >= 0 {
+        wk: int64 = ty_get(t, want).kind
+        if wk != tyk_bool() { aw = want }
+    }
+    if op == bop_eq() || op == bop_ne() { aw = -1 }
+    if op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() { aw = -1 }
+    l2: CVal = gen_expr(g, e.b, aw)
+    r2: CVal = gen_expr(g, e.c, l2.ty)
+    mut opty: int64 = l2.ty
+    if ty_get(t, opty).kind == tyk_unknown() { opty = r2.ty }
+    k: int64 = ty_get(t, opty).kind
+    if op == bop_add() {
+        if k == tyk_str() {
+            return gen_concat(g, l2, r2)
+        }
+    }
+    if op == bop_eq() || op == bop_ne() {
+        v2: string = new_value(g)
+        set_ty(g, v2, "ASH_TY_BOOL")
+        if k == tyk_str() {
+            mut bang: string = ""
+            if op == bop_ne() { bang = "!" }
+            cg_line(g, tmsg7(v2, ".as.b = ", bang, "ash_string_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
+            return CVal { cvar: v2, ty: ty_bool(t) }
+        }
+        fld: string = cg_field_of(g, opty)
+        if str_len(fld) == 0 {
+            cg_unsupported(g, e.lo, e.hi, "'==' on this type")
+            return bad_val(g)
+        }
+        cg_line(g, tmsg7(v2, ".as.b = (", tmsg5(l2.cvar, ".as.", fld, " ", c_op(op)), tmsg3(" ", r2.cvar, ".as."), tmsg2(fld, ");"), "", ""))
+        return CVal { cvar: v2, ty: ty_bool(t) }
+    }
+    fld2: string = cg_field_of(g, opty)
+    if str_len(fld2) == 0 {
+        cg_unsupported(g, e.lo, e.hi, tmsg3("operator '", c_op(op), "' on this type"))
+        return bad_val(g)
+    }
+    if op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() {
+        v3: string = new_value(g)
+        set_ty(g, v3, "ASH_TY_BOOL")
+        cg_line(g, tmsg7(v3, ".as.b = (", tmsg5(l2.cvar, ".as.", fld2, " ", c_op(op)), tmsg3(" ", r2.cvar, ".as."), tmsg2(fld2, ");"), "", ""))
+        return CVal { cvar: v3, ty: ty_bool(t) }
+    }
+    if op == bop_mod() {
+        if str_eq(fld2, "f") {
+            cg_unsupported(g, e.lo, e.hi, "'%' on Float")
+            return bad_val(g)
+        }
+    }
+    v4: string = new_value(g)
+    set_ty(g, v4, cg_tag_of(g, opty))
+    cg_line(g, tmsg7(v4, ".as.", fld2, tmsg5(" = ", l2.cvar, ".as.", fld2, " "), tmsg3(c_op(op), " ", r2.cvar), tmsg3(".as.", fld2, ";"), ""))
+    return CVal { cvar: v4, ty: opty }
+}
+
+// A boxed constructor: the payload lands in an instance owned box and the
+// wrapper carries the ABI tag, Option 0 None 1 Some, Result 0 Ok 1 Err.
+func gen_boxed(g: *Cg, payload: CVal, tag_name: string, variant: int64, tyid: int64) -> CVal {
+    b: string = cg_tmp(g)
+    cg_line(g, tmsg3("AshValue* ", b, " = ash_box(cc);"))
+    cg_line(g, tmsg3("if (!", b, ") return ASH_ERR_OOM;"))
+    cg_line(g, tmsg5("*", b, " = ", payload.cvar, ";"))
+    v: string = new_value(g)
+    set_ty(g, v, tag_name)
+    cg_line(g, tmsg5(v, ".tag = ", int_to_string(variant), ";", ""))
+    cg_line(g, tmsg5(v, ".as.box = ", b, ";", ""))
+    return CVal { cvar: v, ty: tyid }
+}
+
+func gen_some(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    t: *TyArena = (*g).ty
+    mut pw: int64 = -1
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_option() { pw = wn.a }
+    }
+    p: CVal = gen_expr(g, e.a, pw)
+    return gen_boxed(g, p, "ASH_TY_OPTION", 1, ty_option(t, p.ty))
+}
+
+func gen_ok_err(g: *Cg, e: ExprNode, want: int64, is_ok: bool) -> CVal {
+    t: *TyArena = (*g).ty
+    mut pw: int64 = -1
+    mut tyid: int64 = -1
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_result() {
+            tyid = want
+            pw = wn.a
+            if !is_ok { pw = wn.b }
+        }
+    }
+    p: CVal = gen_expr(g, e.a, pw)
+    if tyid < 0 {
+        if is_ok {
+            tyid = ty_result(t, p.ty, ty_unknown(t))
+        } else {
+            tyid = ty_result(t, ty_unknown(t), p.ty)
+        }
+    }
+    mut variant: int64 = 0
+    if !is_ok { variant = 1 }
+    return gen_boxed(g, p, "ASH_TY_RESULT", variant, tyid)
+}
+
+func gen_none(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    t: *TyArena = (*g).ty
+    mut tyid: int64 = ty_option(t, ty_unknown(t))
+    if want >= 0 {
+        if ty_get(t, want).kind == tyk_option() { tyid = want }
+    }
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_OPTION")
+    return CVal { cvar: v, ty: tyid }
+}
+
+export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    e: ExprNode = vec_get((*a).exprs, id)
+    (*g).cur_lo = e.lo
+    (*g).cur_hi = e.hi
+    if e.kind == xk_int() { return gen_int(g, e, want) }
+    if e.kind == xk_float() {
+        v: string = new_value(g)
+        set_ty(g, v, "ASH_TY_FLOAT")
+        cg_line(g, tmsg5(v, ".as.f = ", ast_name(a, e.a), ";", ""))
+        return CVal { cvar: v, ty: ty_float(t) }
+    }
+    if e.kind == xk_str() { return gen_str(g, e) }
+    if e.kind == xk_char() {
+        v2: string = new_value(g)
+        set_ty(g, v2, "ASH_TY_CHAR")
+        cg_line(g, tmsg5(v2, ".as.ch = ", int_to_string(e.a), ";", ""))
+        return CVal { cvar: v2, ty: ty_char(t) }
+    }
+    if e.kind == xk_bool() {
+        v3: string = new_value(g)
+        set_ty(g, v3, "ASH_TY_BOOL")
+        cg_line(g, tmsg5(v3, ".as.b = ", int_to_string(e.a), ";", ""))
+        return CVal { cvar: v3, ty: ty_bool(t) }
+    }
+    if e.kind == xk_ident() { return gen_ident(g, e) }
+    if e.kind == xk_unary() { return gen_unary(g, e) }
+    if e.kind == xk_binary() { return gen_binary(g, e, want) }
+    if e.kind == xk_some() { return gen_some(g, e, want) }
+    if e.kind == xk_none() { return gen_none(g, e, want) }
+    if e.kind == xk_ok() { return gen_ok_err(g, e, want, true) }
+    if e.kind == xk_err() { return gen_ok_err(g, e, want, false) }
+    if e.kind == xk_mut() { return gen_expr(g, e.a, want) }
+    if e.kind == xk_call() { cg_unsupported(g, e.lo, e.hi, "a call in a pledge body") }
+    if e.kind == xk_member() { cg_unsupported(g, e.lo, e.hi, "member access in a pledge body") }
+    if e.kind == xk_index() { cg_unsupported(g, e.lo, e.hi, "indexing in a pledge body") }
+    if e.kind == xk_question() { cg_unsupported(g, e.lo, e.hi, "'?' in a pledge body") }
+    if e.kind == xk_tuple() { cg_unsupported(g, e.lo, e.hi, "a tuple literal in a pledge body") }
+    if e.kind == xk_list() { cg_unsupported(g, e.lo, e.hi, "a list literal in a pledge body") }
+    if e.kind == xk_record_lit() { cg_unsupported(g, e.lo, e.hi, "a record literal in a pledge body") }
+    if e.kind == xk_match() { cg_unsupported(g, e.lo, e.hi, "match in a pledge body") }
+    return bad_val(g)
+}

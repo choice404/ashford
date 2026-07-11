@@ -1,0 +1,94 @@
+// cgenstmt: lowering statements and blocks to C. A block opens a scope on
+// both sides of the fence at once, a brace pair in the C and a scope frame in
+// the emitter, so an ashford binding lives exactly as long as the C variable
+// that carries it. The M3 statement set is let, if with else, return, and a
+// bare expression statement; assignment and the loops arrive with a later
+// milestone and are named build errors until then. return writes the pledge's
+// value through the thunk's out parameter and reports ASH_OK, the one exit
+// convention every thunk shares.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import cgenstate
+@import cgenexpr
+
+func gen_let(g: *Cg, s: StmtNode) -> void {
+    mut ann: int64 = -1
+    if s.b >= 0 {
+        ve: ExprNode = vec_get((*(*g).ast).exprs, s.c)
+        ann = lower_type((*g).sigs, s.b, ve.lo, ve.hi)
+    }
+    v: CVal = gen_expr(g, s.c, ann)
+    mut bound: int64 = v.ty
+    if ann >= 0 { bound = ann }
+    cg_declare(g, s.a, v.cvar, bound)
+}
+
+func gen_return(g: *Cg, s: StmtNode) -> void {
+    if s.a < 0 {
+        cg_line(g, "out->ty = ASH_TY_UNIT;")
+        cg_line(g, "return ASH_OK;")
+        return
+    }
+    v: CVal = gen_expr(g, s.a, (*g).cur_ret)
+    cg_line(g, tmsg3("*out = ", v.cvar, ";"))
+    cg_line(g, "return ASH_OK;")
+}
+
+func gen_if(g: *Cg, s: StmtNode) -> void {
+    c: CVal = gen_expr(g, s.a, ty_bool((*g).ty))
+    cg_line(g, tmsg3("if (", c.cvar, ".as.b) {"))
+    (*g).indent = (*g).indent + 1
+    gen_block(g, s.b)
+    (*g).indent = (*g).indent - 1
+    if s.c >= 0 {
+        cg_line(g, "} else {")
+        (*g).indent = (*g).indent + 1
+        gen_block(g, s.c)
+        (*g).indent = (*g).indent - 1
+    }
+    cg_line(g, "}")
+}
+
+export func gen_stmt(g: *Cg, sid: int64) -> void {
+    a: *Ast = (*g).ast
+    s: StmtNode = vec_get((*a).stmts, sid)
+    if s.kind == sk_let() {
+        gen_let(g, s)
+    } else if s.kind == sk_return() {
+        gen_return(g, s)
+    } else if s.kind == sk_if() {
+        gen_if(g, s)
+    } else if s.kind == sk_expr() {
+        gen_expr(g, s.a, -1)
+    } else if s.kind == sk_assign() {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "assignment in a pledge body")
+    } else if s.kind == sk_while() {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "while in a pledge body")
+    } else if s.kind == sk_for() {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "for in a pledge body")
+    } else {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "loop control in a pledge body")
+    }
+}
+
+export func gen_block(g: *Cg, bid: int64) -> void {
+    a: *Ast = (*g).ast
+    b: BlockNode = vec_get((*a).blocks, bid)
+    cg_push_scope(g)
+    mut i: int64 = 0
+    while i < b.len {
+        gen_stmt(g, vec_get((*a).kids, b.off + i))
+        i = i + 1
+    }
+    cg_pop_scope(g)
+}

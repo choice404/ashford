@@ -144,8 +144,23 @@ func infer_binary(tc: *Tc, e: ExprNode, want: int64) -> int64 {
     mut aw: int64 = -1
     if want >= 0 {
         if is_numeric(t, want) { aw = want }
+        if op == bop_add() {
+            if ty_get(t, want).kind == tyk_str() { aw = want }
+        }
     }
     lt4: int64 = infer_expr(tc, e.b, aw)
+    // '+' doubles as String concatenation: a String left operand asks for a
+    // String right operand and the result is String. Every other pairing
+    // falls through to the numeric rule below and faults there.
+    if op == bop_add() {
+        if ty_get(t, lt4).kind == tyk_str() {
+            st: int64 = infer_expr(tc, e.c, lt4)
+            if !compat(t, lt4, st) {
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "operator '+' concatenates two String values; got ", lt4, " and ", st))
+            }
+            return ty_str(t)
+        }
+    }
     mut rw2: int64 = -1
     if is_numeric(t, lt4) { rw2 = lt4 }
     rt4: int64 = infer_expr(tc, e.c, rw2)

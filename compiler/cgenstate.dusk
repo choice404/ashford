@@ -1,0 +1,270 @@
+// cgenstate: the shared state of the C emitter and its small toolbox. One Cg
+// rides through the module: the tables the front end built, the builder the
+// finished file grows in, the builder the current thunk body grows in, a
+// scope stack binding a local's interner id to the C variable that holds it,
+// and the fault vector codegen errors land in. A construct the milestone does
+// not lower is a build error here, never silently wrong C, so everything a
+// thunk emits is a value the runtime can hold. Message strings follow the
+// checker's convention: heap strings a Located borrows for the run.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+
+// A local binding: the C expression that reads the value, and its checked
+// type. found stands in for a miss on lookup.
+export struct CBind { cvar: string, ty: int64, found: bool }
+
+export struct Cg {
+    ast: *Ast,
+    res: *Resolved,
+    sigs: *Sigs,
+    ty: *TyArena,
+    out: *StringBuilder,
+    body: *StringBuilder,
+    scopes: *Vector<*Map<CBind>>,
+    tmp: int64,
+    indent: int64,
+    cur_cid: int64,
+    cur_ret: int64,
+    cur_lo: int64,
+    cur_hi: int64,
+    errors: *Vector<Located>,
+}
+
+export func cg_new(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> *Cg {
+    out: *StringBuilder = alloc(sb_new())
+    body: *StringBuilder = alloc(sb_new())
+    scopes: *Vector<*Map<CBind>> = alloc(vec_new())
+    return alloc(Cg {
+        ast: a, res: r, sigs: s, ty: t,
+        out: out, body: body, scopes: scopes,
+        tmp: 0, indent: 0,
+        cur_cid: -1, cur_ret: -1, cur_lo: 0, cur_hi: 0,
+        errors: errors,
+    })
+}
+
+export func cg_err(g: *Cg, lo: int64, hi: int64, msg: string) -> void {
+    vec_push((*g).errors, located(lo, hi, msg))
+}
+
+// The named build error for a construct outside the lowered subset.
+export func cg_unsupported(g: *Cg, lo: int64, hi: int64, what: string) -> void {
+    cg_err(g, lo, hi, tmsg2("codegen: not yet supported: ", what))
+}
+
+// A fresh thunk local temporary name, t0, t1, and so on.
+export func cg_tmp(g: *Cg) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push_char(b, 116)
+    sb_push_int(b, (*g).tmp)
+    (*g).tmp = (*g).tmp + 1
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Pushes one line of the current thunk body at the current indent.
+export func cg_line(g: *Cg, s: string) -> void {
+    body: *StringBuilder = (*g).body
+    mut i: int64 = 0
+    while i < (*g).indent + 1 {
+        sb_push(body, "    ")
+        i = i + 1
+    }
+    sb_push(body, s)
+    sb_push_char(body, 10)
+}
+
+// Pushes one line of the finished file, no indent.
+export func cg_top(g: *Cg, s: string) -> void {
+    sb_push((*g).out, s)
+    sb_push_char((*g).out, 10)
+}
+
+export func cg_push_scope(g: *Cg) -> void {
+    m: *Map<CBind> = alloc(map_new())
+    vec_push((*g).scopes, m)
+}
+
+export func cg_pop_scope(g: *Cg) -> void {
+    scopes: *Vector<*Map<CBind>> = (*g).scopes
+    (*scopes).len = vec_len(scopes) - 1
+}
+
+export func cg_declare(g: *Cg, name: int64, cvar: string, tyid: int64) -> void {
+    scopes: *Vector<*Map<CBind>> = (*g).scopes
+    top: *Map<CBind> = vec_get(scopes, vec_len(scopes) - 1)
+    map_put(top, rs_gkey(name), CBind { cvar: cvar, ty: tyid, found: true })
+}
+
+export func cg_lookup(g: *Cg, name: int64) -> CBind {
+    key: string = rs_gkey(name)
+    scopes: *Vector<*Map<CBind>> = (*g).scopes
+    mut i: int64 = vec_len(scopes) - 1
+    while i >= 0 {
+        m: *Map<CBind> = vec_get(scopes, i)
+        if map_has(m, key) {
+            return unwrap_or(map_get(m, key), CBind { cvar: "", ty: -1, found: false })
+        }
+        i = i - 1
+    }
+    return CBind { cvar: "", ty: -1, found: false }
+}
+
+// The AshTypeTag spelling of a checked type, or "" for a shape the ABI does
+// not tag one to one, which the callers treat as no check or a build fault.
+export func cg_tag_of(g: *Cg, tyid: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_int() { return "ASH_TY_INT" }
+    if k == tyk_uint() { return "ASH_TY_UINT" }
+    if k == tyk_float() { return "ASH_TY_FLOAT" }
+    if k == tyk_bool() { return "ASH_TY_BOOL" }
+    if k == tyk_byte() { return "ASH_TY_BYTE" }
+    if k == tyk_char() { return "ASH_TY_CHAR" }
+    if k == tyk_str() { return "ASH_TY_STRING" }
+    if k == tyk_unit() { return "ASH_TY_UNIT" }
+    if k == tyk_list() { return "ASH_TY_LIST" }
+    if k == tyk_map() { return "ASH_TY_MAP" }
+    if k == tyk_tuple() { return "ASH_TY_TUPLE" }
+    if k == tyk_option() { return "ASH_TY_OPTION" }
+    if k == tyk_result() { return "ASH_TY_RESULT" }
+    return ""
+}
+
+// The AshValue union field a scalar of this type lives in, or "".
+export func cg_field_of(g: *Cg, tyid: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_int() { return "i" }
+    if k == tyk_uint() { return "u" }
+    if k == tyk_float() { return "f" }
+    if k == tyk_bool() { return "b" }
+    if k == tyk_byte() { return "b" }
+    if k == tyk_char() { return "ch" }
+    return ""
+}
+
+// Appends one byte of a C string literal in a spelling every C compiler
+// reads back exactly: printable ASCII as itself, quote and backslash
+// escaped, and everything else as a three digit octal escape, which cannot
+// swallow a digit that follows the way a hex escape can.
+func push_c_byte(b: *StringBuilder, v: int64) -> void {
+    if v == 34 {
+        sb_push(b, "\\\"")
+        return
+    }
+    if v == 92 {
+        sb_push(b, "\\\\")
+        return
+    }
+    if v >= 32 {
+        if v <= 126 {
+            sb_push_char(b, v)
+            return
+        }
+    }
+    sb_push_char(b, 92)
+    sb_push_char(b, 48 + ((v >> 6) & 7))
+    sb_push_char(b, 48 + ((v >> 3) & 7))
+    sb_push_char(b, 48 + (v & 7))
+}
+
+// Appends the UTF-8 bytes of one scalar to a byte vector.
+func push_utf8(bytes_out: *Vector<int64>, cp: int64) -> void {
+    if cp < 128 {
+        vec_push(bytes_out, cp)
+        return
+    }
+    if cp < 2048 {
+        vec_push(bytes_out, 192 + (cp >> 6))
+        vec_push(bytes_out, 128 + (cp & 63))
+        return
+    }
+    if cp < 65536 {
+        vec_push(bytes_out, 224 + (cp >> 12))
+        vec_push(bytes_out, 128 + ((cp >> 6) & 63))
+        vec_push(bytes_out, 128 + (cp & 63))
+        return
+    }
+    vec_push(bytes_out, 240 + (cp >> 18))
+    vec_push(bytes_out, 128 + ((cp >> 12) & 63))
+    vec_push(bytes_out, 128 + ((cp >> 6) & 63))
+    vec_push(bytes_out, 128 + (cp & 63))
+}
+
+// Decodes the canonical string body the parser interned, the form
+// debug_string produced: printable ASCII raw, backslash and quote escaped,
+// everything else as \u{hex}. Returns the raw UTF-8 bytes of the value.
+func decode_body(s: string) -> *Vector<int64> {
+    out: *Vector<int64> = alloc(vec_new())
+    n: int64 = str_len(s)
+    mut i: int64 = 0
+    while i < n {
+        b: int64 = s[i]
+        if b == 92 {
+            i = i + 1
+            e: int64 = s[i]
+            if e == 117 {
+                // \u{hex}: past the brace, accumulate to the closing one.
+                i = i + 2
+                mut cp: int64 = 0
+                while s[i] != 125 {
+                    d: int64 = s[i]
+                    mut v: int64 = d - 48
+                    if d >= 97 { v = d - 87 }
+                    cp = cp * 16 + v
+                    i = i + 1
+                }
+                push_utf8(out, cp)
+            } else if e == 110 {
+                vec_push(out, 10)
+            } else if e == 116 {
+                vec_push(out, 9)
+            } else if e == 114 {
+                vec_push(out, 13)
+            } else if e == 48 {
+                vec_push(out, 0)
+            } else {
+                // \\  \"  \' decode to the escaped byte itself.
+                vec_push(out, e)
+            }
+        } else {
+            vec_push(out, b)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// The result of lowering one string literal: the quoted C literal spelling
+// and the byte length of the value.
+export struct CStr { lit: string, len: int64 }
+
+// Lowers an interned string body id to a C string literal and its length.
+export func cg_c_string(g: *Cg, sid: int64) -> CStr {
+    body: string = ast_name((*g).ast, sid)
+    raw: *Vector<int64> = decode_body(body)
+    b: *StringBuilder = alloc(sb_new())
+    sb_push_char(b, 34)
+    mut i: int64 = 0
+    while i < vec_len(raw) {
+        push_c_byte(b, vec_get(raw, i))
+        i = i + 1
+    }
+    sb_push_char(b, 34)
+    lit: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return CStr { lit: lit, len: vec_len(raw) }
+}

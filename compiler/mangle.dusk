@@ -1,0 +1,31 @@
+// mangle: the exported symbol name of a compiled pledge. The format is
+// __ash_ash_{contract}_{symbol}_{sighash}_v{version}: the fixed prefix, the
+// contract name, the pledge name, the 16 hex digit FNV-1a 64 of the pledge's
+// canonical signature spelling, and the contract version. Contract and pledge
+// names are identifiers, so the name is a valid C identifier as long as the
+// pieces are, and the sig hash keeps two versions of a pledge from colliding
+// even when nothing else about the header moved.
+
+@paradigm procedural
+
+@import std.string
+@import hash
+
+// The mangled name of one pledge. A fresh heap string the caller owns.
+export func mangle_pledge(contract: string, symbol: string, sighash: int64, version: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "__ash_ash_")
+    sb_push(b, contract)
+    sb_push_char(b, 95)
+    sb_push(b, symbol)
+    sb_push_char(b, 95)
+    hx: string = hash_hex16(sighash)
+    sb_push(b, hx)
+    free(hx)
+    sb_push(b, "_v")
+    sb_push_int(b, version)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}

@@ -1,0 +1,369 @@
+// cgen: the module level C emitter, the M3 replacement for the canned M0
+// module. Given a checked file it emits one C translation unit: a static
+// thunk per compiled pledge body in the uniform frame, the vow and pledge
+// descriptor tables, one contract descriptor per contract with its shape
+// hash and version baked in, and the single exported ash_module_register.
+// The emitted C includes ash/ash.h and nothing else defines a layout.
+//
+// The shape hash is FNV-1a 64 of the contract's canonical signature string:
+// the contract name, then every vow and every pledge in declaration order,
+// each spelled through the same canonical type strings the checker compares.
+// Two builds of the same header agree byte for byte, and any change to a vow
+// type or a pledge signature moves the hash, which is the whole point.
+//
+// Codegen faults collect into the caller's vector; a caller that sees any
+// must throw the returned C away.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import hash
+@import mangle
+@import cgenstate
+@import cgenexpr
+@import cgenstmt
+
+// One pledge of a contract, flattened: loose pledges and subcontract pledges
+// alike, in declaration order, with the sig table key they were filed under.
+struct PlInfo { pid: int64, key: string }
+
+struct VowInfo { vid: int64 }
+
+// Collects the contract's vows and pledges in declaration order.
+func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -> void {
+    a: *Ast = (*g).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+        if mkind == mk_vow() {
+            vec_push(vows, VowInfo { vid: mid })
+        } else if mkind == mk_pledge() {
+            pl: PledgeNode = vec_get((*a).pledges, mid)
+            vec_push(pls, PlInfo { pid: mid, key: rs_mkey(cid, pl.name) })
+        } else if mkind == mk_subcontract() {
+            sub: SubNode = vec_get((*a).subs, mid)
+            mut j: int64 = 0
+            while j < sub.pledges_len {
+                pid: int64 = vec_get((*a).kids, sub.pledges_off + j)
+                pl2: PledgeNode = vec_get((*a).pledges, pid)
+                if sub.name >= 0 {
+                    vec_push(pls, PlInfo { pid: pid, key: rs_skey(mid, pl2.name) })
+                } else {
+                    vec_push(pls, PlInfo { pid: pid, key: rs_mkey(cid, pl2.name) })
+                }
+                j = j + 1
+            }
+        }
+        i = i + 2
+    }
+}
+
+// The contract's version attribute, defaulting to 1.
+func contract_version(g: *Cg, c: ContractNode) -> int64 {
+    a: *Ast = (*g).ast
+    mut i: int64 = 0
+    while i < c.attrs_len {
+        at: AttrNode = vec_get((*a).attrs, vec_get((*a).kids, c.attrs_off + i))
+        if str_eq(ast_name(a, at.key), "version") {
+            ve: ExprNode = vec_get((*a).exprs, at.val)
+            if ve.kind == xk_int() {
+                return ve.a
+            }
+            cg_err(g, ve.lo, ve.hi, "codegen: the version attribute must be an integer literal")
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// The canonical signature string the shape hash eats: the contract name,
+// then each vow and pledge in declaration order under the checker's own
+// canonical type spellings.
+func shape_string(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -> string {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "contract ")
+    sb_push(b, ast_name(a, c.name))
+    sb_push_char(b, 59)
+    mut i: int64 = 0
+    while i < vec_len(vows) {
+        v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
+        vs: VowSigT = sig_vow(s, cid, v.name)
+        sb_push(b, "vow ")
+        sb_push(b, ast_name(a, v.name))
+        sb_push_char(b, 58)
+        sb_push(b, ty_canon_str((*g).ty, vs.ty))
+        sb_push_char(b, 59)
+        i = i + 1
+    }
+    mut j: int64 = 0
+    while j < vec_len(pls) {
+        info: PlInfo = vec_get(pls, j)
+        pl: PledgeNode = vec_get((*a).pledges, info.pid)
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+        sb_push(b, "pledge ")
+        sb_push(b, ast_name(a, pl.name))
+        sb_push_char(b, 58)
+        sig: string = sig_canon(s, ps.params, ps.ret)
+        sb_push(b, sig)
+        free(sig)
+        sb_push_char(b, 59)
+        j = j + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The vow default initializer text for the descriptor table, or "" when the
+// vow's shape is outside what a descriptor can carry, which is a build fault
+// the caller already reported.
+func vow_default_text(g: *Cg, v: VowNode, tyid: int64) -> string {
+    a: *Ast = (*g).ast
+    k: int64 = ty_get((*g).ty, tyid).kind
+    tag: string = cg_tag_of(g, tyid)
+    mut e: ExprNode = vec_get((*a).exprs, v.init)
+    mut negate: bool = false
+    if e.kind == xk_unary() {
+        negate = true
+        e = vec_get((*a).exprs, e.b)
+    }
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "{ .ty = ")
+    sb_push(b, tag)
+    sb_push(b, ", .tag = 0, .as = { ")
+    if k == tyk_str() {
+        cs: CStr = cg_c_string(g, e.a)
+        sb_push(b, ".s = { (uint8_t*)")
+        sb_push(b, cs.lit)
+        sb_push(b, ", ")
+        sb_push_int(b, cs.len)
+        sb_push(b, " }")
+    } else if k == tyk_float() {
+        sb_push(b, ".f = ")
+        if negate { sb_push_char(b, 45) }
+        sb_push(b, ast_name(a, e.a))
+    } else {
+        sb_push_char(b, 46)
+        sb_push(b, cg_field_of(g, tyid))
+        sb_push(b, " = ")
+        mut val: int64 = e.a
+        if negate { val = 0 - val }
+        sb_push_int(b, val)
+    }
+    sb_push(b, " } }")
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Emits the vow descriptor table of one contract; returns how many vows it
+// carries so the contract descriptor can point at it.
+func emit_vows(g: *Cg, cid: int64, cname: string, vows: *Vector<VowInfo>) -> void {
+    a: *Ast = (*g).ast
+    if vec_len(vows) == 0 { return }
+    cg_top(g, tmsg3("static const AshVowDesc k_", cname, "_vows[] = {"))
+    mut i: int64 = 0
+    while i < vec_len(vows) {
+        v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
+        vs: VowSigT = sig_vow((*g).sigs, cid, v.name)
+        tag: string = cg_tag_of(g, vs.ty)
+        fld: string = cg_field_of(g, vs.ty)
+        k: int64 = ty_get((*g).ty, vs.ty).kind
+        mut carriable: bool = true
+        if str_len(fld) == 0 {
+            if k != tyk_str() { carriable = false }
+        }
+        if carriable {
+            mut has_default: string = "0"
+            mut init_text: string = "{ .ty = ASH_TY_UNIT, .tag = 0, .as = { .i = 0 } }"
+            if v.init >= 0 {
+                has_default = "1"
+                init_text = vow_default_text(g, v, vs.ty)
+            }
+            line: string = tmsg7("    { \"", ast_name(a, v.name), "\", ", tag, ", ", has_default, tmsg3(", ", init_text, " },"))
+            cg_top(g, line)
+        } else {
+            cg_unsupported(g, v.lo, v.hi, "a vow of this type in a compiled module")
+        }
+        i = i + 1
+    }
+    cg_top(g, "};")
+    cg_top(g, "")
+}
+
+// Emits one thunk: the uniform frame, the argument count and tag checks, the
+// parameters bound by name, and the lowered body. A body that runs off its
+// end reports Unit, the value a bare pledge leaves behind.
+func emit_thunk(g: *Cg, cid: int64, info: PlInfo, mangled: string) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    pl: PledgeNode = vec_get((*a).pledges, info.pid)
+    ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+
+    old_body: *StringBuilder = (*g).body
+    (*g).body = alloc(sb_new())
+    (*g).tmp = 0
+    (*g).indent = 0
+    (*g).cur_cid = cid
+    (*g).cur_ret = ps.ret
+    (*g).cur_lo = pl.lo
+    (*g).cur_hi = pl.hi
+
+    if pl.attrs_len > 0 {
+        cg_unsupported(g, pl.lo, pl.hi, "pledge attributes in a compiled module")
+    }
+
+    cg_push_scope(g)
+    cg_line(g, tmsg3("if (nargs != ", int_to_string(pl.params_len), ") return ASH_ERR_TYPE;"))
+    mut i: int64 = 0
+    while i < pl.params_len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, pl.params_off + i))
+        mut pt: int64 = ty_unknown((*g).ty)
+        if i < ps.params.len { pt = sig_param(s, ps.params, i) }
+        tag: string = cg_tag_of(g, pt)
+        idx: string = int_to_string(i)
+        if str_len(tag) > 0 {
+            cg_line(g, tmsg7("if (args[", idx, "].ty != ", tag, ") return ASH_ERR_TYPE;", "", ""))
+        }
+        cg_declare(g, f.name, tmsg3("args[", idx, "]"), pt)
+        i = i + 1
+    }
+    gen_block(g, pl.body)
+    cg_pop_scope(g)
+
+    cg_top(g, tmsg3("static AshStatus ", mangled, "(void* ctx, const AshValue* args, size_t nargs,"))
+    cg_top(g, "                           AshValue* out) {")
+    cg_top(g, "    AshContract* cc = (AshContract*)ctx;")
+    cg_top(g, "    (void)cc;")
+    cg_top(g, "    (void)args;")
+    body_text: string = substring(sb_cstr((*g).body), 0, sb_size((*g).body))
+    sb_push((*g).out, body_text)
+    free(body_text)
+    cg_top(g, "    out->ty = ASH_TY_UNIT;")
+    cg_top(g, "    return ASH_OK;")
+    cg_top(g, "}")
+    cg_top(g, "")
+
+    sb_free((*g).body)
+    free((*g).body)
+    (*g).body = old_body
+    (*g).cur_cid = -1
+    (*g).cur_ret = -1
+}
+
+// Emits one contract: its thunks, its descriptor tables, and the contract
+// descriptor the registrar hands over.
+func emit_contract(g: *Cg, cid: int64) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    collect(g, cid, vows, pls)
+
+    version: int64 = contract_version(g, c)
+    shape: string = shape_string(g, cid, vows, pls)
+    shash: int64 = fnv1a64(shape)
+    free(shape)
+
+    // The mangled name of every pledge, body or not, in declaration order.
+    mangled: *Vector<string> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < vec_len(pls) {
+        info: PlInfo = vec_get(pls, i)
+        pl: PledgeNode = vec_get((*a).pledges, info.pid)
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+        sig: string = sig_canon(s, ps.params, ps.ret)
+        m: string = mangle_pledge(cname, ast_name(a, pl.name), fnv1a64(sig), version)
+        free(sig)
+        vec_push(mangled, m)
+        if pl.body >= 0 {
+            emit_thunk(g, cid, info, m)
+        }
+        i = i + 1
+    }
+
+    emit_vows(g, cid, cname, vows)
+
+    if vec_len(pls) > 0 {
+        cg_top(g, tmsg3("static const AshPledgeDesc k_", cname, "_pledges[] = {"))
+        mut j: int64 = 0
+        while j < vec_len(pls) {
+            info2: PlInfo = vec_get(pls, j)
+            pl2: PledgeNode = vec_get((*a).pledges, info2.pid)
+            m2: string = vec_get(mangled, j)
+            mut fn_text: string = m2
+            if pl2.body < 0 { fn_text = "NULL" }
+            head: string = tmsg7("    { \"", ast_name(a, pl2.name), "\", \"", m2, "\", ", int_to_string(pl2.params_len), ", ")
+            cg_top(g, tmsg3(head, fn_text, " },"))
+            j = j + 1
+        }
+        cg_top(g, "};")
+        cg_top(g, "")
+    }
+
+    hex: string = hash_hex16(shash)
+    mut pl_ref: string = "NULL"
+    if vec_len(pls) > 0 { pl_ref = tmsg3("k_", cname, "_pledges") }
+    mut vow_ref: string = "NULL"
+    if vec_len(vows) > 0 { vow_ref = tmsg3("k_", cname, "_vows") }
+    cg_top(g, tmsg3("static const AshContractDesc k_", cname, " = {"))
+    cg_top(g, tmsg5("    \"", cname, "\", 0x", hex, "ULL,"))
+    free(hex)
+    cg_top(g, tmsg7("    ", int_to_string(version), ", ", int_to_string(vec_len(pls)), ", ", pl_ref, ","))
+    cg_top(g, tmsg5("    ", int_to_string(vec_len(vows)), ", ", vow_ref, ","))
+    cg_top(g, "};")
+    cg_top(g, "")
+}
+
+// Emits the whole module. The returned string is the translation unit; the
+// caller discards it when errors arrived in the vector.
+export func cgen_module(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> string {
+    g: *Cg = cg_new(a, r, s, t, errors)
+    cg_top(g, "/* generated by ashc, do not edit */")
+    cg_top(g, "#include <ash/ash.h>")
+    cg_top(g, "")
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            emit_contract(g, d.id)
+        }
+        i = i + 1
+    }
+    cg_top(g, "AshStatus ash_module_register(AshRuntime* rt) {")
+    cg_top(g, "    (void)rt;")
+    cg_top(g, "    AshStatus st = ASH_OK;")
+    mut j: int64 = 0
+    while j < vec_len(decls) {
+        d2: DeclNode = vec_get(decls, j)
+        if d2.kind == dk_contract() {
+            c: ContractNode = vec_get((*a).contracts, d2.id)
+            cg_top(g, tmsg3("    st = ash_register_contract(rt, &k_", ast_name(a, c.name), ");"))
+            cg_top(g, "    if (st != ASH_OK) return st;")
+        }
+        j = j + 1
+    }
+    cg_top(g, "    return st;")
+    cg_top(g, "}")
+    out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
+    return out
+}

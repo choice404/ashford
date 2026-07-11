@@ -1,16 +1,16 @@
 // ashc: the command line entry for the ashford compiler, written in dusk.
-// Four commands work today. version prints the build string. lex runs the M1
-// lexer over an .ash file and dumps one token per line to stdout, the golden
-// format tests/lex diffs. parse runs the lexer and the M1 parser and dumps
-// the AST to stdout, the golden format tests/parse diffs. build still emits
-// the canned M0 Greeter module and links target/ashc-out; the checker and
-// code generator replace it as M1 finishes, but the driver path it exercises
-// stays.
+// version prints the build string. lex runs the lexer over an .ash file and
+// dumps one token per line to stdout, the golden format tests/lex diffs.
+// parse runs the lexer and the parser and dumps the AST to stdout, the
+// golden format tests/parse diffs. check runs the whole front end and
+// reports faults alone. build runs the front end and then the M3 code
+// generator: the module C lands in target/ashc-out and cc links it into a
+// shared library beside it.
 //
 // Progress and error messages go to stderr, so stdout carries dump output
 // alone and a tool can diff it byte for byte. build expects to run from the
-// repository root, since it hands cc the relative runtime/include path; the
-// M1 driver grows a proper home lookup.
+// repository root, since it hands cc the relative runtime/include path; a
+// proper home lookup is a later milestone.
 
 @paradigm procedural
 
@@ -18,7 +18,6 @@
 @import std.string
 @import std.os
 @import std.vector
-@import emitc
 @import source
 @import diag
 @import token
@@ -29,8 +28,11 @@
 @import parseitem
 @import astdump
 @import resolve
+@import ty
+@import tysigs
 @import tcrun
 @import reqsolve
+@import cgen
 
 func version_string() -> string {
     return "ashc 0.0.1 (M0 spike)"
@@ -261,23 +263,75 @@ func link_module(cpath: string, sopath: string) -> int64 {
     return code
 }
 
-// Builds one .ash file: read it as a sanity check, emit the module C, write
-// it, and link the shared library beside it.
+// Builds one .ash file: the whole front end first, exactly the check path,
+// then the code generator over the checked tree. Codegen faults are build
+// errors like any other; only a clean run writes the module C and links the
+// shared library beside it.
 func cmd_build(path: string) -> int32 {
-    src, e := read_file(path)
+    s, e := source_load(path)
     if e.exists() {
-        printerr("ashc: could not read the source file")
+        printerr("ashc: cannot read source file")
         return 1
     }
-    if str_len(src) == 0 {
-        printerr("ashc: the source file is empty")
-        free(src)
+    src: string = s.text
+    n: int64 = s.len
+    lx: *Lexer = lex(src, n)
+    p: *Parser = parser_new(lx_tokens(lx), src, n)
+    tree: *Ast = parse_file(p)
+    lerrs: *Vector<Located> = lx_errors(lx)
+    mut li: int64 = 0
+    while li < vec_len(lerrs) {
+        emit_located(path, src, n, vec_get(lerrs, li))
+        li = li + 1
+    }
+    perrs: *Vector<Located> = p_errors(p)
+    mut pi: int64 = 0
+    while pi < vec_len(perrs) {
+        emit_located(path, src, n, vec_get(perrs, pi))
+        pi = pi + 1
+    }
+    if vec_len(lerrs) > 0 { return 1 }
+    if vec_len(perrs) > 0 { return 1 }
+    res: *Resolved = resolve_file(tree)
+    rerrs: *Vector<Located> = rs_errors(res)
+    mut ri: int64 = 0
+    while ri < vec_len(rerrs) {
+        emit_located(path, src, n, vec_get(rerrs, ri))
+        ri = ri + 1
+    }
+    if vec_len(rerrs) > 0 { return 1 }
+    terrs: *Vector<Located> = typeck_file(tree, res)
+    reqsolve_file(tree, res, terrs)
+    mut ti: int64 = 0
+    while ti < vec_len(terrs) {
+        emit_located(path, src, n, vec_get(terrs, ti))
+        ti = ti + 1
+    }
+    if vec_len(terrs) > 0 { return 1 }
+
+    // The checker's own arena and tables were internal to it; the code
+    // generator rebuilds them the same deterministic way. Annotation faults
+    // were all reported above, so the scratch vector stays empty.
+    t: *TyArena = ty_arena_new()
+    scratch: *Vector<Located> = alloc(vec_new())
+    sigs: *Sigs = build_sigs(tree, res, t, scratch)
+    gerrs: *Vector<Located> = alloc(vec_new())
+    ccode: string = cgen_module(tree, res, sigs, t, gerrs)
+    mut gi: int64 = 0
+    while gi < vec_len(gerrs) {
+        emit_located(path, src, n, vec_get(gerrs, gi))
+        gi = gi + 1
+    }
+    if vec_len(gerrs) > 0 {
+        free(ccode)
         return 1
     }
-    free(src)
 
     out: string = out_dir()
-    if !make_out_dir(out) { return 1 }
+    if !make_out_dir(out) {
+        free(ccode)
+        return 1
+    }
 
     stem: string = stem_of(path)
     base: string = join2(out, "/")
@@ -292,7 +346,6 @@ func cmd_build(path: string) -> int32 {
     free(base)
     free(stem)
 
-    ccode: string = emit_module_c()
     werr := write_file(cpath0, ccode)
     free(ccode)
     if werr.exists() {

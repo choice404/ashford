@@ -109,13 +109,33 @@ typedef struct AshPledgeDesc {
     AshPledgeFn fn;        /* NULL marks an abstract pledge awaiting a bind */
 } AshPledgeDesc;
 
+/* One vow of a contract: its name, its value's type tag, and its default
+ * when the declaration carried an initializer. A default that is a string
+ * points at bytes inside the module, which stays mapped for the life of the
+ * runtime; signing copies the value onto the instance either way. */
+typedef struct AshVowDesc {
+    const char* name;
+    uint32_t    ty;           /* AshTypeTag of the vow's value */
+    uint32_t    has_default;
+    AshValue    default_value;
+} AshVowDesc;
+
 typedef struct AshContractDesc {
     const char*          name;
     uint64_t             shape_hash;
     uint32_t             version;
     uint32_t             npledges;
     const AshPledgeDesc* pledges;
+    uint32_t             nvows;
+    const AshVowDesc*    vows;
 } AshContractDesc;
+
+/* A vow override a host supplies at sign. The value is copied onto the
+ * instance, string bytes included; the runtime keeps nothing the host owns. */
+typedef struct AshVowBinding {
+    const char* name;
+    AshValue    value;
+} AshVowBinding;
 
 #ifdef __cplusplus
 }
