@@ -1,0 +1,338 @@
+// ty: the checked type arena for the ashford type checker. Every checked type
+// is one hash consed node, so two mentions of the same type share one id and
+// a type comparison downstream is an integer compare. The node shapes follow
+// docs/grammar.md: the seven scalars and Unit, the builtin composites List,
+// Map, Option, Result, and Tuple, the first class pledge type, a named form
+// for records, sums, and names imports will resolve later, a contract
+// instance type for what sign returns, and an unknown type that stands in
+// after an error so one fault never cascades. Consing goes through the
+// canonical string of a node, interned once; the same string is also the
+// deterministic signature spelling tysigs builds shape hashes from later.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import intern
+
+export struct TyNode { kind: int64, a: int64, b: int64, off: int64, len: int64 }
+
+export struct TyArena {
+    nodes: *Vector<TyNode>,
+    kids: *Vector<int64>,
+    canons: *Vector<int64>,
+    interner: *Interner,
+    ids: *Map<int64>,
+}
+
+export func tyk_int() -> int64 { return 0 }
+export func tyk_uint() -> int64 { return 1 }
+export func tyk_float() -> int64 { return 2 }
+export func tyk_bool() -> int64 { return 3 }
+export func tyk_byte() -> int64 { return 4 }
+export func tyk_char() -> int64 { return 5 }
+export func tyk_str() -> int64 { return 6 }
+export func tyk_unit() -> int64 { return 7 }
+export func tyk_list() -> int64 { return 8 }
+export func tyk_map() -> int64 { return 9 }
+export func tyk_option() -> int64 { return 10 }
+export func tyk_result() -> int64 { return 11 }
+export func tyk_tuple() -> int64 { return 12 }
+export func tyk_pledge() -> int64 { return 13 }
+export func tyk_named() -> int64 { return 14 }
+export func tyk_contract() -> int64 { return 15 }
+export func tyk_unknown() -> int64 { return 16 }
+
+export func ty_arena_new() -> *TyArena {
+    nodes: *Vector<TyNode> = alloc(vec_new())
+    kids: *Vector<int64> = alloc(vec_new())
+    canons: *Vector<int64> = alloc(vec_new())
+    ids: *Map<int64> = alloc(map_new())
+    return alloc(TyArena {
+        nodes: nodes,
+        kids: kids,
+        canons: canons,
+        interner: intern_new(),
+        ids: ids,
+    })
+}
+
+export func ty_get(t: *TyArena, id: int64) -> TyNode {
+    return vec_get((*t).nodes, id)
+}
+
+// The name behind a named or contract node, and "" for every other shape.
+export func ty_name_of(t: *TyArena, id: int64) -> string {
+    n: TyNode = ty_get(t, id)
+    if n.kind == tyk_named() || n.kind == tyk_contract() {
+        return intern_get((*t).interner, n.a)
+    }
+    return ""
+}
+
+func leaf_code(k: int64) -> string {
+    if k == tyk_int() { return "I" }
+    if k == tyk_uint() { return "U" }
+    if k == tyk_float() { return "F" }
+    if k == tyk_bool() { return "B" }
+    if k == tyk_byte() { return "Y" }
+    if k == tyk_char() { return "C" }
+    if k == tyk_str() { return "S" }
+    if k == tyk_unit() { return "V" }
+    return "?"
+}
+
+// Appends the canonical spelling of an already interned node, by id.
+func push_canon(b: *StringBuilder, t: *TyArena, id: int64) -> void {
+    sb_push(b, intern_get((*t).interner, vec_get((*t).canons, id)))
+}
+
+// The canonical spelling of a node whose children are already interned. The
+// spelling is injective per shape, so string equality is node equality.
+func ty_canon(t: *TyArena, n: TyNode) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    if n.kind == tyk_list() {
+        sb_push(b, "L(")
+        push_canon(b, t, n.a)
+        sb_push_char(b, 41)
+    } else if n.kind == tyk_option() {
+        sb_push(b, "O(")
+        push_canon(b, t, n.a)
+        sb_push_char(b, 41)
+    } else if n.kind == tyk_map() {
+        sb_push(b, "M(")
+        push_canon(b, t, n.a)
+        sb_push_char(b, 44)
+        push_canon(b, t, n.b)
+        sb_push_char(b, 41)
+    } else if n.kind == tyk_result() {
+        sb_push(b, "R(")
+        push_canon(b, t, n.a)
+        sb_push_char(b, 44)
+        push_canon(b, t, n.b)
+        sb_push_char(b, 41)
+    } else if n.kind == tyk_tuple() {
+        sb_push(b, "T(")
+        mut i: int64 = 0
+        while i < n.len {
+            if i > 0 { sb_push_char(b, 44) }
+            push_canon(b, t, vec_get((*t).kids, n.off + i))
+            i = i + 1
+        }
+        sb_push_char(b, 41)
+    } else if n.kind == tyk_pledge() {
+        sb_push(b, "P(")
+        mut j: int64 = 0
+        while j < n.len {
+            if j > 0 { sb_push_char(b, 44) }
+            push_canon(b, t, vec_get((*t).kids, n.off + j))
+            j = j + 1
+        }
+        sb_push(b, ")->")
+        push_canon(b, t, n.a)
+    } else if n.kind == tyk_named() {
+        sb_push(b, "N")
+        sb_push(b, intern_get((*t).interner, n.a))
+    } else if n.kind == tyk_contract() {
+        sb_push(b, "K")
+        sb_push(b, intern_get((*t).interner, n.a))
+    } else {
+        sb_push(b, leaf_code(n.kind))
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Interns a node, returning the id of the first node with the same canonical
+// spelling. The canon string joins the arena interner and its id rides beside
+// the node, so signature strings read it back without rebuilding it.
+export func ty_intern(t: *TyArena, n: TyNode) -> int64 {
+    c: string = ty_canon(t, n)
+    cid: int64 = intern_owned((*t).interner, c)
+    key: string = intern_get((*t).interner, cid)
+    ids: *Map<int64> = (*t).ids
+    if map_has(ids, key) {
+        return unwrap_or(map_get(ids, key), -1)
+    }
+    nodes: *Vector<TyNode> = (*t).nodes
+    id: int64 = vec_len(nodes)
+    vec_push(nodes, n)
+    vec_push((*t).canons, cid)
+    map_put(ids, key, id)
+    return id
+}
+
+// The canonical spelling of an interned type, borrowed from the arena.
+export func ty_canon_str(t: *TyArena, id: int64) -> string {
+    return intern_get((*t).interner, vec_get((*t).canons, id))
+}
+
+func ty_kids(t: *TyArena, src: *Vector<int64>) -> (int64, int64) {
+    kids: *Vector<int64> = (*t).kids
+    off: int64 = vec_len(kids)
+    mut i: int64 = 0
+    while i < vec_len(src) {
+        vec_push(kids, vec_get(src, i))
+        i = i + 1
+    }
+    return (off, vec_len(src))
+}
+
+func leaf(t: *TyArena, k: int64) -> int64 {
+    return ty_intern(t, TyNode { kind: k, a: 0, b: 0, off: 0, len: 0 })
+}
+
+export func ty_int(t: *TyArena) -> int64 { return leaf(t, tyk_int()) }
+export func ty_uint(t: *TyArena) -> int64 { return leaf(t, tyk_uint()) }
+export func ty_float(t: *TyArena) -> int64 { return leaf(t, tyk_float()) }
+export func ty_bool(t: *TyArena) -> int64 { return leaf(t, tyk_bool()) }
+export func ty_byte(t: *TyArena) -> int64 { return leaf(t, tyk_byte()) }
+export func ty_char(t: *TyArena) -> int64 { return leaf(t, tyk_char()) }
+export func ty_str(t: *TyArena) -> int64 { return leaf(t, tyk_str()) }
+export func ty_unit(t: *TyArena) -> int64 { return leaf(t, tyk_unit()) }
+export func ty_unknown(t: *TyArena) -> int64 { return leaf(t, tyk_unknown()) }
+
+export func ty_list(t: *TyArena, elem: int64) -> int64 {
+    return ty_intern(t, TyNode { kind: tyk_list(), a: elem, b: 0, off: 0, len: 0 })
+}
+export func ty_map(t: *TyArena, key: int64, val: int64) -> int64 {
+    return ty_intern(t, TyNode { kind: tyk_map(), a: key, b: val, off: 0, len: 0 })
+}
+export func ty_option(t: *TyArena, inner: int64) -> int64 {
+    return ty_intern(t, TyNode { kind: tyk_option(), a: inner, b: 0, off: 0, len: 0 })
+}
+export func ty_result(t: *TyArena, ok: int64, err: int64) -> int64 {
+    return ty_intern(t, TyNode { kind: tyk_result(), a: ok, b: err, off: 0, len: 0 })
+}
+export func ty_tuple(t: *TyArena, xs: *Vector<int64>) -> int64 {
+    off, len := ty_kids(t, xs)
+    return ty_intern(t, TyNode { kind: tyk_tuple(), a: 0, b: 0, off: off, len: len })
+}
+export func ty_pledge_ty(t: *TyArena, ps: *Vector<int64>, ret: int64) -> int64 {
+    off, len := ty_kids(t, ps)
+    return ty_intern(t, TyNode { kind: tyk_pledge(), a: ret, b: 0, off: off, len: len })
+}
+export func ty_named(t: *TyArena, name: string) -> int64 {
+    nid: int64 = intern_id((*t).interner, name)
+    return ty_intern(t, TyNode { kind: tyk_named(), a: nid, b: 0, off: 0, len: 0 })
+}
+export func ty_contract(t: *TyArena, name: string) -> int64 {
+    nid: int64 = intern_id((*t).interner, name)
+    return ty_intern(t, TyNode { kind: tyk_contract(), a: nid, b: 0, off: 0, len: 0 })
+}
+
+// Whether a type may stand where the other is expected. Consing makes equal
+// types share an id, so the only work left is letting the unknown recovery
+// type stand anywhere, including inside a composite, the case an empty list
+// literal produces.
+export func compat(t: *TyArena, a: int64, b: int64) -> bool {
+    if a == b { return true }
+    na: TyNode = ty_get(t, a)
+    nb: TyNode = ty_get(t, b)
+    if na.kind == tyk_unknown() || nb.kind == tyk_unknown() { return true }
+    if na.kind != nb.kind { return false }
+    if na.kind == tyk_list() || na.kind == tyk_option() {
+        return compat(t, na.a, nb.a)
+    }
+    if na.kind == tyk_map() || na.kind == tyk_result() {
+        return compat(t, na.a, nb.a) && compat(t, na.b, nb.b)
+    }
+    if na.kind == tyk_tuple() {
+        if na.len != nb.len { return false }
+        mut i: int64 = 0
+        while i < na.len {
+            if !compat(t, vec_get((*t).kids, na.off + i), vec_get((*t).kids, nb.off + i)) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if na.kind == tyk_pledge() {
+        if na.len != nb.len { return false }
+        mut j: int64 = 0
+        while j < na.len {
+            if !compat(t, vec_get((*t).kids, na.off + j), vec_get((*t).kids, nb.off + j)) { return false }
+            j = j + 1
+        }
+        return compat(t, na.a, nb.a)
+    }
+    return false
+}
+
+func push_render(b: *StringBuilder, t: *TyArena, id: int64) -> void {
+    n: TyNode = ty_get(t, id)
+    if n.kind == tyk_int() {
+        sb_push(b, "Int")
+    } else if n.kind == tyk_uint() {
+        sb_push(b, "UInt")
+    } else if n.kind == tyk_float() {
+        sb_push(b, "Float")
+    } else if n.kind == tyk_bool() {
+        sb_push(b, "Bool")
+    } else if n.kind == tyk_byte() {
+        sb_push(b, "Byte")
+    } else if n.kind == tyk_char() {
+        sb_push(b, "Char")
+    } else if n.kind == tyk_str() {
+        sb_push(b, "String")
+    } else if n.kind == tyk_unit() {
+        sb_push(b, "Unit")
+    } else if n.kind == tyk_list() {
+        sb_push(b, "List<")
+        push_render(b, t, n.a)
+        sb_push_char(b, 62)
+    } else if n.kind == tyk_map() {
+        sb_push(b, "Map<")
+        push_render(b, t, n.a)
+        sb_push(b, ", ")
+        push_render(b, t, n.b)
+        sb_push_char(b, 62)
+    } else if n.kind == tyk_option() {
+        sb_push(b, "Option<")
+        push_render(b, t, n.a)
+        sb_push_char(b, 62)
+    } else if n.kind == tyk_result() {
+        sb_push(b, "Result<")
+        push_render(b, t, n.a)
+        sb_push(b, ", ")
+        push_render(b, t, n.b)
+        sb_push_char(b, 62)
+    } else if n.kind == tyk_tuple() {
+        sb_push(b, "Tuple<")
+        mut i: int64 = 0
+        while i < n.len {
+            if i > 0 { sb_push(b, ", ") }
+            push_render(b, t, vec_get((*t).kids, n.off + i))
+            i = i + 1
+        }
+        sb_push_char(b, 62)
+    } else if n.kind == tyk_pledge() {
+        sb_push(b, "pledge(")
+        mut j: int64 = 0
+        while j < n.len {
+            if j > 0 { sb_push(b, ", ") }
+            push_render(b, t, vec_get((*t).kids, n.off + j))
+            j = j + 1
+        }
+        sb_push(b, ") -> ")
+        push_render(b, t, n.a)
+    } else if n.kind == tyk_named() || n.kind == tyk_contract() {
+        sb_push(b, intern_get((*t).interner, n.a))
+    } else {
+        sb_push(b, "_")
+    }
+}
+
+// The surface spelling of a type for diagnostics, a fresh heap string that
+// message builders keep alive for the run.
+export func ty_render(t: *TyArena, id: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    push_render(b, t, id)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}

@@ -1,0 +1,163 @@
+// reqsolve: requirements satisfiability. The resolver capped a contract at
+// 16 atoms, so the policy lines are small boolean formulas and satisfiability
+// is a plain enumeration of every atom assignment. Two static rejections
+// come out of it. A fulfill line and a break line that can hold at once is
+// the contradiction the grammar names, reported with the witness assignment
+// that makes both true. A fulfill or break line no assignment satisfies is a
+// dead policy, a line that can never fire, and dead law in a contract is a
+// bug at the site that wrote it. A contract with no requirements block keeps
+// the synthesized defaults, which are sound by construction and never
+// checked here. This pass runs only after a clean resolve, so every atom
+// names a real subcontract or loose pledge.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+
+func rq_emit(errors: *Vector<Located>, lo: int64, hi: int64, msg: string) -> void {
+    vec_push(errors, located(lo, hi, msg))
+}
+
+func rmsg3(s1: string, s2: string, s3: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Collects the distinct atoms of one line in first appearance order. The
+// order is what the witness rendering follows, so the diagnostic reads the
+// way the block was written.
+func collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<int64>) -> void {
+    q: ReqNode = vec_get((*a).reqs, id)
+    if q.kind == rk_atom() {
+        key: string = rs_gkey(q.a)
+        if !map_has(idx, key) {
+            map_put(idx, key, vec_len(names))
+            vec_push(names, q.a)
+        }
+    } else if q.kind == rk_not() {
+        collect_atoms(a, q.a, names, idx)
+    } else {
+        collect_atoms(a, q.a, names, idx)
+        collect_atoms(a, q.b, names, idx)
+    }
+}
+
+// Evaluates one line under one assignment: bit i of mask is atom i.
+func eval_req(a: *Ast, id: int64, idx: *Map<int64>, pows: *Vector<int64>, mask: int64) -> bool {
+    q: ReqNode = vec_get((*a).reqs, id)
+    if q.kind == rk_atom() {
+        i: int64 = unwrap_or(map_get(idx, rs_gkey(q.a)), 0)
+        return (mask / vec_get(pows, i)) % 2 == 1
+    }
+    if q.kind == rk_not() {
+        return !eval_req(a, q.a, idx, pows, mask)
+    }
+    if q.kind == rk_and() {
+        return eval_req(a, q.a, idx, pows, mask) && eval_req(a, q.b, idx, pows, mask)
+    }
+    return eval_req(a, q.a, idx, pows, mask) || eval_req(a, q.b, idx, pows, mask)
+}
+
+// The witness assignment rendered as the atom list, each name bare when true
+// and negated when false: "Packing, !Delivery, invoice".
+func witness(a: *Ast, names: *Vector<int64>, pows: *Vector<int64>, mask: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut i: int64 = 0
+    while i < vec_len(names) {
+        if i > 0 { sb_push(b, ", ") }
+        if (mask / vec_get(pows, i)) % 2 == 0 {
+            sb_push_char(b, 33)
+        }
+        sb_push(b, ast_name(a, vec_get(names, i)))
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func solve_block(a: *Ast, cname: string, rb: ReqBlockNode, errors: *Vector<Located>) -> void {
+    names: *Vector<int64> = alloc(vec_new())
+    idx: *Map<int64> = alloc(map_new())
+    if rb.fulfill >= 0 { collect_atoms(a, rb.fulfill, names, idx) }
+    if rb.partial >= 0 { collect_atoms(a, rb.partial, names, idx) }
+    if rb.brk >= 0 { collect_atoms(a, rb.brk, names, idx) }
+    n: int64 = vec_len(names)
+    if n > 16 { return }
+    pows: *Vector<int64> = alloc(vec_new())
+    mut p: int64 = 1
+    mut k: int64 = 0
+    while k <= n {
+        vec_push(pows, p)
+        p = p * 2
+        k = k + 1
+    }
+    total: int64 = vec_get(pows, n)
+    mut sat_f: bool = false
+    mut sat_b: bool = false
+    mut both: int64 = -1
+    mut mask: int64 = 0
+    while mask < total {
+        mut fv: bool = false
+        mut bv: bool = false
+        if rb.fulfill >= 0 { fv = eval_req(a, rb.fulfill, idx, pows, mask) }
+        if rb.brk >= 0 { bv = eval_req(a, rb.brk, idx, pows, mask) }
+        if fv { sat_f = true }
+        if bv { sat_b = true }
+        if fv && bv {
+            if both < 0 { both = mask }
+        }
+        mask = mask + 1
+    }
+    if rb.fulfill >= 0 && rb.brk >= 0 && both >= 0 {
+        w: string = witness(a, names, pows, both)
+        rq_emit(errors, rb.lo, rb.hi, rmsg3(rmsg3("requirements 'fulfill' and 'break' can both hold in contract '", cname, "' when "), w, ""))
+    }
+    if rb.fulfill >= 0 && !sat_f {
+        rq_emit(errors, rb.lo, rb.hi, rmsg3("requirements 'fulfill' can never hold in contract '", cname, "'"))
+    }
+    if rb.brk >= 0 && !sat_b {
+        rq_emit(errors, rb.lo, rb.hi, rmsg3("requirements 'break' can never hold in contract '", cname, "'"))
+    }
+}
+
+// The pass: the first requirements block of every contract, the one the
+// resolver accepted. Faults append to the caller's vector.
+export func reqsolve_file(a: *Ast, r: *Resolved, errors: *Vector<Located>) -> void {
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            cname: string = ast_name(a, c.name)
+            mut done: bool = false
+            mut j: int64 = 0
+            while j < c.members_len {
+                mkind: int64 = vec_get((*a).kids, c.members_off + j)
+                if mkind == mk_requirements() {
+                    if !done {
+                        done = true
+                        rb: ReqBlockNode = vec_get((*a).reqblocks, vec_get((*a).kids, c.members_off + j + 1))
+                        solve_block(a, cname, rb, errors)
+                    }
+                }
+                j = j + 2
+            }
+        }
+        i = i + 1
+    }
+}

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # The golden test runner for the ashford front end. Each suite directory pairs
-# with an ashc command: tests/lex with `ashc lex` and tests/parse with
-# `ashc parse`. Every NAME.ash with a NAME.expect beside it must be accepted
-# and its dump must match the golden byte for byte. Every NAME.ash with a
+# with an ashc command: tests/lex with `ashc lex`, tests/parse with
+# `ashc parse`, and tests/check and tests/typeck with `ashc check`. Every NAME.ash with a
+# NAME.expect beside it must be accepted and its dump must match the golden
+# byte for byte; check writes nothing to stdout, so its goldens are a single
+# blank line guarding that silence. Every NAME.ash with a
 # NAME.err beside it must be rejected: a nonzero exit and every line of the
 # .err file appearing somewhere in stderr as a substring, so a diagnostic can
 # gain context without breaking the suite. The ashc binary is rebuilt when
@@ -80,6 +82,8 @@ run_suite() {
 
 run_suite lex lex
 run_suite parse parse
+run_suite check check
+run_suite typeck check
 
 echo "[tests] $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -1,0 +1,1 @@
+vow 'currency' initializer has type 'Int' but the vow is 'String'

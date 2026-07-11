@@ -28,6 +28,9 @@
 @import parse
 @import parseitem
 @import astdump
+@import resolve
+@import tcrun
+@import reqsolve
 
 func version_string() -> string {
     return "ashc 0.0.1 (M0 spike)"
@@ -39,6 +42,7 @@ func usage() -> void {
     printerr("  version       print the compiler version")
     printerr("  lex <file>    dump the token stream of a source file")
     printerr("  parse <file>  dump the AST of a source file")
+    printerr("  check <file>  lex, parse, resolve, and type check a source file")
     printerr("  build <file>  emit the module C and link it into a shared library")
 }
 
@@ -113,6 +117,67 @@ func cmd_parse(path: string) -> int32 {
     if vec_len(perrs) > 0 {
         return 1
     }
+    return 0
+}
+
+// Runs the lexer, the parser, the resolver, the type checker, and the
+// requirements solver on the file at path. Nothing goes to stdout; faults go
+// to stderr and decide the exit code. A file that faulted in the lexer or
+// the parser never reaches the resolver, since the recovery placeholders in
+// its tree would only echo the earlier faults as phantom names, and a file
+// that faulted in the resolver never reaches the type checker, whose sig
+// tables assume every name is unique. A clean file reports one line so a
+// caller watching stderr sees the pass happened.
+func cmd_check(path: string) -> int32 {
+    s, e := source_load(path)
+    if e.exists() {
+        printerr("ashc: cannot read source file")
+        return 1
+    }
+    src: string = s.text
+    n: int64 = s.len
+    lx: *Lexer = lex(src, n)
+    p: *Parser = parser_new(lx_tokens(lx), src, n)
+    tree: *Ast = parse_file(p)
+    lerrs: *Vector<Located> = lx_errors(lx)
+    mut i: int64 = 0
+    while i < vec_len(lerrs) {
+        emit_located(path, src, n, vec_get(lerrs, i))
+        i = i + 1
+    }
+    perrs: *Vector<Located> = p_errors(p)
+    mut j: int64 = 0
+    while j < vec_len(perrs) {
+        emit_located(path, src, n, vec_get(perrs, j))
+        j = j + 1
+    }
+    if vec_len(lerrs) > 0 {
+        return 1
+    }
+    if vec_len(perrs) > 0 {
+        return 1
+    }
+    res: *Resolved = resolve_file(tree)
+    rerrs: *Vector<Located> = rs_errors(res)
+    mut k: int64 = 0
+    while k < vec_len(rerrs) {
+        emit_located(path, src, n, vec_get(rerrs, k))
+        k = k + 1
+    }
+    if vec_len(rerrs) > 0 {
+        return 1
+    }
+    terrs: *Vector<Located> = typeck_file(tree, res)
+    reqsolve_file(tree, res, terrs)
+    mut q: int64 = 0
+    while q < vec_len(terrs) {
+        emit_located(path, src, n, vec_get(terrs, q))
+        q = q + 1
+    }
+    if vec_len(terrs) > 0 {
+        return 1
+    }
+    printerr("[ashc] check ok")
     return 0
 }
 
@@ -272,6 +337,14 @@ func main(argc: int32, argv: string[]) -> int32 {
             return 1
         }
         return cmd_parse(argv[2])
+    }
+    if str_eq(cmd, "check") {
+        if argv.len < 3 {
+            printerr("ashc: check needs a file argument")
+            usage()
+            return 1
+        }
+        return cmd_check(argv[2])
     }
     if str_eq(cmd, "build") {
         if argv.len < 3 {

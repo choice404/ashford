@@ -1,0 +1,475 @@
+// tysigs: the signature tables the type checker reads, built from the
+// resolved file before any body is walked. Every declared type annotation is
+// lowered here into the checked type arena, with the grammar's type rules
+// enforced at the annotation: type arguments belong to the builtin composites
+// alone and arrive in the right number, Map keys stay in the keyable set, a
+// user named type takes no arguments, and a pledge returns Result, Option, or
+// Unit and nothing else. A name no declaration owns lowers to an opaque named
+// type rather than a fault, because imports resolve in a later milestone and
+// an imported type must be usable by name today. The canonical signature
+// string built here is deterministic, the spelling later shape hashes eat.
+//
+// Table keys reuse the resolver's spelling: rs_mkey for contract members,
+// rs_skey for pledges inside a named subcontract, and the global name id in
+// decimal for records and variants. Duplicate declarations were already
+// reported by resolve, so on a repeated key the first entry wins here too.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+
+export struct TyList { off: int64, len: int64 }
+export struct FieldSig { name: int64, ty: int64 }
+export struct RecSig { off: int64, len: int64, found: bool }
+export struct VariantSig { off: int64, len: int64, owner: int64, found: bool }
+export struct VowSigT { ty: int64, has_init: bool, found: bool }
+export struct PledgeSigT { params: TyList, ret: int64, sub: int64, found: bool }
+export struct ClauseSigT { params: TyList, ret: int64, found: bool }
+
+export struct Sigs {
+    ast: *Ast,
+    res: *Resolved,
+    ty: *TyArena,
+    plists: *Vector<int64>,
+    fields: *Vector<FieldSig>,
+    recs: *Map<RecSig>,
+    variants: *Map<VariantSig>,
+    vows: *Map<VowSigT>,
+    pledges: *Map<PledgeSigT>,
+    clauses: *Map<ClauseSigT>,
+    provsigs: *Map<ClauseSigT>,
+    errors: *Vector<Located>,
+}
+
+export func no_vow_sig() -> VowSigT {
+    return VowSigT { ty: -1, has_init: false, found: false }
+}
+
+export func no_pledge_sig() -> PledgeSigT {
+    return PledgeSigT { params: TyList { off: 0, len: 0 }, ret: -1, sub: -1, found: false }
+}
+
+export func no_clause_sig() -> ClauseSigT {
+    return ClauseSigT { params: TyList { off: 0, len: 0 }, ret: -1, found: false }
+}
+
+func no_rec_sig() -> RecSig {
+    return RecSig { off: 0, len: 0, found: false }
+}
+
+func no_variant_sig() -> VariantSig {
+    return VariantSig { off: 0, len: 0, owner: -1, found: false }
+}
+
+// The key of a provisional clause signature: the prov id, then the name id.
+export func sig_pkey(provid: int64, name: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push_char(b, 112)
+    sb_push_int(b, provid)
+    sb_push_char(b, 46)
+    sb_push_int(b, name)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func sig_emit(s: *Sigs, lo: int64, hi: int64, msg: string) -> void {
+    vec_push((*s).errors, located(lo, hi, msg))
+}
+
+func smsg3(s1: string, s2: string, s3: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// Whether a lowered type may key a Map: Int, UInt, Bool, Byte, Char, String,
+// with the unknown recovery type passing so one fault stays one fault.
+func map_keyable(t: *TyArena, id: int64) -> bool {
+    k: int64 = ty_get(t, id).kind
+    if k == tyk_int() || k == tyk_uint() || k == tyk_bool() { return true }
+    if k == tyk_byte() || k == tyk_char() || k == tyk_str() { return true }
+    return k == tyk_unknown()
+}
+
+func scalar_of(t: *TyArena, name: string) -> int64 {
+    if str_eq(name, "Int") { return ty_int(t) }
+    if str_eq(name, "UInt") { return ty_uint(t) }
+    if str_eq(name, "Float") { return ty_float(t) }
+    if str_eq(name, "Bool") { return ty_bool(t) }
+    if str_eq(name, "Byte") { return ty_byte(t) }
+    if str_eq(name, "Char") { return ty_char(t) }
+    if str_eq(name, "String") { return ty_str(t) }
+    if str_eq(name, "Unit") { return ty_unit(t) }
+    return -1
+}
+
+func lower_named(s: *Sigs, n: TypeNode, lo: int64, hi: int64) -> int64 {
+    a: *Ast = (*s).ast
+    t: *TyArena = (*s).ty
+    name: string = ast_name(a, n.a)
+    if str_len(name) == 0 { return ty_unknown(t) }
+    scalar: int64 = scalar_of(t, name)
+    if scalar >= 0 {
+        if n.c > 0 {
+            sig_emit(s, lo, hi, smsg3("type '", name, "' takes no type arguments"))
+        }
+        return scalar
+    }
+    if str_eq(name, "List") {
+        if n.c != 1 {
+            sig_emit(s, lo, hi, "List takes one type argument")
+            return ty_unknown(t)
+        }
+        return ty_list(t, lower_type(s, vec_get((*a).kids, n.b), lo, hi))
+    }
+    if str_eq(name, "Option") {
+        if n.c != 1 {
+            sig_emit(s, lo, hi, "Option takes one type argument")
+            return ty_unknown(t)
+        }
+        return ty_option(t, lower_type(s, vec_get((*a).kids, n.b), lo, hi))
+    }
+    if str_eq(name, "Map") {
+        if n.c != 2 {
+            sig_emit(s, lo, hi, "Map takes two type arguments")
+            return ty_unknown(t)
+        }
+        key: int64 = lower_type(s, vec_get((*a).kids, n.b), lo, hi)
+        val: int64 = lower_type(s, vec_get((*a).kids, n.b + 1), lo, hi)
+        if !map_keyable(t, key) {
+            sig_emit(s, lo, hi, "a Map key must be Int, UInt, Bool, Byte, Char, or String")
+        }
+        return ty_map(t, key, val)
+    }
+    if str_eq(name, "Result") {
+        if n.c != 2 {
+            sig_emit(s, lo, hi, "Result takes two type arguments")
+            return ty_unknown(t)
+        }
+        ok: int64 = lower_type(s, vec_get((*a).kids, n.b), lo, hi)
+        err: int64 = lower_type(s, vec_get((*a).kids, n.b + 1), lo, hi)
+        return ty_result(t, ok, err)
+    }
+    if str_eq(name, "Tuple") {
+        if n.c < 1 {
+            sig_emit(s, lo, hi, "Tuple takes at least one type argument")
+            return ty_unknown(t)
+        }
+        xs: *Vector<int64> = alloc(vec_new())
+        mut i: int64 = 0
+        while i < n.c {
+            vec_push(xs, lower_type(s, vec_get((*a).kids, n.b + i), lo, hi))
+            i = i + 1
+        }
+        return ty_tuple(t, xs)
+    }
+    if n.c > 0 {
+        sig_emit(s, lo, hi, smsg3("'", name, "' takes no type arguments"))
+    }
+    g: GEntry = rs_global((*s).res, n.a)
+    if g.kind == gk_contract() {
+        return ty_contract(t, name)
+    }
+    if g.kind == gk_variant() {
+        sig_emit(s, lo, hi, smsg3("'", name, "' is a variant, not a type"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_prov() {
+        sig_emit(s, lo, hi, smsg3("'", name, "' is a provisional clause, not a type"))
+        return ty_unknown(t)
+    }
+    return ty_named(t, name)
+}
+
+// Lowers one surface type annotation into the arena, reporting every rule the
+// annotation itself can break. An unresolvable name stays opaque, see above.
+export func lower_type(s: *Sigs, tyid: int64, lo: int64, hi: int64) -> int64 {
+    t: *TyArena = (*s).ty
+    if tyid < 0 { return ty_unknown(t) }
+    a: *Ast = (*s).ast
+    n: TypeNode = vec_get((*a).types, tyid)
+    if n.kind == tk_named() {
+        return lower_named(s, n, lo, hi)
+    }
+    ps: *Vector<int64> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < n.b {
+        vec_push(ps, lower_type(s, vec_get((*a).kids, n.a + i), lo, hi))
+        i = i + 1
+    }
+    return ty_pledge_ty(t, ps, lower_type(s, n.c, lo, hi))
+}
+
+// Lowers a FieldDecl parameter list into a TyList of checked types.
+func lower_params(s: *Sigs, off: int64, len: int64, lo: int64, hi: int64) -> TyList {
+    a: *Ast = (*s).ast
+    tys: *Vector<int64> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, off + i))
+        vec_push(tys, lower_type(s, f.ty, lo, hi))
+        i = i + 1
+    }
+    plists: *Vector<int64> = (*s).plists
+    poff: int64 = vec_len(plists)
+    mut j: int64 = 0
+    while j < vec_len(tys) {
+        vec_push(plists, vec_get(tys, j))
+        j = j + 1
+    }
+    return TyList { off: poff, len: vec_len(tys) }
+}
+
+// The deterministic canonical spelling of a pledge or clause signature, the
+// string a signature comparison and a later shape hash both read. A fresh
+// heap string the message tables keep alive.
+export func sig_canon(s: *Sigs, params: TyList, ret: int64) -> string {
+    t: *TyArena = (*s).ty
+    b: *StringBuilder = alloc(sb_new())
+    sb_push_char(b, 40)
+    mut i: int64 = 0
+    while i < params.len {
+        if i > 0 { sb_push_char(b, 44) }
+        sb_push(b, ty_canon_str(t, vec_get((*s).plists, params.off + i)))
+        i = i + 1
+    }
+    sb_push(b, ")->")
+    sb_push(b, ty_canon_str(t, ret))
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The pledge return rule: Result, Option, or Unit, with unknown passing after
+// an earlier fault in the annotation.
+func check_pledge_ret(s: *Sigs, pl: PledgeNode, ret: int64) -> void {
+    k: int64 = ty_get((*s).ty, ret).kind
+    if k == tyk_result() || k == tyk_option() || k == tyk_unit() || k == tyk_unknown() {
+        return
+    }
+    sig_emit(s, pl.lo, pl.hi, smsg3("pledge '", ast_name((*s).ast, pl.name), "' must return Result, Option, or Unit"))
+}
+
+func collect_pledge(s: *Sigs, key: string, pid: int64, sub: int64) -> void {
+    a: *Ast = (*s).ast
+    pl: PledgeNode = vec_get((*a).pledges, pid)
+    params: TyList = lower_params(s, pl.params_off, pl.params_len, pl.lo, pl.hi)
+    ret: int64 = lower_type(s, pl.ret, pl.lo, pl.hi)
+    check_pledge_ret(s, pl, ret)
+    tab: *Map<PledgeSigT> = (*s).pledges
+    if !map_has(tab, key) {
+        map_put(tab, key, PledgeSigT { params: params, ret: ret, sub: sub, found: true })
+    }
+}
+
+func collect_contract(s: *Sigs, cid: int64) -> void {
+    a: *Ast = (*s).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+        if mkind == mk_vow() {
+            v: VowNode = vec_get((*a).vows, mid)
+            vkey: string = rs_mkey(cid, v.name)
+            vows: *Map<VowSigT> = (*s).vows
+            if !map_has(vows, vkey) {
+                map_put(vows, vkey, VowSigT { ty: lower_type(s, v.ty, v.lo, v.hi), has_init: v.init >= 0, found: true })
+            }
+        } else if mkind == mk_pledge() {
+            pl: PledgeNode = vec_get((*a).pledges, mid)
+            collect_pledge(s, rs_mkey(cid, pl.name), mid, -1)
+        } else if mkind == mk_clause() {
+            cl: ClauseNode = vec_get((*a).clauses, mid)
+            ckey: string = rs_mkey(cid, cl.name)
+            clauses: *Map<ClauseSigT> = (*s).clauses
+            if !map_has(clauses, ckey) {
+                params: TyList = lower_params(s, cl.params_off, cl.params_len, cl.lo, cl.hi)
+                map_put(clauses, ckey, ClauseSigT { params: params, ret: lower_type(s, cl.ret, cl.lo, cl.hi), found: true })
+            }
+        } else if mkind == mk_subcontract() {
+            sub: SubNode = vec_get((*a).subs, mid)
+            mut j: int64 = 0
+            while j < sub.pledges_len {
+                pid: int64 = vec_get((*a).kids, sub.pledges_off + j)
+                pl2: PledgeNode = vec_get((*a).pledges, pid)
+                if sub.name >= 0 {
+                    collect_pledge(s, rs_skey(mid, pl2.name), pid, mid)
+                } else {
+                    collect_pledge(s, rs_mkey(cid, pl2.name), pid, mid)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 2
+    }
+}
+
+// Builds every table. Records and sums first, then provisional clause
+// signatures, then contract members, all in declaration order so the lowered
+// tables read back deterministically.
+export func build_sigs(a: *Ast, r: *Resolved, t: *TyArena, errors: *Vector<Located>) -> *Sigs {
+    plists: *Vector<int64> = alloc(vec_new())
+    fields: *Vector<FieldSig> = alloc(vec_new())
+    recs: *Map<RecSig> = alloc(map_new())
+    variants: *Map<VariantSig> = alloc(map_new())
+    vows: *Map<VowSigT> = alloc(map_new())
+    pledges: *Map<PledgeSigT> = alloc(map_new())
+    clauses: *Map<ClauseSigT> = alloc(map_new())
+    provsigs: *Map<ClauseSigT> = alloc(map_new())
+    s: *Sigs = alloc(Sigs {
+        ast: a, res: r, ty: t,
+        plists: plists, fields: fields,
+        recs: recs, variants: variants, vows: vows,
+        pledges: pledges, clauses: clauses, provsigs: provsigs,
+        errors: errors,
+    })
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_record() {
+            collect_record(s, d.id)
+        } else if d.kind == dk_sum() {
+            collect_sum(s, d.id)
+        } else if d.kind == dk_prov() {
+            collect_prov(s, d.id)
+        } else if d.kind == dk_contract() {
+            collect_contract(s, d.id)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+func collect_record(s: *Sigs, rid: int64) -> void {
+    a: *Ast = (*s).ast
+    rec: RecordNode = vec_get((*a).records, rid)
+    key: string = rs_gkey(rec.name)
+    tab: *Map<RecSig> = (*s).recs
+    if map_has(tab, key) { return }
+    fields: *Vector<FieldSig> = (*s).fields
+    off: int64 = vec_len(fields)
+    mut i: int64 = 0
+    while i < rec.fields_len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, rec.fields_off + i))
+        vec_push(fields, FieldSig { name: f.name, ty: lower_type(s, f.ty, rec.lo, rec.hi) })
+        i = i + 1
+    }
+    map_put(tab, key, RecSig { off: off, len: rec.fields_len, found: true })
+}
+
+func collect_sum(s: *Sigs, sid: int64) -> void {
+    a: *Ast = (*s).ast
+    sum: SumNode = vec_get((*a).sums, sid)
+    mut i: int64 = 0
+    while i < sum.variants_len {
+        vid: int64 = vec_get((*a).kids, sum.variants_off + i)
+        v: VariantNode = vec_get((*a).variants, vid)
+        key: string = rs_gkey(v.name)
+        tab: *Map<VariantSig> = (*s).variants
+        if !map_has(tab, key) {
+            fields: *Vector<FieldSig> = (*s).fields
+            off: int64 = vec_len(fields)
+            mut j: int64 = 0
+            while j < v.fields_len {
+                f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, v.fields_off + j))
+                vec_push(fields, FieldSig { name: f.name, ty: lower_type(s, f.ty, sum.lo, sum.hi) })
+                j = j + 1
+            }
+            map_put(tab, key, VariantSig { off: off, len: v.fields_len, owner: sum.name, found: true })
+        }
+        i = i + 1
+    }
+}
+
+func collect_prov(s: *Sigs, pvid: int64) -> void {
+    a: *Ast = (*s).ast
+    pv: ProvNode = vec_get((*a).provs, pvid)
+    mut i: int64 = 0
+    while i < pv.sigs_len {
+        sig: ClauseSigNode = vec_get((*a).clause_sigs, vec_get((*a).kids, pv.sigs_off + i))
+        key: string = sig_pkey(pvid, sig.name)
+        tab: *Map<ClauseSigT> = (*s).provsigs
+        if !map_has(tab, key) {
+            params: TyList = lower_params(s, sig.params_off, sig.params_len, pv.lo, pv.hi)
+            map_put(tab, key, ClauseSigT { params: params, ret: lower_type(s, sig.ret, pv.lo, pv.hi), found: true })
+        }
+        i = i + 1
+    }
+}
+
+// Lookups with a found flag standing in for a miss.
+export func sig_rec(s: *Sigs, name: int64) -> RecSig {
+    return unwrap_or(map_get((*s).recs, rs_gkey(name)), no_rec_sig())
+}
+
+export func sig_variant(s: *Sigs, name: int64) -> VariantSig {
+    return unwrap_or(map_get((*s).variants, rs_gkey(name)), no_variant_sig())
+}
+
+export func sig_vow(s: *Sigs, cid: int64, name: int64) -> VowSigT {
+    return unwrap_or(map_get((*s).vows, rs_mkey(cid, name)), no_vow_sig())
+}
+
+export func sig_clause(s: *Sigs, cid: int64, name: int64) -> ClauseSigT {
+    return unwrap_or(map_get((*s).clauses, rs_mkey(cid, name)), no_clause_sig())
+}
+
+export func sig_prov_clause(s: *Sigs, pvid: int64, name: int64) -> ClauseSigT {
+    return unwrap_or(map_get((*s).provsigs, sig_pkey(pvid, name)), no_clause_sig())
+}
+
+// A pledge reachable on an instance of the contract: a loose pledge or an
+// anonymous subcontract's pledge under the member key, or a pledge inside any
+// named subcontract, all fulfillable through the signed instance.
+export func find_pledge(s: *Sigs, cid: int64, name: int64) -> PledgeSigT {
+    tab: *Map<PledgeSigT> = (*s).pledges
+    mkey: string = rs_mkey(cid, name)
+    if map_has(tab, mkey) {
+        return unwrap_or(map_get(tab, mkey), no_pledge_sig())
+    }
+    a: *Ast = (*s).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_subcontract() {
+            subid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+            sub: SubNode = vec_get((*a).subs, subid)
+            if sub.name >= 0 {
+                skey: string = rs_skey(subid, name)
+                if map_has(tab, skey) {
+                    return unwrap_or(map_get(tab, skey), no_pledge_sig())
+                }
+            }
+        }
+        i = i + 2
+    }
+    return no_pledge_sig()
+}
+
+// The n-th parameter type of a lowered signature.
+export func sig_param(s: *Sigs, params: TyList, i: int64) -> int64 {
+    return vec_get((*s).plists, params.off + i)
+}
+
+// The n-th field of a record or variant payload.
+export func sig_field(s: *Sigs, off: int64, i: int64) -> FieldSig {
+    return vec_get((*s).fields, off + i)
+}

@@ -39,11 +39,11 @@ export struct VariantNode { name: int64, fields_off: int64, fields_len: int64 }
 export struct SumNode { name: int64, lo: int64, hi: int64, variants_off: int64, variants_len: int64 }
 export struct ClauseSigNode { name: int64, params_off: int64, params_len: int64, ret: int64 }
 export struct ProvNode { internal: bool, name: int64, lo: int64, hi: int64, sigs_off: int64, sigs_len: int64 }
-export struct VowNode { name: int64, ty: int64, init: int64 }
+export struct VowNode { name: int64, lo: int64, hi: int64, ty: int64, init: int64 }
 export struct PledgeNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, attrs_off: int64, attrs_len: int64, body: int64 }
 export struct ClauseNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, body: int64 }
 export struct SubNode { name: int64, lo: int64, hi: int64, pledges_off: int64, pledges_len: int64 }
-export struct ReqNode { kind: int64, a: int64, b: int64 }
+export struct ReqNode { kind: int64, lo: int64, hi: int64, a: int64, b: int64 }
 export struct ReqBlockNode { lo: int64, hi: int64, fulfill: int64, partial: int64, brk: int64 }
 export struct IncNode { name: int64, lo: int64, hi: int64 }
 
@@ -346,10 +346,10 @@ export func ast_sub(a: *Ast, n: SubNode) -> int64 {
     return id
 }
 
-export func ast_req(a: *Ast, kind: int64, x: int64, y: int64) -> int64 {
+export func ast_req(a: *Ast, kind: int64, lo: int64, hi: int64, x: int64, y: int64) -> int64 {
     v: *Vector<ReqNode> = (*a).reqs
     id: int64 = vec_len(v)
-    vec_push(v, ReqNode { kind: kind, a: x, b: y })
+    vec_push(v, ReqNode { kind: kind, lo: lo, hi: hi, a: x, b: y })
     return id
 }
 

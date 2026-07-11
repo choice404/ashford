@@ -1,0 +1,1 @@
+pledge 'count' must return Result, Option, or Unit

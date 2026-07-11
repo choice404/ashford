@@ -1,0 +1,194 @@
+// tcstate: the shared state of the ashford type checker and its scope stack.
+// One Tc rides through every body: the tables the earlier passes built, the
+// contract and return type of the body being walked, the loop depth for break
+// and continue, and the fault vector diagnostics land in. Scopes are a stack
+// of maps from a local's interner id, rendered in decimal, to its checked
+// type, with a parallel stack marking the let mut bindings; lookups walk from
+// the innermost scope out, so shadowing costs nothing. Message strings are
+// heap strings deliberately never freed, the resolver's convention: a Located
+// borrows its message for the rest of the run.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+
+export struct Tc {
+    ast: *Ast,
+    res: *Resolved,
+    sigs: *Sigs,
+    ty: *TyArena,
+    scopes: *Vector<*Map<int64>>,
+    muts: *Vector<*Map<int64>>,
+    cur_cid: int64,
+    cur_ret: int64,
+    cur_lo: int64,
+    cur_hi: int64,
+    loop_depth: int64,
+    errors: *Vector<Located>,
+}
+
+export func tc_new(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> *Tc {
+    scopes: *Vector<*Map<int64>> = alloc(vec_new())
+    muts: *Vector<*Map<int64>> = alloc(vec_new())
+    return alloc(Tc {
+        ast: a, res: r, sigs: s, ty: t,
+        scopes: scopes, muts: muts,
+        cur_cid: -1, cur_ret: -1, cur_lo: 0, cur_hi: 0, loop_depth: 0,
+        errors: errors,
+    })
+}
+
+export func tc_emit(tc: *Tc, lo: int64, hi: int64, msg: string) -> void {
+    vec_push((*tc).errors, located(lo, hi, msg))
+}
+
+export func push_scope(tc: *Tc) -> void {
+    m: *Map<int64> = alloc(map_new())
+    u: *Map<int64> = alloc(map_new())
+    vec_push((*tc).scopes, m)
+    vec_push((*tc).muts, u)
+}
+
+export func pop_scope(tc: *Tc) -> void {
+    scopes: *Vector<*Map<int64>> = (*tc).scopes
+    muts: *Vector<*Map<int64>> = (*tc).muts
+    n: int64 = vec_len(scopes) - 1
+    (*scopes).len = n
+    (*muts).len = n
+}
+
+// Declares a binding in the innermost scope, replacing any shadowed name.
+export func declare(tc: *Tc, name: int64, tyid: int64, is_mut: bool) -> void {
+    key: string = rs_gkey(name)
+    scopes: *Vector<*Map<int64>> = (*tc).scopes
+    top: *Map<int64> = vec_get(scopes, vec_len(scopes) - 1)
+    map_put(top, key, tyid)
+    muts: *Vector<*Map<int64>> = (*tc).muts
+    mtop: *Map<int64> = vec_get(muts, vec_len(muts) - 1)
+    mut flag: int64 = 0
+    if is_mut { flag = 1 }
+    map_put(mtop, key, flag)
+}
+
+// The type of a local, or -1 when no scope binds the name.
+export func lookup(tc: *Tc, name: int64) -> int64 {
+    key: string = rs_gkey(name)
+    scopes: *Vector<*Map<int64>> = (*tc).scopes
+    mut i: int64 = vec_len(scopes) - 1
+    while i >= 0 {
+        m: *Map<int64> = vec_get(scopes, i)
+        if map_has(m, key) {
+            return unwrap_or(map_get(m, key), -1)
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// Whether the binding a lookup would find was declared let mut.
+export func lookup_mut(tc: *Tc, name: int64) -> bool {
+    key: string = rs_gkey(name)
+    scopes: *Vector<*Map<int64>> = (*tc).scopes
+    muts: *Vector<*Map<int64>> = (*tc).muts
+    mut i: int64 = vec_len(scopes) - 1
+    while i >= 0 {
+        m: *Map<int64> = vec_get(scopes, i)
+        if map_has(m, key) {
+            mm: *Map<int64> = vec_get(muts, i)
+            return unwrap_or(map_get(mm, key), 0) == 1
+        }
+        i = i - 1
+    }
+    return false
+}
+
+// Message builders, one per segment count, all yielding a heap string the
+// diagnostic borrows for the run.
+export func tmsg2(s1: string, s2: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+export func tmsg3(s1: string, s2: string, s3: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+export func tmsg5(s1: string, s2: string, s3: string, s4: string, s5: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    sb_push(b, s4)
+    sb_push(b, s5)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+export func tmsg7(s1: string, s2: string, s3: string, s4: string, s5: string, s6: string, s7: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    sb_push(b, s4)
+    sb_push(b, s5)
+    sb_push(b, s6)
+    sb_push(b, s7)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// A count message: "<head><n><tail>", for arity diagnostics.
+export func tmsg_count(head: string, n: int64, tail: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, head)
+    sb_push_int(b, n)
+    sb_push(b, tail)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// A two type mismatch message: "<head>'<want>'<mid>'<got>'".
+export func tmsg_types(tc: *Tc, head: string, want: int64, mid: string, got: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, head)
+    sb_push_char(b, 39)
+    w: string = ty_render((*tc).ty, want)
+    sb_push(b, w)
+    free(w)
+    sb_push_char(b, 39)
+    sb_push(b, mid)
+    sb_push_char(b, 39)
+    g: string = ty_render((*tc).ty, got)
+    sb_push(b, g)
+    sb_push_char(b, 39)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}

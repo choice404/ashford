@@ -1,0 +1,301 @@
+// tcmatch: the match expression. The scrutinee type drives every pattern
+// check: a Some pattern needs an Option, a variant pattern needs its own sum,
+// a literal pattern must type as the scrutinee does. Arms are checked for
+// exhaustiveness over sums, Option, Result, and Bool; an open type such as
+// Int needs a wildcard or binding arm. A constructor arm counts toward
+// coverage only when every subpattern is irrefutable, so an arm matching
+// Ok(0) alone never claims the whole Ok side. Arms must agree in type, since
+// match is an expression; with an expected type each arm is held to it, and
+// without one the first arm sets the type the rest must share. Patterns
+// carry no spans of their own, so pattern faults land on the match span.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+
+struct Cover {
+    catch_all: bool,
+    saw_true: bool,
+    saw_false: bool,
+    saw_some: bool,
+    saw_none: bool,
+    saw_ok: bool,
+    saw_err: bool,
+    covered: *Map<int64>,
+}
+
+// The sum declaration behind a named type, or -1 when the name is not a
+// declared sum.
+func sum_of(tc: *Tc, st: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    if ty_get(t, st).kind != tyk_named() { return -1 }
+    g: GEntry = rs_global((*tc).res, ast_intern((*tc).ast, ty_name_of(t, st)))
+    if g.kind == gk_sum() { return g.id }
+    return -1
+}
+
+// Whether name is a variant belonging to the sum the scrutinee names.
+func variant_of(tc: *Tc, st: int64, name: int64) -> bool {
+    vs: VariantSig = sig_variant((*tc).sigs, name)
+    if !vs.found { return false }
+    return str_eq(ast_name((*tc).ast, vs.owner), ty_name_of((*tc).ty, st))
+}
+
+// Binds and type checks one pattern against the type it matches. Returns
+// whether the pattern is irrefutable, a wildcard or a plain binding.
+func bind_pat(tc: *Tc, pid: int64, vt: int64, lo: int64, hi: int64) -> bool {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    p: PatternNode = vec_get((*a).patterns, pid)
+    n: TyNode = ty_get(t, vt)
+    if p.kind == pk_wildcard() { return true }
+    if p.kind == pk_bind() {
+        if sum_of(tc, vt) >= 0 {
+            if variant_of(tc, vt, p.a) {
+                vs: VariantSig = sig_variant((*tc).sigs, p.a)
+                if vs.len > 0 {
+                    tc_emit(tc, lo, hi, tmsg5("variant '", ast_name(a, p.a), "' carries a payload; match it as '", ast_name(a, p.a), "(...)'"))
+                }
+                return false
+            }
+        }
+        declare(tc, p.a, vt, false)
+        return true
+    }
+    if p.kind == pk_lit() {
+        lt: int64 = infer_expr(tc, p.a, vt)
+        if !compat(t, vt, lt) {
+            tc_emit(tc, lo, hi, tmsg_types(tc, "pattern literal has type ", lt, " but the scrutinee is ", vt))
+        }
+        return false
+    }
+    if p.kind == pk_some() {
+        if n.kind == tyk_option() {
+            bind_pat(tc, p.a, n.a, lo, hi)
+        } else if n.kind != tyk_unknown() {
+            tc_emit(tc, lo, hi, tmsg3("'Some' pattern needs an Option scrutinee, got '", ty_render(t, vt), "'"))
+            bind_pat(tc, p.a, ty_unknown(t), lo, hi)
+        } else {
+            bind_pat(tc, p.a, ty_unknown(t), lo, hi)
+        }
+        return false
+    }
+    if p.kind == pk_none() {
+        if n.kind != tyk_option() && n.kind != tyk_unknown() {
+            tc_emit(tc, lo, hi, tmsg3("'None' pattern needs an Option scrutinee, got '", ty_render(t, vt), "'"))
+        }
+        return false
+    }
+    if p.kind == pk_ok() || p.kind == pk_err() {
+        mut word: string = "'Ok'"
+        if p.kind == pk_err() { word = "'Err'" }
+        if n.kind == tyk_result() {
+            mut inner: int64 = n.a
+            if p.kind == pk_err() { inner = n.b }
+            bind_pat(tc, p.a, inner, lo, hi)
+        } else if n.kind != tyk_unknown() {
+            tc_emit(tc, lo, hi, tmsg3(tmsg2(word, " pattern needs a Result scrutinee, got '"), ty_render(t, vt), "'"))
+            bind_pat(tc, p.a, ty_unknown(t), lo, hi)
+        } else {
+            bind_pat(tc, p.a, ty_unknown(t), lo, hi)
+        }
+        return false
+    }
+    // A variant pattern with a payload list.
+    text: string = ast_name(a, p.a)
+    sid: int64 = sum_of(tc, vt)
+    if sid < 0 {
+        if n.kind != tyk_unknown() {
+            tc_emit(tc, lo, hi, tmsg3(tmsg3("variant pattern '", text, "' needs a sum scrutinee, got '"), ty_render(t, vt), "'"))
+        }
+        mut q: int64 = 0
+        while q < p.c {
+            bind_pat(tc, vec_get((*a).kids, p.b + q), ty_unknown(t), lo, hi)
+            q = q + 1
+        }
+        return false
+    }
+    if !variant_of(tc, vt, p.a) {
+        tc_emit(tc, lo, hi, tmsg5("'", text, "' is not a variant of '", ty_name_of(t, vt), "'"))
+        mut q2: int64 = 0
+        while q2 < p.c {
+            bind_pat(tc, vec_get((*a).kids, p.b + q2), ty_unknown(t), lo, hi)
+            q2 = q2 + 1
+        }
+        return false
+    }
+    vs2: VariantSig = sig_variant((*tc).sigs, p.a)
+    if p.c != vs2.len {
+        tc_emit(tc, lo, hi, tmsg_count(tmsg3("variant '", text, "' carries "), vs2.len, tmsg_count(" fields, got ", p.c, "")))
+    }
+    mut i: int64 = 0
+    while i < p.c {
+        mut ft: int64 = ty_unknown(t)
+        if i < vs2.len { ft = sig_field((*tc).sigs, vs2.off, i).ty }
+        bind_pat(tc, vec_get((*a).kids, p.b + i), ft, lo, hi)
+        i = i + 1
+    }
+    return false
+}
+
+// Whether every subpattern of a constructor pattern is irrefutable, the
+// condition for the arm to count toward coverage of its constructor.
+func subs_irrefutable(tc: *Tc, p: PatternNode) -> bool {
+    a: *Ast = (*tc).ast
+    if p.kind == pk_some() || p.kind == pk_ok() || p.kind == pk_err() {
+        inner: PatternNode = vec_get((*a).patterns, p.a)
+        return inner.kind == pk_wildcard() || inner.kind == pk_bind()
+    }
+    if p.kind == pk_variant() {
+        mut i: int64 = 0
+        while i < p.c {
+            sp: PatternNode = vec_get((*a).patterns, vec_get((*a).kids, p.b + i))
+            if sp.kind != pk_wildcard() && sp.kind != pk_bind() { return false }
+            i = i + 1
+        }
+        return true
+    }
+    return true
+}
+
+// Records what one arm's pattern covers, after bind_pat checked it.
+func cover_pat(tc: *Tc, pid: int64, st: int64, cv: *Cover) -> void {
+    a: *Ast = (*tc).ast
+    p: PatternNode = vec_get((*a).patterns, pid)
+    if p.kind == pk_wildcard() {
+        (*cv).catch_all = true
+        return
+    }
+    if p.kind == pk_bind() {
+        if sum_of(tc, st) >= 0 && variant_of(tc, st, p.a) {
+            vs: VariantSig = sig_variant((*tc).sigs, p.a)
+            if vs.len == 0 {
+                map_put((*cv).covered, rs_gkey(p.a), 1)
+            }
+            return
+        }
+        (*cv).catch_all = true
+        return
+    }
+    if p.kind == pk_lit() {
+        le: ExprNode = vec_get((*a).exprs, p.a)
+        if le.kind == xk_bool() {
+            if le.a == 1 {
+                (*cv).saw_true = true
+            } else {
+                (*cv).saw_false = true
+            }
+        }
+        return
+    }
+    if !subs_irrefutable(tc, p) { return }
+    if p.kind == pk_some() { (*cv).saw_some = true }
+    if p.kind == pk_none() { (*cv).saw_none = true }
+    if p.kind == pk_ok() { (*cv).saw_ok = true }
+    if p.kind == pk_err() { (*cv).saw_err = true }
+    if p.kind == pk_variant() {
+        if variant_of(tc, st, p.a) {
+            map_put((*cv).covered, rs_gkey(p.a), 1)
+        }
+    }
+}
+
+func check_exhaustive(tc: *Tc, st: int64, cv: *Cover, lo: int64, hi: int64) -> void {
+    t: *TyArena = (*tc).ty
+    if (*cv).catch_all { return }
+    n: TyNode = ty_get(t, st)
+    if n.kind == tyk_unknown() { return }
+    if n.kind == tyk_bool() {
+        if !(*cv).saw_true { tc_emit(tc, lo, hi, "match on Bool is missing 'true'") }
+        if !(*cv).saw_false { tc_emit(tc, lo, hi, "match on Bool is missing 'false'") }
+        return
+    }
+    if n.kind == tyk_option() {
+        if !(*cv).saw_some { tc_emit(tc, lo, hi, "match is missing 'Some(_)'") }
+        if !(*cv).saw_none { tc_emit(tc, lo, hi, "match is missing 'None'") }
+        return
+    }
+    if n.kind == tyk_result() {
+        if !(*cv).saw_ok { tc_emit(tc, lo, hi, "match is missing 'Ok(_)'") }
+        if !(*cv).saw_err { tc_emit(tc, lo, hi, "match is missing 'Err(_)'") }
+        return
+    }
+    sid: int64 = sum_of(tc, st)
+    if sid >= 0 {
+        a: *Ast = (*tc).ast
+        sum: SumNode = vec_get((*a).sums, sid)
+        mut i: int64 = 0
+        while i < sum.variants_len {
+            v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + i))
+            ctab: *Map<int64> = (*cv).covered
+            if !map_has(ctab, rs_gkey(v.name)) {
+                tc_emit(tc, lo, hi, tmsg3("match is missing variant '", ast_name(a, v.name), "'"))
+            }
+            i = i + 1
+        }
+        return
+    }
+    tc_emit(tc, lo, hi, tmsg3("match over '", ty_render(t, st), "' needs a '_' or binding arm"))
+}
+
+// The match expression. want is the expected type of the whole match, -1
+// when the position expects nothing; without one the first arm sets the type
+// the remaining arms must share.
+export func check_match(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    st: int64 = infer_expr(tc, e.a, -1)
+    covered: *Map<int64> = alloc(map_new())
+    cv: *Cover = alloc(Cover {
+        catch_all: false,
+        saw_true: false, saw_false: false,
+        saw_some: false, saw_none: false,
+        saw_ok: false, saw_err: false,
+        covered: covered,
+    })
+    mut first: int64 = -1
+    mut i: int64 = 0
+    while i < e.c {
+        arm: ArmNode = vec_get((*a).arms, vec_get((*a).kids, e.b + i))
+        if (*cv).catch_all {
+            tc_emit(tc, e.lo, e.hi, "unreachable match arm after a catch all pattern")
+        }
+        push_scope(tc)
+        bind_pat(tc, arm.pat, st, e.lo, e.hi)
+        mut aw: int64 = want
+        if aw < 0 { aw = first }
+        mut at: int64 = -1
+        mut alo: int64 = e.lo
+        mut ahi: int64 = e.hi
+        if arm.is_block {
+            at = block_value(tc, arm.body, aw)
+        } else {
+            at = infer_expr(tc, arm.body, aw)
+            ae: ExprNode = vec_get((*a).exprs, arm.body)
+            alo = ae.lo
+            ahi = ae.hi
+        }
+        pop_scope(tc)
+        if aw >= 0 {
+            if !compat(t, aw, at) {
+                tc_emit(tc, alo, ahi, tmsg_types(tc, "match arms disagree in type; got ", at, " where ", aw))
+            }
+        } else {
+            first = at
+        }
+        cover_pat(tc, arm.pat, st, cv)
+        i = i + 1
+    }
+    check_exhaustive(tc, st, cv, e.lo, e.hi)
+    if want >= 0 { return want }
+    if first >= 0 { return first }
+    return ty_unknown(t)
+}

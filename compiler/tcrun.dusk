@@ -1,0 +1,190 @@
+// tcrun: the type check pass over a resolved file. It runs only when the
+// resolver found nothing, so every name in reach is unique and every sig
+// table lookup lands on the node it was built from. The pass builds the type
+// arena and the signature tables, which report the annotation faults, then
+// checks the file's bodies: every incorporated signature must match its
+// implementing clause exactly, every vow initializer is a constant literal
+// of the vow type, and every pledge and clause body checks under its
+// declared return type with its parameters in scope.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import tcexpr
+@import tcstmt
+@import tccall
+@import tcmatch
+
+// A vow initializer is a constant literal: a literal, or a negated numeric
+// literal. Everything else is supplied at sign time instead.
+func is_const_lit(a: *Ast, eid: int64) -> bool {
+    e: ExprNode = vec_get((*a).exprs, eid)
+    if e.kind == xk_int() || e.kind == xk_float() || e.kind == xk_str() {
+        return true
+    }
+    if e.kind == xk_char() || e.kind == xk_bool() {
+        return true
+    }
+    if e.kind == xk_unary() {
+        if e.a == uop_neg() {
+            inner: ExprNode = vec_get((*a).exprs, e.b)
+            return inner.kind == xk_int() || inner.kind == xk_float()
+        }
+    }
+    return false
+}
+
+func check_vow(tc: *Tc, cid: int64, vid: int64) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    v: VowNode = vec_get((*a).vows, vid)
+    if v.init < 0 { return }
+    text: string = ast_name(a, v.name)
+    ie: ExprNode = vec_get((*a).exprs, v.init)
+    if !is_const_lit(a, v.init) {
+        tc_emit(tc, ie.lo, ie.hi, tmsg3("vow '", text, "' initializer must be a constant literal"))
+        return
+    }
+    vs: VowSigT = sig_vow((*tc).sigs, cid, v.name)
+    it: int64 = infer_expr(tc, v.init, vs.ty)
+    if !compat(t, vs.ty, it) {
+        head: string = tmsg3("vow '", text, "' initializer has type ")
+        tc_emit(tc, ie.lo, ie.hi, tmsg_types(tc, head, it, " but the vow is ", vs.ty))
+    }
+}
+
+// Every signature an incorporated provisional clause carries must match the
+// implementing clause exactly, parameter types and return type both, checked
+// through the canonical signature strings.
+func check_incorporates(tc: *Tc, cid: int64) -> void {
+    a: *Ast = (*tc).ast
+    s: *Sigs = (*tc).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_incorporate() {
+            inc: IncNode = vec_get((*a).incs, vec_get((*a).kids, c.members_off + i + 1))
+            g: GEntry = rs_global((*tc).res, inc.name)
+            if g.kind == gk_prov() {
+                pv: ProvNode = vec_get((*a).provs, g.id)
+                mut j: int64 = 0
+                while j < pv.sigs_len {
+                    sig: ClauseSigNode = vec_get((*a).clause_sigs, vec_get((*a).kids, pv.sigs_off + j))
+                    m: MEntry = rs_member((*tc).res, cid, sig.name)
+                    if m.kind == mk_clause() {
+                        psig: ClauseSigT = sig_prov_clause(s, g.id, sig.name)
+                        csig: ClauseSigT = sig_clause(s, cid, sig.name)
+                        pc: string = sig_canon(s, psig.params, psig.ret)
+                        cc: string = sig_canon(s, csig.params, csig.ret)
+                        if !str_eq(pc, cc) {
+                            tc_emit(tc, m.lo, m.hi, tmsg7("clause '", ast_name(a, sig.name), "' does not match its signature in provisional clause '", ast_name(a, inc.name), "'", "", ""))
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 2
+    }
+}
+
+// One body: the parameters land in a fresh scope with their lowered types,
+// the declared return type rides in cur_ret for return and '?', and the
+// block checks under it.
+func check_body(tc: *Tc, params_off: int64, params_len: int64, params: TyList, ret: int64, body: int64, lo: int64, hi: int64) -> void {
+    a: *Ast = (*tc).ast
+    (*tc).cur_ret = ret
+    (*tc).cur_lo = lo
+    (*tc).cur_hi = hi
+    (*tc).loop_depth = 0
+    push_scope(tc)
+    mut i: int64 = 0
+    while i < params_len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, params_off + i))
+        mut pt: int64 = ty_unknown((*tc).ty)
+        if i < params.len { pt = sig_param((*tc).sigs, params, i) }
+        declare(tc, f.name, pt, false)
+        i = i + 1
+    }
+    check_block(tc, body)
+    pop_scope(tc)
+    (*tc).cur_ret = -1
+}
+
+func check_pledge_body(tc: *Tc, key: string, pid: int64) -> void {
+    a: *Ast = (*tc).ast
+    pl: PledgeNode = vec_get((*a).pledges, pid)
+    if pl.body < 0 { return }
+    ps: PledgeSigT = unwrap_or(map_get((*(*tc).sigs).pledges, key), no_pledge_sig())
+    mut ret: int64 = ps.ret
+    if ret < 0 { ret = ty_unknown((*tc).ty) }
+    check_body(tc, pl.params_off, pl.params_len, ps.params, ret, pl.body, pl.lo, pl.hi)
+}
+
+func check_contract(tc: *Tc, cid: int64) -> void {
+    a: *Ast = (*tc).ast
+    (*tc).cur_cid = cid
+    check_incorporates(tc, cid)
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+        if mkind == mk_vow() {
+            check_vow(tc, cid, mid)
+        } else if mkind == mk_pledge() {
+            pl: PledgeNode = vec_get((*a).pledges, mid)
+            check_pledge_body(tc, rs_mkey(cid, pl.name), mid)
+        } else if mkind == mk_clause() {
+            cl: ClauseNode = vec_get((*a).clauses, mid)
+            cs: ClauseSigT = sig_clause((*tc).sigs, cid, cl.name)
+            mut ret: int64 = cs.ret
+            if ret < 0 { ret = ty_unknown((*tc).ty) }
+            check_body(tc, cl.params_off, cl.params_len, cs.params, ret, cl.body, cl.lo, cl.hi)
+        } else if mkind == mk_subcontract() {
+            sub: SubNode = vec_get((*a).subs, mid)
+            mut j: int64 = 0
+            while j < sub.pledges_len {
+                pid: int64 = vec_get((*a).kids, sub.pledges_off + j)
+                pl2: PledgeNode = vec_get((*a).pledges, pid)
+                if sub.name >= 0 {
+                    check_pledge_body(tc, rs_skey(mid, pl2.name), pid)
+                } else {
+                    check_pledge_body(tc, rs_mkey(cid, pl2.name), pid)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 2
+    }
+    (*tc).cur_cid = -1
+}
+
+// The pass. Signature building reports the annotation faults as it lowers,
+// then every contract's members check in declaration order.
+export func typeck_file(a: *Ast, r: *Resolved) -> *Vector<Located> {
+    errors: *Vector<Located> = alloc(vec_new())
+    t: *TyArena = ty_arena_new()
+    s: *Sigs = build_sigs(a, r, t, errors)
+    tc: *Tc = tc_new(a, r, s, t, errors)
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            check_contract(tc, d.id)
+        }
+        i = i + 1
+    }
+    return errors
+}

@@ -1,0 +1,422 @@
+// tccall: calls, member access, and the contract operations. A call checks
+// its arguments against exactly one signature: a clause called by bare name
+// inside its own contract, a sum variant constructor, sign on a contract
+// name, a pledge or the builtin break on a signed instance, or a first class
+// pledge value. Everything else is not callable and says so. Member access
+// covers record fields, the pledge value form instance.pledge_name, and the
+// contract name statics; the constructions the milestone leaves out, status,
+// partial, and vows read through an instance, fault by name as not yet
+// supported rather than passing silently.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+
+// Infers every argument with no expectation, the recovery walk after the
+// callee itself already faulted.
+func walk_args(tc: *Tc, off: int64, len: int64) -> void {
+    a: *Ast = (*tc).ast
+    mut i: int64 = 0
+    while i < len {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, off + i))
+        infer_expr(tc, arg.expr, -1)
+        i = i + 1
+    }
+}
+
+// Positional arguments against a lowered parameter list. Labels belong to
+// sign alone, the count must match, and every argument type must be exact.
+func check_args(tc: *Tc, params: TyList, off: int64, len: int64, lo: int64, hi: int64, word: string, name: string) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    if len != params.len {
+        head: string = tmsg5(word, " '", name, "' takes ", "")
+        tc_emit(tc, lo, hi, tmsg_count(head, params.len, tmsg_count(" arguments, got ", len, "")))
+    }
+    mut i: int64 = 0
+    while i < len {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, off + i))
+        ae: ExprNode = vec_get((*a).exprs, arg.expr)
+        if arg.label >= 0 {
+            tc_emit(tc, ae.lo, ae.hi, "named arguments are used only with sign")
+        }
+        mut w: int64 = -1
+        if i < params.len { w = sig_param((*tc).sigs, params, i) }
+        at: int64 = infer_expr(tc, arg.expr, w)
+        if w >= 0 {
+            if !compat(t, w, at) {
+                head2: string = tmsg_count("argument ", i + 1, tmsg3(" of '", name, "' expects "))
+                tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, head2, w, ", got ", at))
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Contract.sign(named vow overrides): every argument is labeled with a vow
+// name, appears once, matches the vow type, and every vow without a default
+// is supplied. Returns the signed instance type.
+func check_sign(tc: *Tc, cid: int64, cname: string, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    supplied: *Map<int64> = alloc(map_new())
+    mut i: int64 = 0
+    while i < e.c {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+        ae: ExprNode = vec_get((*a).exprs, arg.expr)
+        if arg.label < 0 {
+            tc_emit(tc, ae.lo, ae.hi, "sign takes named vow arguments")
+            infer_expr(tc, arg.expr, -1)
+        } else {
+            ltext: string = ast_name(a, arg.label)
+            m: MEntry = rs_member((*tc).res, cid, arg.label)
+            if m.kind != mk_vow() {
+                tc_emit(tc, ae.lo, ae.hi, tmsg5("contract '", cname, "' has no vow '", ltext, "'"))
+                infer_expr(tc, arg.expr, -1)
+            } else {
+                key: string = rs_gkey(arg.label)
+                if map_has(supplied, key) {
+                    tc_emit(tc, ae.lo, ae.hi, tmsg3("vow '", ltext, "' is supplied twice in sign"))
+                }
+                map_put(supplied, key, 1)
+                vs: VowSigT = sig_vow((*tc).sigs, cid, arg.label)
+                at: int64 = infer_expr(tc, arg.expr, vs.ty)
+                if !compat(t, vs.ty, at) {
+                    head: string = tmsg5("vow '", ltext, "' of '", cname, "' expects ")
+                    tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, head, vs.ty, ", got ", at))
+                }
+            }
+        }
+        i = i + 1
+    }
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut j: int64 = 0
+    while j < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + j)
+        if mkind == mk_vow() {
+            v: VowNode = vec_get((*a).vows, vec_get((*a).kids, c.members_off + j + 1))
+            if v.init < 0 {
+                if !map_has(supplied, rs_gkey(v.name)) {
+                    tc_emit(tc, e.lo, e.hi, tmsg5("sign of '", cname, "' is missing vow '", ast_name(a, v.name), "'"))
+                }
+            }
+        }
+        j = j + 2
+    }
+    return ty_contract(t, cname)
+}
+
+// The contract id behind a contract instance type.
+func contract_id_of(tc: *Tc, bt: int64) -> int64 {
+    cname: string = ty_name_of((*tc).ty, bt)
+    g: GEntry = rs_global((*tc).res, ast_intern((*tc).ast, cname))
+    if g.kind == gk_contract() { return g.id }
+    return -1
+}
+
+// A call whose callee typed as a first class pledge value.
+func call_pledge_value(tc: *Tc, ct: int64, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    n: TyNode = ty_get(t, ct)
+    if e.c != n.len {
+        tc_emit(tc, e.lo, e.hi, tmsg_count("the pledge value takes ", n.len, tmsg_count(" arguments, got ", e.c, "")))
+    }
+    mut i: int64 = 0
+    while i < e.c {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+        ae: ExprNode = vec_get((*a).exprs, arg.expr)
+        if arg.label >= 0 {
+            tc_emit(tc, ae.lo, ae.hi, "named arguments are used only with sign")
+        }
+        mut w: int64 = -1
+        if i < n.len { w = vec_get((*t).kids, n.off + i) }
+        at: int64 = infer_expr(tc, arg.expr, w)
+        if w >= 0 {
+            if !compat(t, w, at) {
+                head: string = tmsg_count("argument ", i + 1, " of the pledge value expects ")
+                tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, head, w, ", got ", at))
+            }
+        }
+        i = i + 1
+    }
+    return n.a
+}
+
+// An operation on a signed instance, called form. mname is the member name.
+func call_on_instance(tc: *Tc, bt: int64, mname: int64, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    cname: string = ty_name_of(t, bt)
+    mtext: string = ast_name(a, mname)
+    cid: int64 = contract_id_of(tc, bt)
+    if cid < 0 {
+        walk_args(tc, e.b, e.c)
+        return ty_unknown(t)
+    }
+    if str_eq(mtext, "break") {
+        if e.c != 0 {
+            tc_emit(tc, e.lo, e.hi, "break takes no arguments")
+        }
+        walk_args(tc, e.b, e.c)
+        return ty_unit(t)
+    }
+    if str_eq(mtext, "status") || str_eq(mtext, "partial") {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg3("not yet supported: ", mtext, "() on an instance"))
+        return ty_unknown(t)
+    }
+    if str_eq(mtext, "sign") {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, "sign is called on the contract name, not an instance")
+        return ty_unknown(t)
+    }
+    ps: PledgeSigT = find_pledge((*tc).sigs, cid, mname)
+    if ps.found {
+        check_args(tc, ps.params, e.b, e.c, e.lo, e.hi, "pledge", mtext)
+        return ps.ret
+    }
+    walk_args(tc, e.b, e.c)
+    m: MEntry = rs_member((*tc).res, cid, mname)
+    if m.kind == mk_clause() {
+        tc_emit(tc, e.lo, e.hi, tmsg3("clause '", mtext, "' is called by bare name inside its own contract"))
+        return ty_unknown(t)
+    }
+    if m.kind == mk_vow() {
+        tc_emit(tc, e.lo, e.hi, "not yet supported: reading a vow through an instance")
+        return ty_unknown(t)
+    }
+    tc_emit(tc, e.lo, e.hi, tmsg5("contract '", cname, "' has no pledge '", mtext, "'"))
+    return ty_unknown(t)
+}
+
+// A member expression given its base already inferred, the value position.
+func member_with_base(tc: *Tc, e: ExprNode, bt: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    mtext: string = ast_name(a, e.b)
+    n: TyNode = ty_get(t, bt)
+    if n.kind == tyk_contract() {
+        cname: string = ty_name_of(t, bt)
+        cid: int64 = contract_id_of(tc, bt)
+        if cid < 0 { return ty_unknown(t) }
+        if str_eq(mtext, "break") || str_eq(mtext, "sign") {
+            tc_emit(tc, e.lo, e.hi, tmsg3("'", mtext, "' must be called"))
+            return ty_unknown(t)
+        }
+        if str_eq(mtext, "status") || str_eq(mtext, "partial") {
+            tc_emit(tc, e.lo, e.hi, tmsg3("not yet supported: ", mtext, "() on an instance"))
+            return ty_unknown(t)
+        }
+        ps: PledgeSigT = find_pledge((*tc).sigs, cid, e.b)
+        if ps.found {
+            xs: *Vector<int64> = alloc(vec_new())
+            mut i: int64 = 0
+            while i < ps.params.len {
+                vec_push(xs, sig_param((*tc).sigs, ps.params, i))
+                i = i + 1
+            }
+            return ty_pledge_ty(t, xs, ps.ret)
+        }
+        m: MEntry = rs_member((*tc).res, cid, e.b)
+        if m.kind == mk_clause() {
+            tc_emit(tc, e.lo, e.hi, tmsg3("clause '", mtext, "' is called by bare name inside its own contract"))
+            return ty_unknown(t)
+        }
+        if m.kind == mk_vow() {
+            tc_emit(tc, e.lo, e.hi, "not yet supported: reading a vow through an instance")
+            return ty_unknown(t)
+        }
+        tc_emit(tc, e.lo, e.hi, tmsg5("contract '", cname, "' has no pledge '", mtext, "'"))
+        return ty_unknown(t)
+    }
+    if n.kind == tyk_named() {
+        tname: string = ty_name_of(t, bt)
+        tid: int64 = ast_intern(a, tname)
+        g: GEntry = rs_global((*tc).res, tid)
+        if g.kind == gk_record() {
+            rs: RecSig = sig_rec((*tc).sigs, tid)
+            mut j: int64 = 0
+            while j < rs.len {
+                f: FieldSig = sig_field((*tc).sigs, rs.off, j)
+                if f.name == e.b { return f.ty }
+                j = j + 1
+            }
+            tc_emit(tc, e.lo, e.hi, tmsg5("'", tname, "' has no field '", mtext, "'"))
+            return ty_unknown(t)
+        }
+        if g.kind == gk_sum() {
+            tc_emit(tc, e.lo, e.hi, tmsg3("a value of '", tname, "' has no fields; match it"))
+            return ty_unknown(t)
+        }
+        // An opaque imported name: its fields are unknowable until module
+        // resolution lands, so the access stays permissive.
+        return ty_unknown(t)
+    }
+    if n.kind == tyk_unknown() { return ty_unknown(t) }
+    tc_emit(tc, e.lo, e.hi, tmsg3("a value of type '", ty_render(t, bt), "' has no members"))
+    return ty_unknown(t)
+}
+
+// Whether the base expression names a contract statically: a bare identifier
+// no local shadows that resolves to a contract. Returns the contract id.
+func static_contract(tc: *Tc, base_id: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    be: ExprNode = vec_get((*a).exprs, base_id)
+    if be.kind != xk_ident() { return -1 }
+    if lookup(tc, be.a) >= 0 { return -1 }
+    g: GEntry = rs_global((*tc).res, be.a)
+    if g.kind == gk_contract() { return g.id }
+    return -1
+}
+
+// A member expression in value position.
+export func infer_member(tc: *Tc, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    scid: int64 = static_contract(tc, e.a)
+    if scid >= 0 {
+        be: ExprNode = vec_get((*a).exprs, e.a)
+        cname: string = ast_name(a, be.a)
+        mtext: string = ast_name(a, e.b)
+        if str_eq(mtext, "sign") {
+            tc_emit(tc, e.lo, e.hi, "'sign' must be called")
+            return ty_unknown(t)
+        }
+        tc_emit(tc, e.lo, e.hi, tmsg3("only sign is named on the contract '", cname, "'"))
+        return ty_unknown(t)
+    }
+    bt: int64 = infer_expr(tc, e.a, -1)
+    return member_with_base(tc, e, bt)
+}
+
+// A call through a bare identifier that no local binds.
+func call_ident(tc: *Tc, cn: ExprNode, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    text: string = ast_name(a, cn.a)
+    if str_len(text) == 0 {
+        walk_args(tc, e.b, e.c)
+        return ty_unknown(t)
+    }
+    if (*tc).cur_cid >= 0 {
+        m: MEntry = rs_member((*tc).res, (*tc).cur_cid, cn.a)
+        if m.kind == mk_clause() {
+            cs: ClauseSigT = sig_clause((*tc).sigs, (*tc).cur_cid, cn.a)
+            check_args(tc, cs.params, e.b, e.c, e.lo, e.hi, "clause", text)
+            return cs.ret
+        }
+        if m.kind == mk_pledge() {
+            walk_args(tc, e.b, e.c)
+            tc_emit(tc, e.lo, e.hi, tmsg3("pledge '", text, "' is fulfilled through a signed instance"))
+            return ty_unknown(t)
+        }
+    }
+    g: GEntry = rs_global((*tc).res, cn.a)
+    if g.kind == gk_variant() {
+        vs: VariantSig = sig_variant((*tc).sigs, cn.a)
+        if e.c != vs.len {
+            tc_emit(tc, e.lo, e.hi, tmsg_count(tmsg3("variant '", text, "' takes "), vs.len, tmsg_count(" arguments, got ", e.c, "")))
+        }
+        mut i: int64 = 0
+        while i < e.c {
+            arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+            ae: ExprNode = vec_get((*a).exprs, arg.expr)
+            mut w: int64 = -1
+            mut fname: int64 = -1
+            if i < vs.len {
+                f: FieldSig = sig_field((*tc).sigs, vs.off, i)
+                w = f.ty
+                fname = f.name
+            }
+            if arg.label >= 0 {
+                if arg.label != fname {
+                    tc_emit(tc, ae.lo, ae.hi, tmsg5("the label '", ast_name(a, arg.label), "' does not name this field of variant '", text, "'"))
+                }
+            }
+            at: int64 = infer_expr(tc, arg.expr, w)
+            if w >= 0 {
+                if !compat(t, w, at) {
+                    head: string = tmsg_count("argument ", i + 1, tmsg3(" of variant '", text, "' expects "))
+                    tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, head, w, ", got ", at))
+                }
+            }
+            i = i + 1
+        }
+        return ty_named(t, ast_name(a, vs.owner))
+    }
+    walk_args(tc, e.b, e.c)
+    if g.kind == gk_contract() {
+        tc_emit(tc, e.lo, e.hi, tmsg5("'", text, "' is a contract; sign it with '", text, ".sign(...)'"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_record() {
+        tc_emit(tc, e.lo, e.hi, tmsg5("'", text, "' is a record; construct it with '", text, " { ... }'"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_sum() {
+        tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is a type, not a value"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_prov() {
+        tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is a provisional clause, not a value"))
+        return ty_unknown(t)
+    }
+    tc_emit(tc, e.lo, e.hi, tmsg3("unknown name '", text, "'"))
+    return ty_unknown(t)
+}
+
+export func infer_call(tc: *Tc, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    cn: ExprNode = vec_get((*a).exprs, e.a)
+    if cn.kind == xk_ident() {
+        if lookup(tc, cn.a) < 0 {
+            return call_ident(tc, cn, e)
+        }
+    }
+    if cn.kind == xk_member() {
+        scid: int64 = static_contract(tc, cn.a)
+        if scid >= 0 {
+            be: ExprNode = vec_get((*a).exprs, cn.a)
+            cname: string = ast_name(a, be.a)
+            mtext: string = ast_name(a, cn.b)
+            if str_eq(mtext, "sign") {
+                return check_sign(tc, scid, cname, e)
+            }
+            walk_args(tc, e.b, e.c)
+            tc_emit(tc, e.lo, e.hi, tmsg3("only sign is called on the contract '", cname, "'"))
+            return ty_unknown(t)
+        }
+        bt: int64 = infer_expr(tc, cn.a, -1)
+        if ty_get(t, bt).kind == tyk_contract() {
+            return call_on_instance(tc, bt, cn.b, e)
+        }
+        ct: int64 = member_with_base(tc, cn, bt)
+        if ty_get(t, ct).kind == tyk_pledge() {
+            return call_pledge_value(tc, ct, e)
+        }
+        walk_args(tc, e.b, e.c)
+        if ty_get(t, ct).kind != tyk_unknown() {
+            tc_emit(tc, e.lo, e.hi, "this expression is not callable")
+        }
+        return ty_unknown(t)
+    }
+    ct2: int64 = infer_expr(tc, e.a, -1)
+    if ty_get(t, ct2).kind == tyk_pledge() {
+        return call_pledge_value(tc, ct2, e)
+    }
+    walk_args(tc, e.b, e.c)
+    if ty_get(t, ct2).kind != tyk_unknown() {
+        tc_emit(tc, e.lo, e.hi, "this expression is not callable")
+    }
+    return ty_unknown(t)
+}

@@ -1,0 +1,412 @@
+// tcexpr: expression inference for the ashford type checker. Inference walks
+// the tree once with an expected type riding down, -1 when the position
+// expects nothing in particular. The expected type is what lets an integer
+// literal become UInt or Byte where the value fits, lets Some, Ok, Err, and
+// None take their payload types from context, and keeps every check exact:
+// there is no implicit conversion anywhere, widening included, so a mismatch
+// is a fault and never a coercion. A subtree that faults infers as the
+// unknown type, which stands anywhere, so one fault reads as one diagnostic.
+// Calls and member access live in tccall, match in tcmatch.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import tccall
+@import tcmatch
+
+export func is_numeric(t: *TyArena, id: int64) -> bool {
+    k: int64 = ty_get(t, id).kind
+    if k == tyk_int() || k == tyk_uint() || k == tyk_float() || k == tyk_byte() {
+        return true
+    }
+    return k == tyk_unknown()
+}
+
+func op_text(op: int64) -> string {
+    if op == bop_add() { return "+" }
+    if op == bop_sub() { return "-" }
+    if op == bop_mul() { return "*" }
+    if op == bop_div() { return "/" }
+    if op == bop_mod() { return "%" }
+    if op == bop_eq() { return "==" }
+    if op == bop_ne() { return "!=" }
+    if op == bop_lt() { return "<" }
+    if op == bop_le() { return "<=" }
+    if op == bop_gt() { return ">" }
+    if op == bop_ge() { return ">=" }
+    if op == bop_and() { return "&&" }
+    return "||"
+}
+
+// An integer literal types as Int unless the expected type is UInt, or Byte
+// with the value in range. The lexer already rejected values above the Int
+// maximum, so a nonnegative value always fits UInt.
+func infer_int(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    if want >= 0 {
+        wk: int64 = ty_get(t, want).kind
+        if wk == tyk_uint() { return ty_uint(t) }
+        if wk == tyk_byte() {
+            if e.a <= 255 { return ty_byte(t) }
+            tc_emit(tc, e.lo, e.hi, "integer literal does not fit in 'Byte'")
+            return ty_byte(t)
+        }
+    }
+    return ty_int(t)
+}
+
+func infer_ident(tc: *Tc, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    text: string = ast_name(a, e.a)
+    if str_len(text) == 0 { return ty_unknown(t) }
+    lt: int64 = lookup(tc, e.a)
+    if lt >= 0 { return lt }
+    if (*tc).cur_cid >= 0 {
+        m: MEntry = rs_member((*tc).res, (*tc).cur_cid, e.a)
+        if m.kind == mk_vow() {
+            return sig_vow((*tc).sigs, (*tc).cur_cid, e.a).ty
+        }
+        if m.kind == mk_clause() {
+            tc_emit(tc, e.lo, e.hi, tmsg3("clause '", text, "' is not a value; call it"))
+            return ty_unknown(t)
+        }
+        if m.kind == mk_pledge() {
+            tc_emit(tc, e.lo, e.hi, tmsg3("pledge '", text, "' is fulfilled through a signed instance"))
+            return ty_unknown(t)
+        }
+        if m.kind == mk_subcontract() {
+            tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is a subcontract, not a value"))
+            return ty_unknown(t)
+        }
+    }
+    g: GEntry = rs_global((*tc).res, e.a)
+    if g.kind == gk_variant() {
+        vs: VariantSig = sig_variant((*tc).sigs, e.a)
+        if vs.len > 0 {
+            tc_emit(tc, e.lo, e.hi, tmsg3("variant '", text, "' takes a payload"))
+        }
+        return ty_named(t, ast_name(a, vs.owner))
+    }
+    if g.kind == gk_record() || g.kind == gk_sum() {
+        tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is a type, not a value"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_contract() {
+        tc_emit(tc, e.lo, e.hi, tmsg5("'", text, "' is a contract; sign it with '", text, ".sign(...)'"))
+        return ty_unknown(t)
+    }
+    if g.kind == gk_prov() {
+        tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is a provisional clause, not a value"))
+        return ty_unknown(t)
+    }
+    tc_emit(tc, e.lo, e.hi, tmsg3("unknown name '", text, "'"))
+    return ty_unknown(t)
+}
+
+func infer_binary(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    op: int64 = e.a
+    if op == bop_and() || op == bop_or() {
+        lt: int64 = infer_expr(tc, e.b, ty_bool(t))
+        rt: int64 = infer_expr(tc, e.c, ty_bool(t))
+        if !compat(t, lt, ty_bool(t)) || !compat(t, rt, ty_bool(t)) {
+            tc_emit(tc, e.lo, e.hi, tmsg3("operator '", op_text(op), "' needs 'Bool' operands"))
+        }
+        return ty_bool(t)
+    }
+    if op == bop_eq() || op == bop_ne() {
+        lt2: int64 = infer_expr(tc, e.b, -1)
+        rt2: int64 = infer_expr(tc, e.c, lt2)
+        if !compat(t, lt2, rt2) {
+            tc_emit(tc, e.lo, e.hi, tmsg_types(tc, tmsg3("operator '", op_text(op), "' needs matching operands; got "), lt2, " and ", rt2))
+        }
+        return ty_bool(t)
+    }
+    if op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() {
+        lt3: int64 = infer_expr(tc, e.b, -1)
+        mut rw: int64 = -1
+        if is_numeric(t, lt3) { rw = lt3 }
+        rt3: int64 = infer_expr(tc, e.c, rw)
+        if !is_numeric(t, lt3) || !is_numeric(t, rt3) || !compat(t, lt3, rt3) {
+            tc_emit(tc, e.lo, e.hi, tmsg_types(tc, tmsg3("operator '", op_text(op), "' needs matching numeric operands; got "), lt3, " and ", rt3))
+        }
+        return ty_bool(t)
+    }
+    mut aw: int64 = -1
+    if want >= 0 {
+        if is_numeric(t, want) { aw = want }
+    }
+    lt4: int64 = infer_expr(tc, e.b, aw)
+    mut rw2: int64 = -1
+    if is_numeric(t, lt4) { rw2 = lt4 }
+    rt4: int64 = infer_expr(tc, e.c, rw2)
+    if !is_numeric(t, lt4) || !is_numeric(t, rt4) || !compat(t, lt4, rt4) {
+        tc_emit(tc, e.lo, e.hi, tmsg_types(tc, tmsg3("operator '", op_text(op), "' needs matching numeric operands; got "), lt4, " and ", rt4))
+        return ty_unknown(t)
+    }
+    if ty_get(t, lt4).kind == tyk_unknown() { return rt4 }
+    return lt4
+}
+
+func infer_question(tc: *Tc, e: ExprNode) -> int64 {
+    t: *TyArena = (*tc).ty
+    ot: int64 = infer_expr(tc, e.a, -1)
+    n: TyNode = ty_get(t, ot)
+    mut ret: int64 = (*tc).cur_ret
+    if ret < 0 { ret = ty_unknown(t) }
+    rn: TyNode = ty_get(t, ret)
+    if n.kind == tyk_option() {
+        if rn.kind != tyk_option() && rn.kind != tyk_unknown() {
+            tc_emit(tc, e.lo, e.hi, "'?' on an Option needs the enclosing body to return Option")
+        }
+        return n.a
+    }
+    if n.kind == tyk_result() {
+        if rn.kind == tyk_result() {
+            if !compat(t, n.b, rn.b) {
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "'?' propagates error type ", n.b, " but the body returns error type ", rn.b))
+            }
+        } else if rn.kind != tyk_unknown() {
+            tc_emit(tc, e.lo, e.hi, "'?' on a Result needs the enclosing body to return Result")
+        }
+        return n.a
+    }
+    if n.kind == tyk_unknown() { return ty_unknown(t) }
+    tc_emit(tc, e.lo, e.hi, "'?' needs an Option or a Result value")
+    return ty_unknown(t)
+}
+
+func infer_index(tc: *Tc, e: ExprNode) -> int64 {
+    t: *TyArena = (*tc).ty
+    bt: int64 = infer_expr(tc, e.a, -1)
+    it: int64 = infer_expr(tc, e.b, ty_int(t))
+    n: TyNode = ty_get(t, bt)
+    if n.kind == tyk_list() {
+        if !compat(t, it, ty_int(t)) {
+            tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "a list index must be ", ty_int(t), ", got ", it))
+        }
+        return n.a
+    }
+    if n.kind == tyk_map() {
+        tc_emit(tc, e.lo, e.hi, "not yet supported: indexing a Map")
+        return n.b
+    }
+    if n.kind == tyk_unknown() { return ty_unknown(t) }
+    tc_emit(tc, e.lo, e.hi, tmsg3("cannot index a value of type '", ty_render(t, bt), "'; only a List is indexed"))
+    return ty_unknown(t)
+}
+
+func infer_tuple(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    a: *Ast = (*tc).ast
+    mut wn: TyNode = TyNode { kind: -1, a: 0, b: 0, off: 0, len: 0 }
+    if want >= 0 { wn = ty_get(t, want) }
+    xs: *Vector<int64> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < e.b {
+        mut ew: int64 = -1
+        if wn.kind == tyk_tuple() {
+            if wn.len == e.b { ew = vec_get((*t).kids, wn.off + i) }
+        }
+        vec_push(xs, infer_expr(tc, vec_get((*a).kids, e.a + i), ew))
+        i = i + 1
+    }
+    return ty_tuple(t, xs)
+}
+
+func infer_list(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    a: *Ast = (*tc).ast
+    mut elem: int64 = -1
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_list() { elem = wn.a }
+    }
+    mut i: int64 = 0
+    while i < e.b {
+        eid: int64 = vec_get((*a).kids, e.a + i)
+        et: int64 = infer_expr(tc, eid, elem)
+        if elem < 0 {
+            elem = et
+        } else if !compat(t, elem, et) {
+            en: ExprNode = vec_get((*a).exprs, eid)
+            tc_emit(tc, en.lo, en.hi, tmsg_types(tc, "list elements disagree in type; got ", et, " beside ", elem))
+        }
+        i = i + 1
+    }
+    if elem < 0 { elem = ty_unknown(t) }
+    return ty_list(t, elem)
+}
+
+func rec_field_index(tc: *Tc, rs: RecSig, name: int64) -> int64 {
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*tc).sigs, rs.off, i)
+        if f.name == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+func infer_record_lit(tc: *Tc, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    text: string = ast_name(a, e.a)
+    g: GEntry = rs_global((*tc).res, e.a)
+    if g.kind != gk_record() {
+        mut i: int64 = 0
+        while i < e.c {
+            infer_expr(tc, vec_get((*a).kids, e.b + i + 1), -1)
+            i = i + 2
+        }
+        if g.kind < 0 {
+            tc_emit(tc, e.lo, e.hi, tmsg3("unknown record '", text, "'"))
+        } else {
+            tc_emit(tc, e.lo, e.hi, tmsg3("'", text, "' is not a record"))
+        }
+        return ty_unknown(t)
+    }
+    rs: RecSig = sig_rec((*tc).sigs, e.a)
+    mut k: int64 = 0
+    while k < e.c {
+        fname: int64 = vec_get((*a).kids, e.b + k)
+        val_id: int64 = vec_get((*a).kids, e.b + k + 1)
+        val: ExprNode = vec_get((*a).exprs, val_id)
+        mut dup: bool = false
+        mut j: int64 = 0
+        while j < k {
+            prior: int64 = vec_get((*a).kids, e.b + j)
+            if prior == fname { dup = true }
+            j = j + 2
+        }
+        if dup {
+            tc_emit(tc, val.lo, val.hi, tmsg5("field '", ast_name(a, fname), "' is set more than once in '", text, "'"))
+        }
+        idx: int64 = rec_field_index(tc, rs, fname)
+        if idx < 0 {
+            tc_emit(tc, val.lo, val.hi, tmsg5("'", text, "' has no field '", ast_name(a, fname), "'"))
+            infer_expr(tc, val_id, -1)
+        } else {
+            fld: FieldSig = sig_field((*tc).sigs, rs.off, idx)
+            vt: int64 = infer_expr(tc, val_id, fld.ty)
+            if !compat(t, fld.ty, vt) {
+                head: string = tmsg5("field '", ast_name(a, fname), "' of '", text, "' expects ")
+                tc_emit(tc, val.lo, val.hi, tmsg_types(tc, head, fld.ty, ", got ", vt))
+            }
+        }
+        k = k + 2
+    }
+    mut m: int64 = 0
+    while m < rs.len {
+        fld2: FieldSig = sig_field((*tc).sigs, rs.off, m)
+        mut found: bool = false
+        mut n: int64 = 0
+        while n < e.c {
+            fn2: int64 = vec_get((*a).kids, e.b + n)
+            if fn2 == fld2.name { found = true }
+            n = n + 2
+        }
+        if !found {
+            tc_emit(tc, e.lo, e.hi, tmsg5("record literal for '", text, "' is missing field '", ast_name(a, fld2.name), "'"))
+        }
+        m = m + 1
+    }
+    return ty_named(t, text)
+}
+
+func infer_some(tc: *Tc, e: ExprNode, want: int64) -> int64 {
+    t: *TyArena = (*tc).ty
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_option() {
+            it: int64 = infer_expr(tc, e.a, wn.a)
+            if !compat(t, wn.a, it) {
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "'Some' carries ", it, " where ", wn.a))
+            }
+            return want
+        }
+    }
+    return ty_option(t, infer_expr(tc, e.a, -1))
+}
+
+func infer_ok_err(tc: *Tc, e: ExprNode, want: int64, is_ok: bool) -> int64 {
+    t: *TyArena = (*tc).ty
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_result() {
+            mut slot: int64 = wn.a
+            if !is_ok { slot = wn.b }
+            it: int64 = infer_expr(tc, e.a, slot)
+            if !compat(t, slot, it) {
+                mut who: string = "'Ok' carries "
+                if !is_ok { who = "'Err' carries " }
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, who, it, " where ", slot))
+            }
+            return want
+        }
+    }
+    it2: int64 = infer_expr(tc, e.a, -1)
+    if is_ok {
+        tc_emit(tc, e.lo, e.hi, "cannot infer the error type of 'Ok'; annotate the binding")
+        return ty_result(t, it2, ty_unknown(t))
+    }
+    tc_emit(tc, e.lo, e.hi, "cannot infer the value type of 'Err'; annotate the binding")
+    return ty_result(t, ty_unknown(t), it2)
+}
+
+export func infer_expr(tc: *Tc, id: int64, want: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    e: ExprNode = vec_get((*a).exprs, id)
+    if e.kind == xk_int() { return infer_int(tc, e, want) }
+    if e.kind == xk_float() { return ty_float(t) }
+    if e.kind == xk_str() { return ty_str(t) }
+    if e.kind == xk_char() { return ty_char(t) }
+    if e.kind == xk_bool() { return ty_bool(t) }
+    if e.kind == xk_ident() { return infer_ident(tc, e) }
+    if e.kind == xk_unary() {
+        ot: int64 = infer_expr(tc, e.b, -1)
+        n: TyNode = ty_get(t, ot)
+        if e.a == uop_not() {
+            if n.kind != tyk_bool() && n.kind != tyk_unknown() {
+                tc_emit(tc, e.lo, e.hi, "unary '!' needs 'Bool'")
+            }
+            return ty_bool(t)
+        }
+        if n.kind == tyk_int() || n.kind == tyk_float() || n.kind == tyk_unknown() {
+            return ot
+        }
+        tc_emit(tc, e.lo, e.hi, "unary '-' needs 'Int' or 'Float'")
+        return ty_unknown(t)
+    }
+    if e.kind == xk_binary() { return infer_binary(tc, e, want) }
+    if e.kind == xk_call() { return infer_call(tc, e) }
+    if e.kind == xk_index() { return infer_index(tc, e) }
+    if e.kind == xk_member() { return infer_member(tc, e) }
+    if e.kind == xk_question() { return infer_question(tc, e) }
+    if e.kind == xk_tuple() { return infer_tuple(tc, e, want) }
+    if e.kind == xk_list() { return infer_list(tc, e, want) }
+    if e.kind == xk_record_lit() { return infer_record_lit(tc, e) }
+    if e.kind == xk_match() { return check_match(tc, e, want) }
+    if e.kind == xk_some() { return infer_some(tc, e, want) }
+    if e.kind == xk_none() {
+        if want >= 0 {
+            if ty_get(t, want).kind == tyk_option() { return want }
+        }
+        tc_emit(tc, e.lo, e.hi, "cannot infer the type of 'None'; annotate the binding")
+        return ty_unknown(t)
+    }
+    if e.kind == xk_ok() { return infer_ok_err(tc, e, want, true) }
+    if e.kind == xk_err() { return infer_ok_err(tc, e, want, false) }
+    if e.kind == xk_mut() { return infer_expr(tc, e.a, want) }
+    return ty_unknown(t)
+}

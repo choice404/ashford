@@ -295,15 +295,17 @@ func parse_member(p: *Parser, members: *Vector<int64>) -> void {
         return
     }
     if p_kw(p, "vow") {
+        vlo: int64 = p_lo(p)
         p_bump(p)
         name2: int64 = p_ident(p)
+        vhi: int64 = p_prev_hi(p)
         p_expect(p, k_colon(), "':' between the vow name and its type")
         ty: int64 = parse_type(p)
         mut init: int64 = -1
         if p_eat(p, k_assign()) {
             init = parse_expr(p)
         }
-        id2: int64 = ast_vow(p_ast(p), VowNode { name: name2, ty: ty, init: init })
+        id2: int64 = ast_vow(p_ast(p), VowNode { name: name2, lo: vlo, hi: vhi, ty: ty, init: init })
         vec_push(members, mk_vow())
         vec_push(members, id2)
         return
@@ -562,7 +564,7 @@ func parse_req_or(p: *Parser) -> int64 {
     if p_enter_nesting(p) {
         e = parse_req_or_inner(p)
     } else {
-        e = ast_req(p_ast(p), rk_atom(), ast_intern(p_ast(p), ""), 0)
+        e = ast_req(p_ast(p), rk_atom(), p_lo(p), p_hi(p), ast_intern(p_ast(p), ""), 0)
     }
     p_leave_nesting(p)
     return e
@@ -576,7 +578,7 @@ func parse_req_or_inner(p: *Parser) -> int64 {
             going = false
         } else if p_eat(p, k_or_or()) {
             rhs: int64 = parse_req_and(p)
-            lhs = ast_req(p_ast(p), rk_or(), lhs, rhs)
+            lhs = ast_req(p_ast(p), rk_or(), req_lo(p, lhs), req_hi(p, rhs), lhs, rhs)
         } else {
             going = false
         }
@@ -592,7 +594,7 @@ func parse_req_and(p: *Parser) -> int64 {
             going = false
         } else if p_eat(p, k_and_and()) {
             rhs: int64 = parse_req_not(p)
-            lhs = ast_req(p_ast(p), rk_and(), lhs, rhs)
+            lhs = ast_req(p_ast(p), rk_and(), req_lo(p, lhs), req_hi(p, rhs), lhs, rhs)
         } else {
             going = false
         }
@@ -602,7 +604,9 @@ func parse_req_and(p: *Parser) -> int64 {
 
 func parse_req_not(p: *Parser) -> int64 {
     if p_eat(p, k_bang()) {
-        return ast_req(p_ast(p), rk_not(), parse_req_atom(p), 0)
+        lo: int64 = p_prev_hi(p) - 1
+        inner: int64 = parse_req_atom(p)
+        return ast_req(p_ast(p), rk_not(), lo, req_hi(p, inner), inner, 0)
     }
     return parse_req_atom(p)
 }
@@ -617,9 +621,25 @@ func parse_req_atom(p: *Parser) -> int64 {
         return e
     }
     if p_at(p, k_ident()) {
-        return ast_req(p_ast(p), rk_atom(), p_ident(p), 0)
+        lo: int64 = p_lo(p)
+        hi: int64 = p_hi(p)
+        return ast_req(p_ast(p), rk_atom(), lo, hi, p_ident(p), 0)
     }
     p_error(p, expected_found(p, "a subcontract or pledge name"))
+    lo2: int64 = p_lo(p)
+    hi2: int64 = p_hi(p)
     p_bump(p)
-    return ast_req(p_ast(p), rk_atom(), ast_intern(p_ast(p), ""), 0)
+    return ast_req(p_ast(p), rk_atom(), lo2, hi2, ast_intern(p_ast(p), ""), 0)
+}
+
+// The recorded span ends of an already built requirements node, used to give a
+// combined and/or/not node the span of its operands.
+func req_lo(p: *Parser, id: int64) -> int64 {
+    q: ReqNode = vec_get((*p_ast(p)).reqs, id)
+    return q.lo
+}
+
+func req_hi(p: *Parser, id: int64) -> int64 {
+    q: ReqNode = vec_get((*p_ast(p)).reqs, id)
+    return q.hi
 }

@@ -1,0 +1,550 @@
+// resolve: name resolution for ashford, the first checking pass over a parsed
+// file. It builds the symbol tables the type checker reads: the file global
+// namespace of records, sums, sum variants, provisional clauses, and
+// contracts; one member namespace per contract where vows, pledges, clauses,
+// and named subcontracts share their names; and one pledge namespace per
+// named subcontract. Pledges inside an anonymous subcontract join the
+// contract pledge namespace, since the subcontract itself has no name to
+// hold them. With the tables built it checks the references the grammar
+// leaves to a checker: every incorporate names a provisional clause the
+// contract has not already incorporated, no two incorporated provisional
+// clauses provide the same clause name, every provided signature has a
+// same named clause in the contract, and every requirements atom names a
+// named subcontract or a pledge declared outside any subcontract, with at
+// most 16 distinct atoms per contract. Signature shapes are the type
+// checker's business; this pass cares about names alone. Imports are
+// recorded and checked for duplicates only, since module resolution is a
+// later milestone.
+//
+// Map keys are interner ids rendered as decimal strings, prefixed with an
+// owning scope id, so one flat map serves every contract. Key strings and
+// diagnostic messages are heap strings that are deliberately never freed: a
+// Located borrows its message, and the tables live exactly as long as the
+// process that queries them.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+
+// The kinds a global name can resolve to.
+export func gk_record() -> int64 { return 0 }
+export func gk_sum() -> int64 { return 1 }
+export func gk_variant() -> int64 { return 2 }
+export func gk_prov() -> int64 { return 3 }
+export func gk_contract() -> int64 { return 4 }
+
+// A global name: its kind, its id in the matching arena, and the span of the
+// declaration that owns it. kind -1 is the miss sentinel the lookups return.
+export struct GEntry { kind: int64, id: int64, lo: int64, hi: int64 }
+
+// A contract member: its ast member kind, its arena id, and for a pledge the
+// subcontract it was declared in, -1 when it sits directly in the contract.
+export struct MEntry { kind: int64, id: int64, sub: int64, lo: int64, hi: int64 }
+
+// The resolved tables handed to the type checker. members holds the contract
+// scoped names under rs_mkey, sub_pledges the per named subcontract pledges
+// under rs_skey, incs the incorporated provisional clauses under rs_ikey, and
+// imports the dotted paths by their text.
+export struct Resolved {
+    ast: *Ast,
+    globals: *Map<GEntry>,
+    members: *Map<MEntry>,
+    sub_pledges: *Map<int64>,
+    incs: *Map<int64>,
+    imports: *Map<int64>,
+    errors: *Vector<Located>,
+}
+
+export func rs_errors(r: *Resolved) -> *Vector<Located> { return (*r).errors }
+
+// The key of a global name: its interner id in decimal.
+export func rs_gkey(name: int64) -> string {
+    return int_to_string(name)
+}
+
+func pair_key(prefix: string, scope: int64, name: int64) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, prefix)
+    sb_push_int(b, scope)
+    sb_push_char(b, 46)
+    sb_push_int(b, name)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The key of a contract member: the contract id, then the name id.
+export func rs_mkey(cid: int64, name: int64) -> string {
+    return pair_key("c", cid, name)
+}
+
+// The key of a pledge in a named subcontract: the sub id, then the name id.
+export func rs_skey(subid: int64, name: int64) -> string {
+    return pair_key("s", subid, name)
+}
+
+// The key of an incorporate: the contract id, then the provisional clause id.
+export func rs_ikey(cid: int64, provid: int64) -> string {
+    return pair_key("i", cid, provid)
+}
+
+func no_gentry() -> GEntry {
+    return GEntry { kind: -1, id: -1, lo: 0, hi: 0 }
+}
+
+func no_mentry() -> MEntry {
+    return MEntry { kind: -1, id: -1, sub: -1, lo: 0, hi: 0 }
+}
+
+// Looks a name up in the global namespace; kind -1 means not declared.
+export func rs_global(r: *Resolved, name: int64) -> GEntry {
+    return unwrap_or(map_get((*r).globals, rs_gkey(name)), no_gentry())
+}
+
+// Looks a name up in a contract's member namespace; kind -1 means not there.
+export func rs_member(r: *Resolved, cid: int64, name: int64) -> MEntry {
+    return unwrap_or(map_get((*r).members, rs_mkey(cid, name)), no_mentry())
+}
+
+func emit(r: *Resolved, lo: int64, hi: int64, msg: string) -> void {
+    vec_push((*r).errors, located(lo, hi, msg))
+}
+
+// Message builders: the segments joined into one heap string the diagnostic
+// borrows for the rest of the run.
+func msg3(s1: string, s2: string, s3: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func msg5(s1: string, s2: string, s3: string, s4: string, s5: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    sb_push(b, s4)
+    sb_push(b, s5)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func msg7(s1: string, s2: string, s3: string, s4: string, s5: string, s6: string, s7: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    sb_push(b, s4)
+    sb_push(b, s5)
+    sb_push(b, s6)
+    sb_push(b, s7)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func gk_word(kind: int64) -> string {
+    if kind == gk_record() { return "record" }
+    if kind == gk_sum() { return "sum" }
+    if kind == gk_variant() { return "variant" }
+    if kind == gk_prov() { return "provisional clause" }
+    return "contract"
+}
+
+func mk_word(kind: int64) -> string {
+    if kind == mk_vow() { return "vow" }
+    if kind == mk_pledge() { return "pledge" }
+    if kind == mk_clause() { return "clause" }
+    return "subcontract"
+}
+
+// Records the imports and rejects a repeated path. Module resolution proper
+// is a later milestone; the table only remembers what the file asked for.
+func collect_imports(r: *Resolved) -> void {
+    a: *Ast = (*r).ast
+    imps: *Vector<ImportNode> = (*a).imports
+    tab: *Map<int64> = (*r).imports
+    mut i: int64 = 0
+    while i < vec_len(imps) {
+        imp: ImportNode = vec_get(imps, i)
+        path: string = ast_name(a, imp.path)
+        if str_len(path) > 0 {
+            if map_has(tab, path) {
+                emit(r, imp.lo, imp.hi, msg3("duplicate import '", path, "'"))
+            } else {
+                map_put(tab, path, 1)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Declares one global name. A repeat of any kind is an error, named for the
+// later declaration; the first entry stays in the table so downstream lookups
+// see one stable answer. An empty name is a parse recovery placeholder and is
+// skipped, since the parse already reported it.
+func declare_global(r: *Resolved, kind: int64, id: int64, name: int64, lo: int64, hi: int64) -> void {
+    text: string = ast_name((*r).ast, name)
+    if str_len(text) == 0 {
+        return
+    }
+    key: string = rs_gkey(name)
+    tab: *Map<GEntry> = (*r).globals
+    if map_has(tab, key) {
+        emit(r, lo, hi, msg5("duplicate ", gk_word(kind), " '", text, "'"))
+        return
+    }
+    map_put(tab, key, GEntry { kind: kind, id: id, lo: lo, hi: hi })
+}
+
+// Fills the global namespace in declaration order. Sum variants are global
+// constructors, so each one takes a slot beside its sum; a variant has no
+// span of its own and borrows the sum's for its diagnostics.
+func collect_globals(r: *Resolved) -> void {
+    a: *Ast = (*r).ast
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_record() {
+            rec: RecordNode = vec_get((*a).records, d.id)
+            declare_global(r, gk_record(), d.id, rec.name, rec.lo, rec.hi)
+        } else if d.kind == dk_sum() {
+            s: SumNode = vec_get((*a).sums, d.id)
+            declare_global(r, gk_sum(), d.id, s.name, s.lo, s.hi)
+            mut j: int64 = 0
+            while j < s.variants_len {
+                vid: int64 = vec_get((*a).kids, s.variants_off + j)
+                v: VariantNode = vec_get((*a).variants, vid)
+                declare_global(r, gk_variant(), vid, v.name, s.lo, s.hi)
+                j = j + 1
+            }
+        } else if d.kind == dk_prov() {
+            pv: ProvNode = vec_get((*a).provs, d.id)
+            declare_global(r, gk_prov(), d.id, pv.name, pv.lo, pv.hi)
+        } else if d.kind == dk_contract() {
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            declare_global(r, gk_contract(), d.id, c.name, c.lo, c.hi)
+        }
+        i = i + 1
+    }
+}
+
+// Declares one contract member. Vows, pledges, clauses, and named
+// subcontracts share the namespace, so a repeat across kinds is as much an
+// error as a repeat within one; the message names the later member's kind.
+func declare_member(r: *Resolved, cid: int64, cname: string, kind: int64, id: int64, sub: int64, name: int64, lo: int64, hi: int64) -> void {
+    text: string = ast_name((*r).ast, name)
+    if str_len(text) == 0 {
+        return
+    }
+    key: string = rs_mkey(cid, name)
+    tab: *Map<MEntry> = (*r).members
+    if map_has(tab, key) {
+        emit(r, lo, hi, msg7("duplicate ", mk_word(kind), " '", text, "' in contract '", cname, "'"))
+        return
+    }
+    map_put(tab, key, MEntry { kind: kind, id: id, sub: sub, lo: lo, hi: hi })
+}
+
+// One subcontract's names. A named subcontract takes a contract member slot
+// and its pledges live in their own namespace under the sub id; an anonymous
+// subcontract contributes nothing but its pledges, which land in the contract
+// pledge namespace marked with the sub that declared them, the mark the
+// requirements check reads.
+func collect_sub(r: *Resolved, cid: int64, cname: string, subid: int64) -> void {
+    a: *Ast = (*r).ast
+    s: SubNode = vec_get((*a).subs, subid)
+    if s.name >= 0 {
+        declare_member(r, cid, cname, mk_subcontract(), subid, -1, s.name, s.lo, s.hi)
+        sname: string = ast_name(a, s.name)
+        mut i: int64 = 0
+        while i < s.pledges_len {
+            pid: int64 = vec_get((*a).kids, s.pledges_off + i)
+            pl: PledgeNode = vec_get((*a).pledges, pid)
+            ptext: string = ast_name(a, pl.name)
+            if str_len(ptext) > 0 {
+                key: string = rs_skey(subid, pl.name)
+                tab: *Map<int64> = (*r).sub_pledges
+                if map_has(tab, key) {
+                    emit(r, pl.lo, pl.hi, msg5("duplicate pledge '", ptext, "' in subcontract '", sname, "'"))
+                } else {
+                    map_put(tab, key, pid)
+                }
+            }
+            i = i + 1
+        }
+    } else {
+        mut j: int64 = 0
+        while j < s.pledges_len {
+            pid2: int64 = vec_get((*a).kids, s.pledges_off + j)
+            pl2: PledgeNode = vec_get((*a).pledges, pid2)
+            declare_member(r, cid, cname, mk_pledge(), pid2, subid, pl2.name, pl2.lo, pl2.hi)
+            j = j + 1
+        }
+    }
+}
+
+// Fills one contract's member namespace in source order and reports a second
+// requirements block, which the grammar gives no meaning.
+func collect_members(r: *Resolved, cid: int64) -> void {
+    a: *Ast = (*r).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    mut have_req: bool = false
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+        if mkind == mk_vow() {
+            v: VowNode = vec_get((*a).vows, mid)
+            declare_member(r, cid, cname, mk_vow(), mid, -1, v.name, v.lo, v.hi)
+        } else if mkind == mk_pledge() {
+            pl: PledgeNode = vec_get((*a).pledges, mid)
+            declare_member(r, cid, cname, mk_pledge(), mid, -1, pl.name, pl.lo, pl.hi)
+        } else if mkind == mk_clause() {
+            cl: ClauseNode = vec_get((*a).clauses, mid)
+            declare_member(r, cid, cname, mk_clause(), mid, -1, cl.name, cl.lo, cl.hi)
+        } else if mkind == mk_subcontract() {
+            collect_sub(r, cid, cname, mid)
+        } else if mkind == mk_requirements() {
+            rb: ReqBlockNode = vec_get((*a).reqblocks, mid)
+            if have_req {
+                emit(r, rb.lo, rb.hi, msg3("duplicate requirements block in contract '", cname, "'"))
+            }
+            have_req = true
+        }
+        i = i + 2
+    }
+}
+
+// One incorporate. The name must be a provisional clause not yet incorporated
+// by this contract, no two incorporated provisional clauses may provide the
+// same clause name, and every signature the provisional clause carries must
+// have a same named clause in the contract. Whether that clause's signature
+// matches is the type checker's question; the name being there settles this
+// pass. provided maps each contributed clause name to the provisional clause
+// that brought it, for the conflict message.
+func resolve_incorporate(r: *Resolved, cid: int64, cname: string, incid: int64, provided: *Map<string>) -> void {
+    a: *Ast = (*r).ast
+    inc: IncNode = vec_get((*a).incs, incid)
+    text: string = ast_name(a, inc.name)
+    if str_len(text) == 0 {
+        return
+    }
+    g: GEntry = rs_global(r, inc.name)
+    if g.kind < 0 {
+        emit(r, inc.lo, inc.hi, msg3("unknown provisional clause '", text, "'"))
+        return
+    }
+    if g.kind != gk_prov() {
+        emit(r, inc.lo, inc.hi, msg3("'", text, "' is not a provisional clause"))
+        return
+    }
+    ikey: string = rs_ikey(cid, g.id)
+    itab: *Map<int64> = (*r).incs
+    if map_has(itab, ikey) {
+        emit(r, inc.lo, inc.hi, msg5("duplicate incorporate of '", text, "' in contract '", cname, "'"))
+        return
+    }
+    map_put(itab, ikey, 1)
+    pv: ProvNode = vec_get((*a).provs, g.id)
+    mut i: int64 = 0
+    while i < pv.sigs_len {
+        sig: ClauseSigNode = vec_get((*a).clause_sigs, vec_get((*a).kids, pv.sigs_off + i))
+        sname: string = ast_name(a, sig.name)
+        if str_len(sname) > 0 {
+            ckey: string = rs_gkey(sig.name)
+            if map_has(provided, ckey) {
+                other: string = unwrap_or(map_get(provided, ckey), "")
+                emit(r, inc.lo, inc.hi, msg7("provisional clauses '", other, "' and '", text, "' both provide clause '", sname, "'"))
+            } else {
+                map_put(provided, ckey, text)
+                m: MEntry = rs_member(r, cid, sig.name)
+                if m.kind != mk_clause() {
+                    emit(r, inc.lo, inc.hi, msg7("contract '", cname, "' does not implement clause '", sname, "' from provisional clause '", text, "'"))
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+func resolve_incorporates(r: *Resolved, cid: int64) -> void {
+    a: *Ast = (*r).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    provided: *Map<string> = alloc(map_new())
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_incorporate() {
+            resolve_incorporate(r, cid, cname, vec_get((*a).kids, c.members_off + i + 1), provided)
+        }
+        i = i + 2
+    }
+}
+
+// Whether name is a pledge inside one of the contract's named subcontracts,
+// the case the requirements diagnostic below calls out by what it is instead
+// of reporting an unknown name.
+func named_sub_pledge(r: *Resolved, cid: int64, name: int64) -> bool {
+    a: *Ast = (*r).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    kids: *Vector<int64> = (*a).kids
+    tab: *Map<int64> = (*r).sub_pledges
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get(kids, c.members_off + i)
+        if mkind == mk_subcontract() {
+            subid: int64 = vec_get(kids, c.members_off + i + 1)
+            s: SubNode = vec_get((*a).subs, subid)
+            if s.name >= 0 {
+                if map_has(tab, rs_skey(subid, name)) {
+                    return true
+                }
+            }
+        }
+        i = i + 2
+    }
+    return false
+}
+
+// One requirements atom. It must name a named subcontract or a pledge
+// declared outside any subcontract; a pledge inside a subcontract, named or
+// anonymous, is called out by what it is, and a vow or clause is not a state
+// the policy can test. Every named atom counts toward the contract limit
+// whether it resolved or not, since the limit bounds the satisfiability
+// enumeration over the names as written.
+func resolve_req_atom(r: *Resolved, cid: int64, q: ReqNode, seen: *Map<int64>) -> void {
+    a: *Ast = (*r).ast
+    text: string = ast_name(a, q.a)
+    if str_len(text) == 0 {
+        return
+    }
+    map_put(seen, rs_gkey(q.a), 1)
+    m: MEntry = rs_member(r, cid, q.a)
+    if m.kind < 0 {
+        if named_sub_pledge(r, cid, q.a) {
+            emit(r, q.lo, q.hi, msg3("pledge '", text, "' is declared inside a subcontract and cannot be named in requirements"))
+        } else {
+            emit(r, q.lo, q.hi, msg3("unknown name '", text, "' in requirements"))
+        }
+        return
+    }
+    if m.kind == mk_subcontract() {
+        return
+    }
+    if m.kind == mk_pledge() {
+        if m.sub >= 0 {
+            emit(r, q.lo, q.hi, msg3("pledge '", text, "' is declared inside a subcontract and cannot be named in requirements"))
+        }
+        return
+    }
+    emit(r, q.lo, q.hi, msg3("requirements name '", text, "' is not a subcontract or a pledge"))
+}
+
+func resolve_req_expr(r: *Resolved, cid: int64, id: int64, seen: *Map<int64>) -> void {
+    a: *Ast = (*r).ast
+    q: ReqNode = vec_get((*a).reqs, id)
+    if q.kind == rk_atom() {
+        resolve_req_atom(r, cid, q, seen)
+    } else if q.kind == rk_not() {
+        resolve_req_expr(r, cid, q.a, seen)
+    } else {
+        resolve_req_expr(r, cid, q.a, seen)
+        resolve_req_expr(r, cid, q.b, seen)
+    }
+}
+
+// The contract's requirements block, the first one when a duplicate was
+// already reported. Every atom in every line resolves against the member
+// table, and the distinct names are counted against the grammar's limit of
+// 16 atoms per contract.
+func resolve_requirements(r: *Resolved, cid: int64) -> void {
+    a: *Ast = (*r).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    mut done: bool = false
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_requirements() {
+            if !done {
+                done = true
+                rb: ReqBlockNode = vec_get((*a).reqblocks, vec_get((*a).kids, c.members_off + i + 1))
+                seen: *Map<int64> = alloc(map_new())
+                if rb.fulfill >= 0 {
+                    resolve_req_expr(r, cid, rb.fulfill, seen)
+                }
+                if rb.partial >= 0 {
+                    resolve_req_expr(r, cid, rb.partial, seen)
+                }
+                if rb.brk >= 0 {
+                    resolve_req_expr(r, cid, rb.brk, seen)
+                }
+                if map_len(seen) > 16 {
+                    emit(r, rb.lo, rb.hi, msg3("too many requirements atoms in contract '", cname, "'; the limit is 16"))
+                }
+            }
+        }
+        i = i + 2
+    }
+}
+
+// The pass. Imports and globals first, then every contract's member table,
+// and only then the incorporate and requirements checks, so a reference to a
+// contract or member declared later in the file resolves the same as one
+// declared earlier.
+export func resolve_file(a: *Ast) -> *Resolved {
+    globals: *Map<GEntry> = alloc(map_new())
+    members: *Map<MEntry> = alloc(map_new())
+    sub_pledges: *Map<int64> = alloc(map_new())
+    incs: *Map<int64> = alloc(map_new())
+    imports: *Map<int64> = alloc(map_new())
+    errors: *Vector<Located> = alloc(vec_new())
+    r: *Resolved = alloc(Resolved {
+        ast: a,
+        globals: globals,
+        members: members,
+        sub_pledges: sub_pledges,
+        incs: incs,
+        imports: imports,
+        errors: errors,
+    })
+    collect_imports(r)
+    collect_globals(r)
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            collect_members(r, d.id)
+        }
+        i = i + 1
+    }
+    mut j: int64 = 0
+    while j < vec_len(decls) {
+        d2: DeclNode = vec_get(decls, j)
+        if d2.kind == dk_contract() {
+            resolve_incorporates(r, d2.id)
+            resolve_requirements(r, d2.id)
+        }
+        j = j + 1
+    }
+    return r
+}

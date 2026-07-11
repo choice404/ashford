@@ -227,6 +227,8 @@ ForStmt   ::= "for" IDENT "in" Expr Block
 
 Bindings are immutable unless declared `let mut`. Assignment targets a `let mut` binding, a field of one, or an element of one. There are no compound assignment operators in the first version. `break` and `continue` are loop control only, so they appear inside a `while` or `for` body.
 
+A block used as a value takes the type of its final expression statement, and `Unit` when it ends with anything else. Match arms must agree on one type wherever the match sits, so a statement position match with mixed arms ends each arm in a statement or returns.
+
 Vows are never assignable. `mut(expr)` is the builtin that produces a mutable copy of a vow value; the original never changes.
 
 ## Expressions

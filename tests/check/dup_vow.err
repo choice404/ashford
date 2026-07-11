@@ -1,0 +1,2 @@
+duplicate vow 'retries' in contract 'Config'
+duplicate pledge 'timeout' in contract 'Config'
