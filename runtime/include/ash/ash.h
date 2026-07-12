@@ -130,6 +130,13 @@ AshContractState ash_contract_state(const AshContract* c);
 uint64_t ash_contract_hash(const AshContract* c);
 int64_t  ash_contract_signed_at(const AshContract* c);
 
+/* The runtime the instance was signed against, or NULL for a NULL instance.
+ * This is how a pledge body reaches the runtime to sign another contract:
+ * compiled thunks call it on their own ctx, and a host bound implementation
+ * may do the same. Safe from any thread; the backref is immutable after
+ * sign. */
+AshRuntime* ash_instance_runtime(const AshContract* c);
+
 /* Frees every allocation the instance owns and latches the state at Broken.
  * Every later fulfillment on it reports ASH_ERR_STATE. The instance itself
  * stays valid for state queries until shutdown. A break races in-flight
@@ -222,7 +229,16 @@ AshFuture* ash_pledge_fulfill(AshContract* c, const char* pledge_name,
 AshStatus ash_future_wait(AshFuture* f, AshValue* out);
 
 /* The synchronous form: fulfill and wait in one call. Ref write back happens
- * before this returns, on the calling thread. */
+ * before this returns, on the calling thread.
+ *
+ * Reentrancy: called from inside a pledge body, which runs on a pool worker,
+ * the fulfillment runs inline on that worker thread instead of riding the
+ * queue, so a pool full of blocked callers cannot starve itself. The callee
+ * instance's lock is taken while the caller's is held; nesting through fresh
+ * instances is a tree per thread and cannot cycle, but two threads whose
+ * bodies fulfill against each other's shared instances in opposite orders
+ * can deadlock, the v1 limitation the ABI documents. Called from a host
+ * thread it is the queued path, unchanged. */
 AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
                                   const AshValue* args, size_t nargs,
                                   const AshRef* refs, size_t nrefs,

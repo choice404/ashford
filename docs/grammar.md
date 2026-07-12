@@ -237,6 +237,8 @@ A block used as a value takes the type of its final expression statement, and `U
 
 Every value has value semantics. A `let`, an assignment, an argument, and a return each carry an independent copy, composites included; mutating a record or list through one binding is never visible through another. The copy is cheap by assumption, the same assumption the boundary makes.
 
+The one exception is a signed instance, which is a reference handle: `let b = a` binds both names to the same instance, equality on instances is identity, and there is no way to copy a contract. A pledge called on another contract inside a body runs a real fulfillment on that instance, and its result is copied home before it is used, so the value survives the callee breaking.
+
 Vows are never assignable. `mut(expr)` is the builtin that produces a mutable copy of a vow value; the original never changes.
 
 ## Expressions

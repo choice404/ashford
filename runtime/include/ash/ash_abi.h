@@ -34,7 +34,16 @@ typedef enum AshTypeTag {
     ASH_TY_RESULT,
     ASH_TY_RECORD,
     ASH_TY_PLEDGE_REF,
-    ASH_TY_SUM
+    ASH_TY_SUM,
+
+    /* Internal only, never crosses the ABI. A signed instance handle inside a
+     * compiled module: as.box holds the AshContract*. The language already
+     * rejects a contract type at every boundary position, pledge signatures,
+     * vows, record and variant fields, so no frame, vow, or descriptor value
+     * ever carries this tag; it exists so a pledge body can hold the instance
+     * a cross-contract sign returned. Deep copy is the handle copy, equality
+     * is handle identity. */
+    ASH_TY_INSTANCE
 } AshTypeTag;
 
 /* UTF-8 bytes, length counted in bytes, no NUL terminator. When the runtime

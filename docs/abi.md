@@ -69,6 +69,8 @@ A list carries its elements as a contiguous `AshValue` array behind `as.list.dat
 
 A record rides the list arm too: `ASH_TY_RECORD`, the data pointer an `AshValue` array holding the fields in declaration order, `len` the field count, `cap` equal to `len`, `elem_ty` 0. A sum variant's payload is the same shape, `ASH_TY_SUM` with the variant's fields in declaration order behind the data pointer; a variant with no payload carries an empty arm, data NULL and `len` 0. Field access in compiled code is a slot read by declaration index, so the order is normative. Maps have no settled runtime representation yet; a deep copy that meets one reports `ASH_ERR_TYPE` rather than freeze a representation by accident.
 
+**The internal instance tag.** `ASH_TY_INSTANCE`, the tag after `ASH_TY_SUM`, is internal to compiled modules and never crosses the ABI. It is the signed instance handle a cross-contract `Contract.sign(...)` returns inside a pledge body: `as.box` holds the `AshContract*`. The language already rejects a contract type at every boundary position, pledge parameters and returns, vows, record and variant fields, and provisional clause signatures, so no thunk frame, vow storage, or descriptor value ever carries this tag, and a foreign host never meets it. Its helper arms are the reference-handle semantics the language pins: `ash_value_deep_copy` copies the handle, not the contract, the one deliberate exception to value semantics, and `ash_value_eq` is handle identity. The debug renderer spells it `<instance>`.
+
 The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_list_set`, `ash_tuple_new`, `ash_value_eq`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list, tuple, record, and sum elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own. `ash_value_eq` is the structural equality the language's `==` lowers onto for the deep shapes: type tags first, the sum shaped `tag` next, then elements recursively, with a Map or any other unsettled arm reading unequal.
 
 The value and allocation helpers cross the boundary with these shapes, every allocating one hanging its memory off the instance it was handed:
@@ -260,6 +262,22 @@ AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
                                   AshValue* out);
 ```
 
+## Cross-contract calls
+
+A pledge body may sign another contract, fulfill its pledges, and break it. The runtime the body signs against is its own instance's, reached through the backref every instance carries:
+
+```c
+AshRuntime* ash_instance_runtime(const AshContract* c);
+```
+
+Compiled code lowers `Contract.sign(overrides)` onto `ash_contract_sign(ash_instance_runtime(ctx), ...)` with the overrides in an `AshVowBinding` array, `instance.pledge(args)` onto `ash_pledge_fulfill_sync`, and `instance.break()` onto `ash_contract_break`. A sign or fulfill status other than `ASH_OK` is a fault of the enclosing pledge: the thunk returns that status and the enclosing fulfillment reports it, no latch moving.
+
+**Reentrancy.** `ash_pledge_fulfill_sync` called on a pool worker thread, which is what a call from inside a pledge body is, runs the fulfillment inline on that worker: the same validate, copy in, run, latch, and write back walk, under the callee instance's lock, with no future and no queue. Queueing it would park the worker on work only the pool can run, and a pool whose every worker is parked that way deadlocks; the inline rule is what makes nested synchronous calls safe at any pool size. Called from a host thread it is the queued path, unchanged. `ash_pledge_fulfill`, the future form, always queues; a pledge body that queues work and waits on it from the worker can still starve the pool, so a body that must call synchronously uses the sync form, which is the only form the language emits.
+
+**Callee result lifetime.** A fulfillment's value is owned by the callee instance and dies with its heap. Compiled callers therefore deep copy the result onto their own instance immediately after the call returns, before anything else runs, so the value survives the callee's `break()` the way value semantics promise. A host bound body that calls across contracts must do the same, `ash_value_deep_copy` against its own ctx, before breaking the callee.
+
+**Instances a body leaves behind.** A signed instance nothing breaks, the path where propagation exits a body between a sign and its break, stays on the runtime's instance registry and is reclaimed at `ash_runtime_shutdown` like every instance. Nothing leaks past shutdown; the instance slot stays occupied until then.
+
 ## By-reference arguments
 
 ```c
@@ -355,7 +373,9 @@ The moments a fulfillment touches host memory are unchanged from the single thre
 
 **Break against in-flight work.** `ash_contract_break` takes the instance lock, so a thunk mid-run finishes and latches before the break proceeds; a task still queued finds the state already Broken when its worker arrives and never touches the freed heap. Before freeing anything the break forfeits every future not yet waited, delivered or not, to `ASH_ERR_STATE` and clears its pointers into the instance heap. A fulfillment racing a break therefore resolves to exactly one of two outcomes: delivered before the break won, or `ASH_ERR_STATE`; never a crash, never freed memory. An unwaited outcome is forfeited even if the pledge ran, so a host that wants a result waits before it breaks.
 
-**Lock ordering.** Three lock levels, always taken downward, never upward: the runtime lock over the descriptor, instance, and binding tables (sign, register, bind, load); the per-instance mutex; the per-future mutex. The pool's queue lock is a leaf taken with no other lock held. `ash_future_wait` takes only the future mutex, so a waiter can never hold up an instance. v1 ships no deadlock detector and `ASH_ERR_DEADLOCK` stays reserved: a thunk cannot start a fulfillment (emitted C has no such path), the instance lock is only taken by the runtime itself, and no path holds two instance locks at once, so a lock cycle cannot be constructed.
+**Lock ordering.** The hierarchy runs instance above runtime, then future, taken downward and never upward: a caller instance's mutex, then any callee instance mutexes a cross-contract call nests below it, then the runtime lock over the descriptor, instance, and binding tables, then the per-future mutex. The pool's queue lock is a leaf taken with no other lock held. The runtime lock never sits above an instance mutex: `ash_contract_sign` resolves the descriptor and dispatch table under the runtime lock alone, builds the instance with no locks held, the allocation helpers touching only the fresh, unpublished instance's own mutex, and publishes it under the runtime lock again, which is what lets a thunk holding its instance lock sign through `ash_instance_runtime`. `ash_future_wait` takes only the future mutex, so a waiter can never hold up an instance.
+
+Instance-to-instance nesting is safe for compiled code: a body only ever holds instances it signed itself, fresh and unshared, so the per-thread lock graph is a tree over recursive mutexes and a cycle cannot be constructed. The one deadlock v1 leaves possible is host made: two host bound bodies on different threads fulfilling against each other's shared instances in opposite orders. That needs instance pointers handed around outside the language, and v1 documents it instead of detecting it; `ASH_ERR_DEADLOCK` stays reserved.
 
 ## Ownership
 

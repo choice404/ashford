@@ -158,7 +158,10 @@ export func cg_clause_fn(cname: string, clname: string) -> string {
 // The AshTypeTag spelling of a checked type, or "" for a shape the ABI does
 // not tag one to one, which the callers treat as no check or a build fault.
 // A named type resolves through the file's declarations: a record is
-// ASH_TY_RECORD, a sum is ASH_TY_SUM, anything else stays untagged.
+// ASH_TY_RECORD, a sum is ASH_TY_SUM, anything else stays untagged. A
+// contract instance is the internal ASH_TY_INSTANCE; the checker keeps that
+// tag out of every ABI position, so the thunk frame checks never meet it,
+// but a body local list of instances declares it as its element tag.
 export func cg_tag_of(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
     if k == tyk_int() { return "ASH_TY_INT" }
@@ -179,6 +182,7 @@ export func cg_tag_of(g: *Cg, tyid: int64) -> string {
         if cn.kind == gk_record() { return "ASH_TY_RECORD" }
         if cn.kind == gk_sum() { return "ASH_TY_SUM" }
     }
+    if k == tyk_contract() { return "ASH_TY_INSTANCE" }
     return ""
 }
 

@@ -5,13 +5,20 @@
 // expression core: the literals, parameter, vow, and let bound reads, the
 // operators including String concatenation and deep equality, the Option and
 // Result constructors, list, tuple, and record literals, record field reads,
-// list indexing, sum variant construction, the propagation operator, and
-// match, which lives in cgenmatch, and the bare clause call, which lands on
-// the contract's static clause function. What stays out, calls into
-// contracts, member access on instances, and Map operations, is a named
-// build error through cg_unsupported, so no thunk ever ships C the emitter
-// was guessing at. The type questions were all settled by the checker before
-// codegen runs; the types read here pick union fields, never report faults.
+// list indexing, sum variant construction, the propagation operator, match,
+// which lives in cgenmatch, the bare clause call, which lands on the
+// contract's static clause function, and the cross-contract operations:
+// Contract.sign with named vow overrides through ash_contract_sign on the
+// runtime the enclosing instance rides, instance.pledge(args) through
+// ash_pledge_fulfill_sync with the callee's result deep copied home, and
+// instance.break() through ash_contract_break. An instance value is the
+// internal ASH_TY_INSTANCE handle in as.box, value semantics' one exception:
+// a let or a bind copies the handle, not the contract. What stays out, the
+// first class pledge value read off an instance and Map operations, is a
+// named build error through cg_unsupported, so no thunk ever ships C the
+// emitter was guessing at. The type questions were all settled by the
+// checker before codegen runs; the types read here pick union fields, never
+// report faults.
 
 @paradigm procedural
 
@@ -195,9 +202,11 @@ export func cg_is_composite(t: *TyArena, tyid: int64) -> bool {
 }
 
 // Whether equality on this checked type goes through the structural
-// ash_value_eq helper: exactly the composite shapes, everything whose value
-// is more than one union field.
+// ash_value_eq helper: the composite shapes, everything whose value is more
+// than one union field, and the instance handle, whose equality arm is
+// handle identity.
 func deep_eq_kind(t: *TyArena, tyid: int64) -> bool {
+    if ty_get(t, tyid).kind == tyk_contract() { return true }
     return cg_is_composite(t, tyid)
 }
 
@@ -478,7 +487,9 @@ func gen_record_lit(g: *Cg, e: ExprNode) -> CVal {
 }
 
 // A member read: a record field lifts out of its slot by declaration index.
-// Every other member form still belongs to a later milestone.
+// A pledge read off an instance, the first class pledge value the checker
+// admits, has no lowering yet and stays a named build error. Every other
+// member form belongs to a later milestone.
 func gen_member(g: *Cg, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
     base: CVal = gen_expr(g, e.a, -1)
@@ -492,6 +503,10 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
             // own copy: mutating it never writes back through the record.
             return cg_copy_out(g, CVal { cvar: v, ty: cf.ty })
         }
+    }
+    if ty_get((*g).ty, base.ty).kind == tyk_contract() {
+        cg_unsupported(g, e.lo, e.hi, "a first class pledge value in a pledge body")
+        return bad_val(g)
     }
     cg_unsupported(g, e.lo, e.hi, tmsg3("member access '.", ast_name(a, e.b), "' in a pledge body"))
     return bad_val(g)
@@ -540,6 +555,49 @@ func gen_question(g: *Cg, e: ExprNode) -> CVal {
     return CVal { cvar: v, ty: inner }
 }
 
+// Lowers a positional argument list against the checked parameter types of
+// the callee, one CVal per argument, in source order.
+func gen_args(g: *Cg, params: TyList, off: int64, len: int64) -> *Vector<CVal> {
+    a: *Ast = (*g).ast
+    vals: *Vector<CVal> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < len {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, off + i))
+        mut w: int64 = -1
+        if i < params.len { w = sig_param((*g).sigs, params, i) }
+        vec_push(vals, gen_expr(g, arg.expr, w))
+        i = i + 1
+    }
+    return vals
+}
+
+// Gathers lowered argument values into one stack AshValue array and returns
+// its name, or "NULL" for an empty list, the spelling both the static clause
+// call and the fulfill call pass on.
+func gen_val_array(g: *Cg, vals: *Vector<CVal>) -> string {
+    if vec_len(vals) == 0 { return "NULL" }
+    arr: string = cg_tmp(g)
+    line: *StringBuilder = alloc(sb_new())
+    sb_push(line, "AshValue ")
+    sb_push(line, arr)
+    sb_push_char(line, 91)
+    sb_push_int(line, vec_len(vals))
+    sb_push(line, "] = { ")
+    mut j: int64 = 0
+    while j < vec_len(vals) {
+        if j > 0 { sb_push(line, ", ") }
+        sb_push(line, vec_get(vals, j).cvar)
+        j = j + 1
+    }
+    sb_push(line, " };")
+    text: string = substring(sb_cstr(line), 0, sb_size(line))
+    sb_free(line)
+    free(line)
+    cg_line(g, text)
+    free(text)
+    return arr
+}
+
 // A bare clause call. The arguments lower against the clause's checked
 // parameter types, land in one stack array, and the static clause function
 // runs in the thunk's exit convention: a status that is not ASH_OK exits the
@@ -554,38 +612,8 @@ func gen_clause_call(g: *Cg, name: int64, e: ExprNode) -> CVal {
     c: ContractNode = vec_get((*a).contracts, cid)
     cname: string = ast_name(a, c.name)
     cs: ClauseSigT = sig_clause((*g).sigs, cid, name)
-    vals: *Vector<CVal> = alloc(vec_new())
-    mut i: int64 = 0
-    while i < e.c {
-        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
-        mut w: int64 = -1
-        if i < cs.params.len { w = sig_param((*g).sigs, cs.params, i) }
-        vec_push(vals, gen_expr(g, arg.expr, w))
-        i = i + 1
-    }
-    mut argref: string = "NULL"
-    if vec_len(vals) > 0 {
-        arr: string = cg_tmp(g)
-        line: *StringBuilder = alloc(sb_new())
-        sb_push(line, "AshValue ")
-        sb_push(line, arr)
-        sb_push_char(line, 91)
-        sb_push_int(line, vec_len(vals))
-        sb_push(line, "] = { ")
-        mut j: int64 = 0
-        while j < vec_len(vals) {
-            if j > 0 { sb_push(line, ", ") }
-            sb_push(line, vec_get(vals, j).cvar)
-            j = j + 1
-        }
-        sb_push(line, " };")
-        text: string = substring(sb_cstr(line), 0, sb_size(line))
-        sb_free(line)
-        free(line)
-        cg_line(g, text)
-        free(text)
-        argref = arr
-    }
+    vals: *Vector<CVal> = gen_args(g, cs.params, e.b, e.c)
+    argref: string = gen_val_array(g, vals)
     fname: string = cg_clause_fn(cname, ast_name(a, name))
     rv: string = new_value(g)
     st: string = cg_tmp(g)
@@ -596,9 +624,110 @@ func gen_clause_call(g: *Cg, name: int64, e: ExprNode) -> CVal {
     return CVal { cvar: rv, ty: ret }
 }
 
-// A call expression. The lowered callables are a sum variant constructor and
-// a bare clause of the enclosing contract; the contract operations stay
-// named build errors until their milestone.
+// The contract declaration behind an instance type, or -1 when the checked
+// type is not a contract the file declares.
+func cg_contract_of(g: *Cg, tyid: int64) -> int64 {
+    if ty_get((*g).ty, tyid).kind != tyk_contract() { return -1 }
+    nid: int64 = ast_intern((*g).ast, ty_name_of((*g).ty, tyid))
+    ge: GEntry = rs_global((*g).res, nid)
+    if ge.kind == gk_contract() { return ge.id }
+    return -1
+}
+
+// Contract.sign(named vow overrides). The overrides land in an AshVowBinding
+// array, each value lowered against its vow's checked type, and the sign
+// runs against the runtime the enclosing instance rides, reached through
+// ash_instance_runtime(cc). The expected hash is 0 on purpose: the callee's
+// descriptor was emitted from this same checked tree, so the name alone
+// identifies it. A sign that fails is a pledge fault, its status returned
+// straight through the thunk. The value is the internal instance handle. An
+// internal contract emits no descriptor and cannot be signed by name, so
+// signing one from a body is a build error rather than a guaranteed runtime
+// name miss.
+func gen_sign(g: *Cg, scid: int64, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    c: ContractNode = vec_get((*a).contracts, scid)
+    cname: string = ast_name(a, c.name)
+    if c.internal {
+        cg_unsupported(g, e.lo, e.hi, tmsg3("signing the internal contract '", cname, "' in a pledge body"))
+        return bad_val(g)
+    }
+    mut vbref: string = "NULL"
+    if e.c > 0 {
+        arr: string = cg_tmp(g)
+        cg_line(g, tmsg5("AshVowBinding ", arr, "[", int_to_string(e.c), "];"))
+        mut i: int64 = 0
+        while i < e.c {
+            arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+            vs: VowSigT = sig_vow((*g).sigs, scid, arg.label)
+            pv: CVal = gen_expr(g, arg.expr, vs.ty)
+            slot: string = tmsg5(arr, "[", int_to_string(i), "]", "")
+            cg_line(g, tmsg7(slot, ".name = \"", ast_name(a, arg.label), "\";", "", "", ""))
+            cg_line(g, tmsg5(slot, ".value = ", pv.cvar, ";", ""))
+            i = i + 1
+        }
+        vbref = arr
+    }
+    ins: string = cg_tmp(g)
+    cg_line(g, tmsg3("AshContract* ", ins, " = NULL;"))
+    st: string = cg_tmp(g)
+    head: string = tmsg7("AshStatus ", st, " = ash_contract_sign(ash_instance_runtime(cc), \"", cname, "\", ", vbref, ", ")
+    cg_line(g, tmsg7(head, int_to_string(e.c), ", 0, &", ins, ");", "", ""))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_INSTANCE")
+    cg_line(g, tmsg5(v, ".as.box = ", ins, ";", ""))
+    return CVal { cvar: v, ty: ty_contract(t, cname) }
+}
+
+// instance.pledge(args), the cross-contract fulfillment. The arguments lower
+// against the pledge's checked parameter types and ride one synchronous
+// fulfill against the callee instance; on a pool worker the runtime runs it
+// inline on this thread. A status that is not ASH_OK is a fault of the
+// enclosing pledge and returns straight through the thunk; the value, which
+// the callee instance owns, is deep copied onto the enclosing instance at
+// once, so it outlives the callee's break the way value semantics promise.
+func gen_pledge_call(g: *Cg, base: CVal, mname: int64, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    mtext: string = ast_name(a, mname)
+    cid: int64 = cg_contract_of(g, base.ty)
+    ps: PledgeSigT = find_pledge((*g).sigs, cid, mname)
+    if cid < 0 || !ps.found {
+        cg_unsupported(g, e.lo, e.hi, tmsg3("the call '", mtext, "' on this instance in a pledge body"))
+        return bad_val(g)
+    }
+    vals: *Vector<CVal> = gen_args(g, ps.params, e.b, e.c)
+    argref: string = gen_val_array(g, vals)
+    rv: string = new_value(g)
+    st: string = cg_tmp(g)
+    head: string = tmsg7("AshStatus ", st, " = ash_pledge_fulfill_sync((AshContract*)", base.cvar, ".as.box, \"", mtext, "\", ")
+    cg_line(g, tmsg7(head, argref, ", ", int_to_string(vec_len(vals)), ", NULL, 0, &", rv, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    home: string = new_value(g)
+    st2: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st2, " = ash_value_deep_copy(cc, &", rv, ", &", home, ");"))
+    cg_line(g, tmsg5("if (", st2, " != ASH_OK) return ", st2, ";"))
+    mut ret: int64 = ps.ret
+    if ret < 0 { ret = ty_unknown(t) }
+    return CVal { cvar: home, ty: ret }
+}
+
+// instance.break(). The status rides the thunk's exit convention like every
+// runtime helper; the value is Unit, the zeroed fresh temporary.
+func gen_break_call(g: *Cg, base: CVal) -> CVal {
+    st: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st, " = ash_contract_break((AshContract*)", base.cvar, ".as.box);", "", ""))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    v: string = new_value(g)
+    return CVal { cvar: v, ty: ty_unit((*g).ty) }
+}
+
+// A call expression. The lowered callables are a sum variant constructor, a
+// bare clause of the enclosing contract, sign on a contract name, and the
+// pledge and break operations on a signed instance; a call through a first
+// class pledge value stays a named build error.
 func gen_call(g: *Cg, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
     cn: ExprNode = vec_get((*a).exprs, e.a)
@@ -615,6 +744,31 @@ func gen_call(g: *Cg, e: ExprNode) -> CVal {
             if ge.kind == gk_variant() {
                 return gen_variant(g, cn.a, e.b, e.c, e.lo, e.hi)
             }
+        }
+    }
+    if cn.kind == xk_member() {
+        be: ExprNode = vec_get((*a).exprs, cn.a)
+        if be.kind == xk_ident() {
+            bb: CBind = cg_lookup(g, be.a)
+            if !bb.found {
+                ge2: GEntry = rs_global((*g).res, be.a)
+                if ge2.kind == gk_contract() {
+                    // The checker admits only sign here; anything else on a
+                    // contract name never reaches codegen.
+                    if str_eq(ast_name(a, cn.b), "sign") {
+                        return gen_sign(g, ge2.id, e)
+                    }
+                    cg_unsupported(g, e.lo, e.hi, "this call on a contract name in a pledge body")
+                    return bad_val(g)
+                }
+            }
+        }
+        base: CVal = gen_expr(g, cn.a, -1)
+        if ty_get((*g).ty, base.ty).kind == tyk_contract() {
+            if str_eq(ast_name(a, cn.b), "break") {
+                return gen_break_call(g, base)
+            }
+            return gen_pledge_call(g, base, cn.b, e)
         }
     }
     cg_unsupported(g, e.lo, e.hi, "a call in a pledge body")

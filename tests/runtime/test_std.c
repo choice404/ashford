@@ -86,6 +86,13 @@ static int err_sum(const AshValue* v, uint32_t variant) {
     return p->ty == ASH_TY_SUM && p->tag == variant;
 }
 
+/* The boxed Int behind an Err result, for a pledge whose error type is Int. */
+static int err_int(const AshValue* v, int64_t want) {
+    if (v->ty != ASH_TY_RESULT || v->tag != 1 || !v->as.box) return 0;
+    const AshValue* p = (const AshValue*)v->as.box;
+    return p->ty == ASH_TY_INT && p->as.i == want;
+}
+
 static int some_int(const AshValue* v, int64_t want) {
     if (v->ty != ASH_TY_OPTION || v->tag != 1 || !v->as.box) return 0;
     const AshValue* p = (const AshValue*)v->as.box;
@@ -303,6 +310,27 @@ static void drive_stduser(AshRuntime* rt) {
     out = run(c, "describe", a1, 1, "describe -3 runs");
     CHECK(ok_str(&out, "[stduser] negative"),
           "describe(-3) decorates through log_line");
+
+    /* compute is the cross-contract walk: its thunk signs MathOps with a vow
+     * override, runs abs through the instance, breaks it, then routes the
+     * value through IntGate with '?', all on a pool worker. The result must
+     * survive the callee breaks because the call deep copied it home. */
+    a1[0] = int_val(-4);
+    out = run(c, "compute", a1, 1, "compute -4 runs");
+    CHECK(ok_int(&out, 8), "compute(-4) is Ok(8)");
+
+    /* abs faults on the one unrepresentable magnitude; compute translates
+     * the AshMathError sum into its own Int error by hand. */
+    a1[0] = int_val(INT64_MIN);
+    out = run(c, "compute", a1, 1, "compute INT64_MIN runs");
+    CHECK(err_int(&out, -1), "compute(INT64_MIN) is Err(-1)");
+
+    /* The gate refuses what abs let through, and '?' propagates its Err
+     * across the contract boundary; the gate instance is deliberately left
+     * unbroken on this path and must still be reclaimed at shutdown. */
+    a1[0] = int_val(2000);
+    out = run(c, "compute", a1, 1, "compute 2000 runs");
+    CHECK(err_int(&out, 2000), "compute(2000) propagates Err(2000) via '?'");
 
     CHECK(ash_contract_break(c) == ASH_OK, "break StdUser");
 }

@@ -37,14 +37,27 @@
  * copies in on the caller's thread, exactly the M4 boundary, then queues the
  * work; a pool worker runs the thunk; the wait blocks on the future's
  * condvar and performs the ref write back on the waiting thread. Three locks
- * carry the whole design, always taken in this order and never the reverse:
- * the runtime lock over the descriptor, instance, and binding tables; the
- * per-instance recursive mutex that serializes every fulfillment, latch,
- * break, and block list allocation touching one instance; and the per-future
- * mutex under its condvar. The pool's queue lock is a leaf taken with no
- * other lock held. Thunks never call fulfill, the instance lock is only ever
- * taken by the runtime itself, and no path holds two instance locks at once,
- * so a lock cycle cannot be constructed and v1 ships no deadlock detector. */
+ * carry the whole design: the runtime lock over the descriptor, instance,
+ * and binding tables; the per-instance recursive mutex that serializes every
+ * fulfillment, latch, break, and block list allocation touching one
+ * instance; and the per-future mutex under its condvar. The pool's queue
+ * lock is a leaf taken with no other lock held.
+ *
+ * Cross-contract calls change the reentrancy story. A pledge body may sign
+ * another contract, fulfill its pledges, and break it, so a thunk holding
+ * its own instance lock now takes the runtime lock (sign) and another
+ * instance's lock (fulfill). ash_pledge_fulfill_sync detects a pool worker
+ * through a thread-local flag and runs the nested fulfillment inline on that
+ * worker instead of queueing it, since a pool whose every worker is blocked
+ * waiting on a queued nested call would starve itself into deadlock. The
+ * lock graph stays acyclic for compiled code: the runtime lock is held only
+ * over table walks and a fresh, unpublished instance's own mutex, never
+ * blocking on a contended instance, and a thunk's nested instances form a
+ * tree per thread over the recursive mutexes. Two host bound bodies on
+ * different threads fulfilling against each other's shared instances in
+ * opposite orders can still deadlock; that cycle needs instances handed
+ * around outside the language, and v1 documents it instead of detecting
+ * it. */
 
 #include <ash/ash.h>
 
@@ -298,11 +311,17 @@ static void pool_enqueue(AshRuntime* rt, struct AshFuture* f) {
     pthread_mutex_unlock(&rt->qmu);
 }
 
+/* Raised on pool worker threads and read by ash_pledge_fulfill_sync: a
+ * synchronous fulfillment started from inside a thunk runs inline on the
+ * worker rather than riding the queue it is draining. */
+static __thread int t_pool_worker;
+
 /* Workers drain the queue until shutdown raises qstop, and even then they
  * finish what is queued before exiting, so shutdown never strands a future
  * an outstanding wait is parked on. */
 static void* pool_worker(void* arg) {
     AshRuntime* rt = (AshRuntime*)arg;
+    t_pool_worker = 1;
     for (;;) {
         pthread_mutex_lock(&rt->qmu);
         while (!rt->qhead && !rt->qstop) {
@@ -697,18 +716,14 @@ static const AshVowDesc* find_vow_desc(const AshContractDesc* desc,
     return NULL;
 }
 
-/* Copies one vow value onto the instance. Strings deep copy so the instance
- * never aliases host memory or another instance's heap; everything else is a
- * plain value. */
+/* Copies one vow value onto the instance, deeply, so the instance never
+ * aliases host memory or another instance's heap whatever shape the vow is.
+ * An instance handle is refused outright: a vow is a value locked at sign,
+ * and a handle is neither copyable nor a value. */
 static AshStatus copy_vow_value(AshContract* c, const AshValue* src,
                                 AshValue* dst) {
-    if (src->ty == ASH_TY_STRING) {
-        *dst = ash_string_copy(c, src->as.s.ptr, src->as.s.len);
-        if (src->as.s.len && !dst->as.s.ptr) return ASH_ERR_OOM;
-        return ASH_OK;
-    }
-    *dst = *src;
-    return ASH_OK;
+    if (src->ty == ASH_TY_INSTANCE) return ASH_ERR_TYPE;
+    return ash_value_deep_copy(c, src, dst);
 }
 
 /* Fills the instance's vow storage: defaults first, then the overrides, each
@@ -755,33 +770,46 @@ static AshPledgeFn find_binding(const AshRuntime* rt, const AshPledgeDesc* pd) {
     return NULL;
 }
 
-/* Resolves the instance's dispatch table at sign, one fn per pledge, the
- * host binding beating the compiled body. A pledge with neither refuses the
- * whole sign. */
-static AshStatus resolve_dispatch(const AshRuntime* rt, AshContract* c) {
-    const AshContractDesc* desc = c->desc;
+/* Resolves the dispatch table into plain heap under the runtime lock, one fn
+ * per pledge, the host binding beating the compiled body. A pledge with
+ * neither refuses the whole sign. The buffer is deliberately not instance
+ * memory: sign never touches an instance mutex while the runtime lock is
+ * held, the ordering rule cross-contract calls rely on. */
+static AshStatus resolve_dispatch(const AshRuntime* rt,
+                                  const AshContractDesc* desc,
+                                  AshPledgeFn** fns_out) {
+    *fns_out = NULL;
     if (desc->npledges == 0) return ASH_OK;
-    c->fns = (AshPledgeFn*)ash_bytes(c, desc->npledges * sizeof(AshPledgeFn));
-    if (!c->fns) return ASH_ERR_OOM;
+    AshPledgeFn* fns = calloc(desc->npledges, sizeof(AshPledgeFn));
+    if (!fns) return ASH_ERR_OOM;
     for (uint32_t i = 0; i < desc->npledges; i++) {
         AshPledgeFn fn = find_binding(rt, &desc->pledges[i]);
         if (!fn) fn = desc->pledges[i].fn;
-        if (!fn) return ASH_ERR_UNBOUND;
-        c->fns[i] = fn;
+        if (!fn) {
+            free(fns);
+            return ASH_ERR_UNBOUND;
+        }
+        fns[i] = fn;
     }
+    *fns_out = fns;
     return ASH_OK;
 }
 
+/* Sign runs in three phases so the runtime lock never sits above an instance
+ * mutex. Phase one resolves the descriptor and dispatch table under the
+ * runtime lock alone; phase two builds the instance with no locks held,
+ * where the allocation helpers take only the fresh instance's own mutex,
+ * which nothing else can reach yet; phase three publishes it under the
+ * runtime lock, where the capacity check belongs because that is where the
+ * slot is taken. A pledge body signing through ash_instance_runtime already
+ * holds its own instance lock, and this shape keeps that edge one way:
+ * instance above runtime, never the reverse. */
 AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
                             const AshVowBinding* vows, size_t nvows,
                             uint64_t expected_hash, AshContract** out) {
     if (!rt || !contract_name || !out) return ASH_ERR_TYPE;
     if (nvows > 0 && !vows) return ASH_ERR_TYPE;
     pthread_mutex_lock(&rt->lock);
-    if (rt->ninstances == ASH_MAX_INSTANCES) {
-        pthread_mutex_unlock(&rt->lock);
-        return ASH_ERR_OOM;
-    }
     const AshContractDesc* desc = find_desc(rt, contract_name);
     if (!desc) {
         pthread_mutex_unlock(&rt->lock);
@@ -791,24 +819,46 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
         pthread_mutex_unlock(&rt->lock);
         return ASH_ERR_VERSION;
     }
+    AshPledgeFn* fns = NULL;
+    AshStatus st = resolve_dispatch(rt, desc, &fns);
+    pthread_mutex_unlock(&rt->lock);
+    if (st != ASH_OK) return st;
+
     AshContract* c = calloc(1, sizeof(AshContract));
     if (!c) {
-        pthread_mutex_unlock(&rt->lock);
+        free(fns);
         return ASH_ERR_OOM;
     }
     if (mutex_init_recursive(&c->mu) != 0) {
         free(c);
-        pthread_mutex_unlock(&rt->lock);
+        free(fns);
         return ASH_ERR_OOM;
     }
     c->rt = rt;
     c->desc = desc;
-    AshStatus st = resolve_dispatch(rt, c);
+    if (desc->npledges > 0) {
+        c->fns = (AshPledgeFn*)ash_bytes(c, desc->npledges * sizeof(AshPledgeFn));
+        if (!c->fns) st = ASH_ERR_OOM;
+        else memcpy(c->fns, fns, desc->npledges * sizeof(AshPledgeFn));
+    }
+    free(fns);
     if (st == ASH_OK) st = bind_vows(c, vows, nvows);
     if (st == ASH_OK && desc->npledges > 0) {
         c->pledge_state = calloc(desc->npledges, sizeof(uint8_t));
         c->pledge_err = calloc(desc->npledges, sizeof(AshValue));
         if (!c->pledge_state || !c->pledge_err) st = ASH_ERR_OOM;
+    }
+    if (st == ASH_OK) {
+        c->state = ASH_SIGNED;
+        c->shape_hash = desc->shape_hash;
+        c->signed_at = (int64_t)time(NULL);
+        pthread_mutex_lock(&rt->lock);
+        if (rt->ninstances == ASH_MAX_INSTANCES) {
+            st = ASH_ERR_OOM;
+        } else {
+            rt->instances[rt->ninstances++] = c;
+        }
+        pthread_mutex_unlock(&rt->lock);
     }
     if (st != ASH_OK) {
         contract_free_owned(c);
@@ -816,14 +866,8 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
         free(c->pledge_err);
         pthread_mutex_destroy(&c->mu);
         free(c);
-        pthread_mutex_unlock(&rt->lock);
         return st;
     }
-    c->state = ASH_SIGNED;
-    c->shape_hash = desc->shape_hash;
-    c->signed_at = (int64_t)time(NULL);
-    rt->instances[rt->ninstances++] = c;
-    pthread_mutex_unlock(&rt->lock);
     *out = c;
     return ASH_OK;
 }
@@ -843,6 +887,14 @@ uint64_t ash_contract_hash(const AshContract* c) {
 
 int64_t ash_contract_signed_at(const AshContract* c) {
     return c ? c->signed_at : 0;
+}
+
+/* The backref a cross-contract sign needs: a compiled thunk reaches the
+ * runtime through its own ctx, and a host bound body may do the same. The
+ * field is written once under the runtime lock at sign and never moves, so
+ * the read needs no lock. */
+AshRuntime* ash_instance_runtime(const AshContract* c) {
+    return c ? c->rt : NULL;
 }
 
 /* Break under the instance lock, which is the whole in-flight story: a thunk
@@ -1429,14 +1481,76 @@ AshStatus ash_future_wait(AshFuture* f, AshValue* out) {
     return st;
 }
 
+/* The reentrant path: a synchronous fulfillment started inside a thunk runs
+ * whole on the current worker thread, the same validate, copy in, run,
+ * latch, and write back walk the queued path performs, under the callee
+ * instance's lock. No future exists because no one could wait on it; the
+ * caller is this thread. The caller's own instance lock is already held
+ * above this frame, which is exactly the instance-to-instance edge the
+ * header comment audits. */
+static AshStatus fulfill_inline(AshContract* c, const char* pledge_name,
+                                const AshValue* args, size_t nargs,
+                                const AshRef* refs, size_t nrefs,
+                                AshValue* out) {
+    AshStatus st = ASH_OK;
+    pthread_mutex_lock(&c->mu);
+    do {
+        if ((nargs > 0 && !args) || (nrefs > 0 && !refs)) {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        if (c->state != ASH_SIGNED && c->state != ASH_PARTIAL &&
+            c->state != ASH_FULFILLED) {
+            st = ASH_ERR_STATE;
+            break;
+        }
+        const AshPledgeDesc* p = find_pledge(c->desc, pledge_name);
+        if (!p) {
+            st = ASH_ERR_NAME;
+            break;
+        }
+        if (nargs + nrefs != p->nargs) {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        AshValue* frame = NULL;
+        st = prepare_frame(c, args, nargs, refs, nrefs, &frame);
+        if (st != ASH_OK) break;
+        AshValue res;
+        memset(&res, 0, sizeof(res));
+        AshPledgeFn fn = c->fns[p - c->desc->pledges];
+        st = fn((void*)c, frame, p->nargs, &res);
+        if (st != ASH_OK) break;
+        latch_pledge(c, (uint32_t)(p - c->desc->pledges), &res);
+        eval_policy(c);
+        if (nrefs > 0 && frame) {
+            AshStatus wb = write_back_refs(refs, frame + nargs, nrefs);
+            if (wb != ASH_OK) {
+                st = wb;
+                break;
+            }
+        }
+        *out = res;
+    } while (0);
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
 /* The synchronous form is exactly fulfill plus wait on the same path, so
  * the two can never drift; the only extra step is releasing the delivered
- * receipt immediately, since no one else can be holding it. */
+ * receipt immediately, since no one else can be holding it. Called from a
+ * pool worker, which means from inside a pledge body, it runs inline on
+ * this thread instead: queueing would park the worker on work only the
+ * pool can run, and a pool of blocked workers deadlocks. */
 AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
                                   const AshValue* args, size_t nargs,
                                   const AshRef* refs, size_t nrefs,
                                   AshValue* out) {
     if (!c || !pledge_name || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (t_pool_worker) {
+        return fulfill_inline(c, pledge_name, args, nargs, refs, nrefs, out);
+    }
     AshFuture* f = ash_pledge_fulfill(c, pledge_name, args, nargs, refs, nrefs);
     if (!f) return ASH_ERR_OOM;
     AshStatus st = ash_future_wait(f, out);
@@ -1596,6 +1710,9 @@ int ash_value_eq(const AshValue* a, const AshValue* b) {
         return ash_value_eq((const AshValue*)a->as.box,
                             (const AshValue*)b->as.box);
     }
+    case ASH_TY_INSTANCE:
+        /* An instance value is a reference handle; equality is identity. */
+        return a->as.box == b->as.box;
     case ASH_TY_MAP:
     case ASH_TY_PLEDGE_REF:
     default:
@@ -1634,6 +1751,10 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
     case ASH_TY_BYTE:
     case ASH_TY_CHAR:
     case ASH_TY_PLEDGE_REF:
+    case ASH_TY_INSTANCE:
+        /* An instance value is a reference handle, the one deliberate value
+         * semantics exception: the copy shares the instance. Internal only;
+         * the ABI never carries this tag across the boundary. */
         *dst = *src;
         return ASH_OK;
     case ASH_TY_STRING:
@@ -1791,6 +1912,7 @@ static void render_value(RenderSink* s, const AshValue* v, unsigned depth) {
         return;
     case ASH_TY_MAP:        sink_str(s, "<map>"); return;
     case ASH_TY_PLEDGE_REF: sink_str(s, "<pledge>"); return;
+    case ASH_TY_INSTANCE:   sink_str(s, "<instance>"); return;
     default:                sink_str(s, "<?>"); return;
     }
 }

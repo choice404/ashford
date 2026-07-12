@@ -8,7 +8,13 @@
  * and write-back protocol under contention, mixes a compiled-style pledge
  * with a host bound one on the same contract, and races break against
  * in-flight fulfillments demanding every wait land on Ok or ASH_ERR_STATE
- * and nothing else. */
+ * and nothing else.
+ *
+ * The cross-contract section hammers the reentrant path: a pledge body that
+ * signs another contract, fulfills it synchronously, and breaks it, all from
+ * a pool worker. The pool is two workers and four host threads drive it, so
+ * the nested fulfillments deadlock the pool unless they run inline on the
+ * worker, which is exactly the rule under test. */
 
 #include <ash/ash.h>
 
@@ -39,6 +45,8 @@ static void fail_at(const char* what, const char* file, int line) {
 #define OOO_FUTURES      100
 #define RACE_ROUNDS      8
 #define RACE_FULFILLS    16
+#define CROSS_OUTERS     4
+#define CROSS_ITERS      12 /* signs one Inner per call; instance slots cap the total */
 
 /* ---- the Calc contract: one compiled-style pledge, one host bound ---- */
 
@@ -97,6 +105,60 @@ static AshValue int_val(int64_t i) {
     v.as.i = i;
     return v;
 }
+
+/* ---- the cross-contract pair: Outer's pledge body drives Inner ---- */
+
+static const AshPledgeDesc k_inner_pledges[] = {
+    { "add", "__ash_test_inner_add", 2, add_fn, -1 },
+};
+
+static const AshContractDesc k_inner = {
+    .name = "Inner", .shape_hash = 0x6ULL, .version = 1,
+    .npledges = 1, .pledges = k_inner_pledges,
+};
+
+/* compose(a, b): the shape a compiled cross-contract thunk emits. It reaches
+ * the runtime through its own ctx, signs Inner, fulfills add synchronously,
+ * which must run inline because this body is already on a pool worker, deep
+ * copies the callee owned result home, and breaks the callee before using
+ * the copy. */
+static AshStatus compose_fn(void* ctx, const AshValue* args, size_t nargs,
+                            AshValue* out) {
+    AshContract* c = (AshContract*)ctx;
+    if (nargs != 2) return ASH_ERR_TYPE;
+    AshRuntime* rt = ash_instance_runtime(c);
+    if (!rt) return ASH_ERR_STATE;
+    AshContract* inner = NULL;
+    AshStatus st = ash_contract_sign(rt, "Inner", NULL, 0, 0, &inner);
+    if (st != ASH_OK) return st;
+    AshValue res;
+    memset(&res, 0, sizeof(res));
+    st = ash_pledge_fulfill_sync(inner, "add", args, 2, NULL, 0, &res);
+    if (st != ASH_OK) {
+        ash_contract_break(inner);
+        return st;
+    }
+    AshValue mine;
+    memset(&mine, 0, sizeof(mine));
+    st = ash_value_deep_copy(c, &res, &mine);
+    if (st != ASH_OK) {
+        ash_contract_break(inner);
+        return st;
+    }
+    st = ash_contract_break(inner);
+    if (st != ASH_OK) return st;
+    *out = mine;
+    return ASH_OK;
+}
+
+static const AshPledgeDesc k_outer_pledges[] = {
+    { "compose", "__ash_test_outer_compose", 2, compose_fn, -1 },
+};
+
+static const AshContractDesc k_outer = {
+    .name = "Outer", .shape_hash = 0x7ULL, .version = 1,
+    .npledges = 1, .pledges = k_outer_pledges,
+};
 
 static int check_ok_int(const AshValue* out, int64_t want) {
     if (out->ty != ASH_TY_RESULT || out->tag != 0) return 0;
@@ -213,6 +275,51 @@ static void test_out_of_order_waits(AshContract* c) {
     }
 }
 
+/* ---- cross-contract calls from inside pledge bodies, under contention ---- */
+
+typedef struct CrossJob {
+    AshContract** outers;
+    int           nouters;
+    int           tid;
+    int           iters;
+} CrossJob;
+
+/* Each iteration drives compose synchronously from a host thread, so a pool
+ * worker is inside compose_fn signing, fulfilling, and breaking Inner while
+ * its sibling workers do the same against other Outer instances. */
+static void* cross_worker(void* arg) {
+    CrossJob* job = (CrossJob*)arg;
+    for (int i = 0; i < job->iters; i++) {
+        AshContract* c = job->outers[(job->tid + i) % job->nouters];
+        AshValue args[2] = { int_val(job->tid * 100), int_val(i) };
+        AshValue out;
+        if (ash_pledge_fulfill_sync(c, "compose", args, 2, NULL, 0, &out) !=
+                ASH_OK ||
+            !check_ok_int(&out, job->tid * 100 + i)) {
+            CHECK(0, "cross-contract compose fulfillment");
+        }
+    }
+    return NULL;
+}
+
+static void test_cross_contract(AshRuntime* rt, AshContract** outers) {
+    CrossJob jobs[NUM_THREADS];
+    pthread_t th[NUM_THREADS];
+    CHECK(ash_instance_runtime(outers[0]) == rt,
+          "ash_instance_runtime hands back the signing runtime");
+    CHECK(ash_instance_runtime(NULL) == NULL,
+          "ash_instance_runtime on NULL is NULL");
+    for (int t = 0; t < NUM_THREADS; t++) {
+        jobs[t].outers = outers;
+        jobs[t].nouters = CROSS_OUTERS;
+        jobs[t].tid = t;
+        jobs[t].iters = CROSS_ITERS;
+        CHECK(pthread_create(&th[t], NULL, cross_worker, &jobs[t]) == 0,
+              "spawn cross-contract worker");
+    }
+    for (int t = 0; t < NUM_THREADS; t++) pthread_join(th[t], NULL);
+}
+
 /* ---- break racing in-flight fulfillments ---- */
 
 typedef struct RaceJob {
@@ -280,6 +387,8 @@ int main(void) {
     CHECK(ash_register_contract(rt, &k_calc) == ASH_OK, "register Calc");
     CHECK(ash_pledge_bind(rt, "Calc.scale", scale_fn) == ASH_OK,
           "bind Calc.scale");
+    CHECK(ash_register_contract(rt, &k_inner) == ASH_OK, "register Inner");
+    CHECK(ash_register_contract(rt, &k_outer) == ASH_OK, "register Outer");
 
     AshContract* instances[NUM_INSTANCES] = {0};
     for (int i = 0; i < NUM_INSTANCES; i++) {
@@ -288,15 +397,27 @@ int main(void) {
               "sign a fan-out instance");
         if (!instances[i]) return 1;
     }
+    AshContract* outers[CROSS_OUTERS] = {0};
+    for (int i = 0; i < CROSS_OUTERS; i++) {
+        CHECK(ash_contract_sign(rt, "Outer", NULL, 0, 0, &outers[i]) ==
+                  ASH_OK,
+              "sign an outer instance");
+        if (!outers[i]) return 1;
+    }
 
     test_fan_out(instances);
     test_same_instance(instances[0]);
     test_out_of_order_waits(instances[1]);
+    test_cross_contract(rt, outers);
     test_break_race(rt);
 
     for (int i = 0; i < NUM_INSTANCES; i++) {
         CHECK(ash_contract_break(instances[i]) == ASH_OK,
               "break a fan-out instance");
+    }
+    for (int i = 0; i < CROSS_OUTERS; i++) {
+        CHECK(ash_contract_break(outers[i]) == ASH_OK,
+              "break an outer instance");
     }
     ash_runtime_shutdown(rt);
 
