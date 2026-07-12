@@ -1,0 +1,172 @@
+// cgenhdr: the C header emitter behind ashc emit-header. Given a checked
+// file it renders one header a foreign C host compiles against: an include
+// guard from the root file's stem, one ASH_HASH_{Contract} define carrying
+// the shape hash, and one ASH_MANGLED_{Contract}_{pledge} define per pledge
+// carrying the exact mangled string the module registered, each under a
+// comment spelling the signature the way the surface language wrote it. The
+// hashes and mangled names come from the same collect, shape_string, and
+// mangle calls the module emitter makes, so a header and the module it
+// describes can never disagree, and the text is byte stable for a given
+// source, a golden test surface like the module C itself.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import hash
+@import mangle
+@import cgenstate
+@import cgen
+
+// The include guard spelled from the root file's stem: ASH_HEADER_ then the
+// stem uppercased, with anything outside the identifier set as underscore.
+func guard_of(stem: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "ASH_HEADER_")
+    mut i: int64 = 0
+    while i < str_len(stem) {
+        c: int64 = stem[i]
+        if c >= 97 && c <= 122 {
+            sb_push_char(b, c - 32)
+        } else if c >= 65 && c <= 90 {
+            sb_push_char(b, c)
+        } else if c >= 48 && c <= 57 {
+            sb_push_char(b, c)
+        } else {
+            sb_push_char(b, 95)
+        }
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The human readable signature of one pledge, the surface spelling:
+// (name: Type, ...) -> Ret.
+func pledge_sig_text(g: *Cg, info: PlInfo) -> string {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    pl: PledgeNode = vec_get((*a).pledges, info.pid)
+    ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+    b: *StringBuilder = alloc(sb_new())
+    sb_push_char(b, 40)
+    mut i: int64 = 0
+    while i < pl.params_len {
+        if i > 0 { sb_push(b, ", ") }
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, pl.params_off + i))
+        sb_push(b, ast_name(a, f.name))
+        sb_push(b, ": ")
+        if i < ps.params.len {
+            sb_push(b, ty_render((*g).ty, sig_param(s, ps.params, i)))
+        }
+        i = i + 1
+    }
+    sb_push(b, ") -> ")
+    sb_push(b, ty_render((*g).ty, ps.ret))
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// One contract's block: the comment naming it with its version and vow
+// table, the shape hash define, then a commented define per pledge.
+func emit_contract_header(g: *Cg, cid: int64) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    ge: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = ge.pkg
+
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
+
+    version: int64 = contract_version(g, c)
+    shape: string = shape_string(g, cid, vows, pls)
+    hex: string = hash_hex16(fnv1a64(shape))
+    free(shape)
+
+    head: string = tmsg5("/* contract ", cname, ", version ", int_to_string(version), "")
+    if vec_len(vows) == 0 {
+        cg_top(g, tmsg2(head, " */"))
+    } else {
+        cg_top(g, head)
+        mut i: int64 = 0
+        while i < vec_len(vows) {
+            v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
+            vs: VowSigT = sig_vow(s, cid, v.name)
+            mut suffix: string = " (no default)"
+            if v.init >= 0 { suffix = " (default)" }
+            cg_top(g, tmsg7(" * vow ", ast_name(a, v.name), ": ", ty_render((*g).ty, vs.ty), suffix, "", ""))
+            i = i + 1
+        }
+        cg_top(g, " */")
+    }
+    cg_top(g, tmsg7("#define ASH_HASH_", cname, " 0x", hex, "ULL", "", ""))
+    cg_top(g, "")
+    free(hex)
+
+    mut j: int64 = 0
+    while j < vec_len(pls) {
+        info: PlInfo = vec_get(pls, j)
+        pl: PledgeNode = vec_get((*a).pledges, info.pid)
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+        sig: string = sig_canon(s, ps.params, ps.ret)
+        m: string = mangle_pledge(cname, ast_name(a, pl.name), fnv1a64(sig), version)
+        free(sig)
+        sigtext: string = pledge_sig_text(g, info)
+        mut tail: string = " */"
+        if pl.body < 0 { tail = ", abstract */" }
+        cg_top(g, tmsg7("/* pledge ", ast_name(a, pl.name), sigtext, tail, "", "", ""))
+        cg_top(g, tmsg7("#define ASH_MANGLED_", cname, "_", ast_name(a, pl.name), " \"", m, "\""))
+        cg_top(g, "")
+        free(sigtext)
+        free(m)
+        j = j + 1
+    }
+}
+
+// Emits the whole header. The returned string is the file; the caller
+// discards it when errors arrived in the vector.
+export func cgen_header(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>, stem: string) -> string {
+    g: *Cg = cg_new(a, r, s, t, errors)
+    guard: string = guard_of(stem)
+    cg_top(g, tmsg3("/* ", stem, ".ash.h: generated by ashc emit-header, do not edit."))
+    cg_top(g, " * Every layout these names describe comes from ash/ash_abi.h; include")
+    cg_top(g, " * that header for the value and descriptor structs. */")
+    cg_top(g, tmsg2("#ifndef ", guard))
+    cg_top(g, tmsg2("#define ", guard))
+    cg_top(g, "")
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            // Internal contracts publish no descriptor, so a header names
+            // nothing about them, exactly like the module C.
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            if !c.internal {
+                emit_contract_header(g, d.id)
+            }
+        }
+        i = i + 1
+    }
+    cg_top(g, tmsg3("#endif /* ", guard, " */"))
+    free(guard)
+    out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
+    return out
+}

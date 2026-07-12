@@ -1,0 +1,1 @@
+Main.run must return Result<Int, E>

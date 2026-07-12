@@ -78,14 +78,26 @@ make smoke-asan
 
 `make smoke` builds four things in order: the runtime shared library `libashrt.so` from `runtime/`, the `ashc` binary from `compiler/` through the dusk toolchain, the compiled contract module `libhello.ash.so` from `skeleton/hello.ash`, and the C host from `skeleton/host.c`. Then it runs the host, which loads the module, signs `Greeter`, fulfills `greet("world")`, checks the result is `Ok("hello, world")`, exercises the error paths, and breaks the contract. Everything lands under `target/`.
 
-`ashc` itself has two commands today:
+`ashc` builds modules, standalone executables, and the C header a foreign host compiles against:
 
 ```sh
 target/dusk-out/ashc version
 target/dusk-out/ashc build skeleton/hello.ash
+target/dusk-out/ashc build --bin skeleton/main_demo.ash
+target/dusk-out/ashc emit-header skeleton/hello.ash
 ```
 
 `build` reads the source, emits the module C into `target/ashc-out/`, and links it with cc into a loadable `.ash.so`. Run it from the repository root, since it hands cc the relative include path.
+
+Ashford is a standalone language too. A program declares one `Main` contract with a `run(args: List<String>) -> Result<Int, E>` pledge, and `build --bin` links it into a real executable: `Ok(n)` becomes the exit code, `Err` prints itself to stderr and exits 1.
+
+```sh
+make test-bin
+./target/ashc-out/main_demo a b c; echo $?   # counts its args, exits 3
+./target/ashc-out/main_demo fail             # takes the Err path, exits 1
+```
+
+`emit-header` writes `target/ashc-out/hello.ash.h`, which spells the shape hash and every mangled pledge name as defines, so a C host resolves and signs against generated names instead of hardcoded strings. `make test-header` pins the header against its golden and compiles a host with it.
 
 The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 0.6.0 predates `std.os` and cannot build `ashc`; point `DUSK` at a newer build when the installed one lags.
 
@@ -102,7 +114,9 @@ make test-python
 
 ## Status
 
-The walking skeleton is green. `ashc`, written in dusk, compiles the skeleton contract to a shared module, the C runtime loads it, and a C host drives sign, fulfill, and break across the ABI with the sanitizers quiet. The emitted module is still canned: the compiler proves the pipeline, not the language. Next is the front end, the lexer and parser over the full contract grammar in [docs/grammar.md](docs/grammar.md), with golden and compile fail suites pinning every construct.
+The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. A golden and compile fail suite, sanitizer gates, a determinism gate, and a thread sanitizer gate hold the line on every build.
+
+Not there yet: map operations, calling one contract from another inside a pledge body, and the network runtime the interop story ultimately wants.
 
 ## Requirements
 

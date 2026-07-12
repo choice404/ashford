@@ -92,6 +92,15 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
 
 **Indexing out of bounds.** Compiled code bounds checks every list element read and write, reads through `ash_list_get` and writes through `ash_list_set`. An index outside the list, a negative one included through the unsigned cast, makes the pledge return `ASH_ERR_TYPE` from its thunk: the status reports the fulfillment never produced a value, no latch moves, and host memory is never touched. This rule is normative for every compiled module.
 
+**The debug renderer.** The runtime renders any supported value into its canonical debug spelling, the text a standalone executable prints for a `Main.run` error and a convenience for any host that wants a value it can log:
+
+```c
+AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
+                           size_t* need);
+```
+
+The spelling: `Int`, `UInt`, and `Float` as C would print them, `Bool` as `true` or `false`, `Byte` as its decimal value, `Char` as `U+0041`, `Unit` as `()`, strings quoted with `"` and `\` escaped and control bytes as `\xNN`, lists as `[a, b]`, tuples as `(a, b)`, records as `{a, b}` with the fields in declaration order, a sum as `#tag` with its payload in parens when it carries one, and `None`, `Some(v)`, `Ok(v)`, `Err(v)` through their boxes. Nesting deeper than eight levels renders as `...`, so a cyclic or absurd value cannot run the renderer away. Maps have no settled representation and render as `<map>`. The size protocol is `ash_iname_dump`'s: `*need` receives the full size including the terminating NUL, a `cap` at least that writes the text and returns `ASH_OK`, anything smaller writes nothing and returns `ASH_ERR_OOM`, so a NULL `buf` with `cap` 0 sizes the buffer.
+
 ## The thunk frame
 
 Every pledge crosses the boundary in one shape, compiled bodies and host bound implementations alike:
@@ -439,6 +448,34 @@ contract {name};vow {name}:{type};...pledge {name}:{sig};...
 Vows first, then pledges, each in declaration order, each type spelled in the checker's canonical form, the same spelling signature comparison uses. The string is deterministic by construction, no table iteration order touches it, so two builds of the same header agree byte for byte and any change to a vow type or a pledge signature moves the hash.
 
 A host that passes the expected hash to `ash_contract_sign` gets `ASH_ERR_VERSION` when the loaded module's shape disagrees, which is the whole defense against fulfilling yesterday's contract through today's module. Passing 0 skips the check.
+
+## The standalone entry
+
+`ashc build --bin` wraps a module whose program declares the grammar's entry point, exactly one `Main` contract carrying a concrete `run(args: List<String>) -> Result<Int, E>` pledge, `E` any declared error type. The compiler emits the module C as always, plus a small `main()` wrapper beside it, and links the pair against libashrt into an executable instead of a shared library. The module is inside the executable, so the wrapper calls `ash_module_register` directly and no dlopen happens.
+
+The wrapper's walk is fixed: `ash_runtime_init`, `ash_module_register`, `ash_runtime_freeze`, then `ash_contract_sign` on `"Main"`. Only then does it build the argument list, `argv[1..]` deep copied into a `List<String>` through the signed instance, because the allocation helpers need an instance to own the bytes. It fulfills `run` synchronously and maps the outcome onto the process:
+
+- `Ok(n)` exits with the low eight bits of `n`, the shell's own truncation made explicit.
+- `Err(e)` renders `e` through `ash_value_render` to stderr, one line naming the program, and exits 1.
+- A fulfillment status other than `ASH_OK`, and every setup failure before it, is a diagnostic on stderr naming the step and the status, and exit 1.
+
+The instance is broken and the runtime shut down on every path, so the sanitizers hold the wrapper to the same standard as any host. stdout belongs to the program alone; the wrapper never writes it.
+
+## The generated header
+
+`ashc emit-header file.ash` runs the whole front end and writes `target/ashc-out/<stem>.ash.h`, the C header a foreign host compiles against instead of hardcoding mangled strings. The header carries no layouts, those stay in `ash_abi.h`; it spells names and hashes alone, two defines per surface:
+
+```c
+/* contract Greeter, version 1
+ * vow prefix: String (default)
+ */
+#define ASH_HASH_Greeter 0x80464bf23398ab38ULL
+
+/* pledge greet(name: String) -> Result<String, GreetError> */
+#define ASH_MANGLED_Greeter_greet "__ash_ash_Greeter_greet_17cef80f14421b9b_v1"
+```
+
+One `ASH_HASH_{Contract}` per public contract, the shape hash `ash_contract_sign` checks, and one `ASH_MANGLED_{Contract}_{pledge}` per pledge, the exact string the iname table keys, each under a comment spelling the signature the way the source wrote it, an abstract pledge marked so the host knows to bind before signing. Internal contracts publish no descriptor and appear in no header. The hashes and mangled names come from the same canonical spellings the module emitter hashes, so a header and its module cannot disagree, and the text is byte stable for a given source, which is what lets `tests/golden/hello.ash.h` pin it.
 
 ## Status codes
 

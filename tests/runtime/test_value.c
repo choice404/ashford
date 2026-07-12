@@ -263,6 +263,101 @@ static void test_sum_copy(AshContract* arena, AshContract* dst_arena) {
     CHECK(ash_value_eq(&bare, &copy), "same variant reads equal");
 }
 
+/* Renders v and compares against the expected debug spelling, checking the
+ * size protocol on the way: the sizing call reports the exact need, a cap
+ * one short is refused with nothing written, and the full cap round trips. */
+static void check_render(const AshValue* v, const char* want, const char* what) {
+    size_t need = 0;
+    CHECK(ash_value_render(v, NULL, 0, &need) == ASH_ERR_OOM,
+          "sizing call reports ASH_ERR_OOM");
+    CHECK(need == strlen(want) + 1, what);
+    char buf[256];
+    if (need > sizeof buf) {
+        CHECK(0, "render exceeds the test buffer");
+        return;
+    }
+    buf[0] = 'Z';
+    CHECK(ash_value_render(v, buf, need - 1, &need) == ASH_ERR_OOM,
+          "a short cap is refused");
+    CHECK(buf[0] == 'Z', "a short cap writes nothing");
+    CHECK(ash_value_render(v, buf, sizeof buf, &need) == ASH_OK,
+          "render with room succeeds");
+    CHECK(strcmp(buf, want) == 0, what);
+}
+
+static void test_render(AshContract* arena) {
+    AshValue v = int_val(-42);
+    check_render(&v, "-42", "render Int");
+
+    memset(&v, 0, sizeof(v));
+    v.ty = ASH_TY_BOOL;
+    v.as.b = 1;
+    check_render(&v, "true", "render Bool");
+
+    v = str_val("say \"hi\"\n");
+    check_render(&v, "\"say \\\"hi\\\"\\x0a\"", "render String escapes");
+
+    /* Err(Some("deep")): the boxed shapes recurse. */
+    AshValue some;
+    memset(&some, 0, sizeof(some));
+    some.ty = ASH_TY_OPTION;
+    some.tag = 1;
+    some.as.box = ash_box(arena);
+    *(AshValue*)some.as.box = ash_string_copy(arena, (const uint8_t*)"deep", 4);
+    AshValue err;
+    memset(&err, 0, sizeof(err));
+    err.ty = ASH_TY_RESULT;
+    err.tag = 1;
+    err.as.box = ash_box(arena);
+    *(AshValue*)err.as.box = some;
+    check_render(&err, "Err(Some(\"deep\"))", "render Err(Some(String))");
+
+    /* A payload variant and a list of a tuple, the deep composite arms. */
+    AshValue* payload = (AshValue*)ash_bytes(arena, sizeof(AshValue));
+    payload[0] = str_val("overflow");
+    AshValue sum;
+    memset(&sum, 0, sizeof(sum));
+    sum.ty = ASH_TY_SUM;
+    sum.tag = 1;
+    sum.as.list.data = payload;
+    sum.as.list.len = 1;
+    sum.as.list.cap = 1;
+    check_render(&sum, "#1(\"overflow\")", "render a payload variant");
+
+    AshValue tup;
+    CHECK(ash_tuple_new(arena, 2, &tup) == ASH_OK, "render tuple_new");
+    ((AshValue*)tup.as.list.data)[0] = str_val("alpha");
+    ((AshValue*)tup.as.list.data)[1] = int_val(10);
+    AshValue list;
+    CHECK(ash_list_new(arena, ASH_TY_TUPLE, 1, &list) == ASH_OK,
+          "render list_new");
+    CHECK(ash_list_push(arena, &list, &tup) == ASH_OK, "render list_push");
+    check_render(&list, "[(\"alpha\", 10)]", "render a list of tuples");
+
+    /* Past the depth limit the render prints ... instead of recursing. */
+    AshValue deep;
+    memset(&deep, 0, sizeof(deep));
+    deep.ty = ASH_TY_OPTION;
+    deep.tag = 1;
+    deep.as.box = NULL;
+    for (int i = 0; i < 12; i++) {
+        AshValue* box = ash_box(arena);
+        *box = deep;
+        memset(&deep, 0, sizeof(deep));
+        deep.ty = ASH_TY_OPTION;
+        deep.tag = 1;
+        deep.as.box = box;
+    }
+    char buf[256];
+    size_t need = 0;
+    CHECK(ash_value_render(&deep, buf, sizeof buf, &need) == ASH_OK,
+          "render a deep nest");
+    CHECK(strstr(buf, "...") != NULL, "the depth limit cuts the recursion");
+
+    CHECK(ash_value_render(NULL, buf, sizeof buf, &need) == ASH_ERR_TYPE,
+          "render of NULL is refused");
+}
+
 static void test_copy_in_isolation(AshContract* cap) {
     /* The host's mutable bytes. The fulfill deep copies them onto the
      * instance; scribbling over them afterwards must not reach the thunk's
@@ -312,6 +407,7 @@ int main(void) {
         test_option_result_nesting(src, dst);
         test_record_copy(src, dst);
         test_sum_copy(src, dst);
+        test_render(src);
         test_copy_in_isolation(cap);
     }
 

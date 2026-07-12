@@ -24,10 +24,11 @@ MODULE_PAY := $(OUT)/libpayment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
+BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-python test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-python test-determinism tsan
+all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -56,6 +57,9 @@ $(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
 
 $(MODULE_STD): $(ASHC) skeleton/std_user.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/std_user.ash
+
+$(BIN_DEMO): $(ASHC) skeleton/main_demo.ash $(RT_SO) runtime/include/ash/ash_abi.h
+	$(ASHC) build --bin skeleton/main_demo.ash
 
 host: $(HOST)
 
@@ -140,10 +144,34 @@ test-python: $(RT_SO) $(MODULE) $(MODULE_PAY)
 	    echo "[test-python] python3 not found, skipping"; \
 	fi
 
+# The standalone gate: build --bin turns main_demo into an executable, and
+# both exits the grammar promises are asserted from the shell. Three args on
+# the Ok path exit 3, the word fail takes the Err path, which must exit 1
+# and carry the rendered payload on stderr while stdout stays silent.
+test-bin: $(BIN_DEMO)
+	./$(BIN_DEMO) a b c; test $$? -eq 3
+	./$(BIN_DEMO); test $$? -eq 0
+	./$(BIN_DEMO) x fail y >$(OUT)/main_demo.out 2>$(OUT)/main_demo.err; \
+	    code=$$?; test $$code -eq 1 \
+	    && grep -q 'asked to fail' $(OUT)/main_demo.err \
+	    && test ! -s $(OUT)/main_demo.out
+	@echo "[test-bin] ok"
+
+# The header gate: emit-header must reproduce the pinned golden byte for
+# byte, and the C smoke host compiles against nothing but that header and
+# ash.h, resolves the mangled name it spells, and signs under its hash.
+test-header: $(ASHC) $(MODULE) $(RT_SO)
+	$(ASHC) emit-header skeleton/hello.ash
+	diff tests/golden/hello.ash.h $(OUT)/hello.ash.h
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic \
+	    -I runtime/include -I $(OUT) \
+	    tests/runtime/test_header.c runtime/src/runtime.c -ldl -o $(OUT)/test_header
+	./$(OUT)/test_header
+
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
 # in the iname story reproducible.
-test-determinism: $(ASHC)
+test-determinism: $(ASHC) $(RT_SO)
 	@mkdir -p $(OUT)
 	$(ASHC) build skeleton/hello.ash
 	mv $(OUT)/hello.c $(OUT)/hello.c.first
@@ -165,7 +193,18 @@ test-determinism: $(ASHC)
 	mv $(OUT)/std_user.c $(OUT)/std_user.c.first
 	$(ASHC) build skeleton/std_user.ash
 	diff $(OUT)/std_user.c.first $(OUT)/std_user.c
+	$(ASHC) build --bin skeleton/main_demo.ash
+	mv $(OUT)/main_demo.c $(OUT)/main_demo.c.first
+	mv $(OUT)/main_demo.main.c $(OUT)/main_demo.main.c.first
+	$(ASHC) build --bin skeleton/main_demo.ash
+	diff $(OUT)/main_demo.c.first $(OUT)/main_demo.c
+	diff $(OUT)/main_demo.main.c.first $(OUT)/main_demo.main.c
+	$(ASHC) emit-header skeleton/hello.ash
+	mv $(OUT)/hello.ash.h $(OUT)/hello.ash.h.first
+	$(ASHC) emit-header skeleton/hello.ash
+	diff $(OUT)/hello.ash.h.first $(OUT)/hello.ash.h
 	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first $(OUT)/lang.c.first $(OUT)/std_user.c.first
+	rm -f $(OUT)/main_demo.c.first $(OUT)/main_demo.main.c.first $(OUT)/hello.ash.h.first
 	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the

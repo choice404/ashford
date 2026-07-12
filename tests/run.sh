@@ -131,11 +131,48 @@ run_multi_suite() {
     done
 }
 
+# The standalone reject suite. Every NAME.ash here breaks the entry point
+# rule some way, so `ashc build --bin` must refuse it with every line of the
+# .err beside it on stderr; nothing in this directory is expected to build.
+run_bin_suite() {
+    local src name base code err missing want
+    for src in tests/bin/*.ash; do
+        name="${src%.ash}"
+        base="bin/$(basename "$name")"
+
+        if [ ! -f "$name.err" ]; then
+            fail_case "$base" "no .err beside it"
+            continue
+        fi
+        err="$("$ASHC" build --bin "$src" 2>&1 >/dev/null)"
+        code=$?
+        if [ "$code" -eq 0 ]; then
+            fail_case "$base" "expected rejection, got exit 0"
+            continue
+        fi
+        missing=""
+        while IFS= read -r want; do
+            [ -z "$want" ] && continue
+            if ! printf '%s' "$err" | grep -qF -- "$want"; then
+                missing="$want"
+                break
+            fi
+        done < "$name.err"
+        if [ -n "$missing" ]; then
+            fail_case "$base" "stderr missing: $missing"
+            printf '%s\n' "$err" | head -10
+            continue
+        fi
+        pass=$((pass + 1))
+    done
+}
+
 run_suite lex lex
 run_suite parse parse
 run_suite check check
 run_suite typeck check
 run_multi_suite check/mfa
+run_bin_suite
 
 echo "[tests] $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

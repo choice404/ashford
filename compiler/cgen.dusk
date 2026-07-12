@@ -37,16 +37,18 @@
 
 // One pledge of a contract, flattened: loose pledges and subcontract pledges
 // alike, in declaration order, with the sig table key they were filed under
-// and the ordinal of the owning subcontract, -1 for a loose pledge.
-struct PlInfo { pid: int64, key: string, sub: int64 }
+// and the ordinal of the owning subcontract, -1 for a loose pledge. Exported
+// with collect, shape_string, and contract_version so the header emitter
+// reads the same tables the module emitter does and the two can never skew.
+export struct PlInfo { pid: int64, key: string, sub: int64 }
 
-struct VowInfo { vid: int64 }
+export struct VowInfo { vid: int64 }
 
 // Collects the contract's vows, pledges, and subcontracts in declaration
 // order. sub_ids holds the arena id of every subcontract, named or not, and
 // sub_names its name id or -1, so a pledge's sub field and a requirements
 // atom index against one table.
-func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>, sub_ids: *Vector<int64>, sub_names: *Vector<int64>) -> void {
+export func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>, sub_ids: *Vector<int64>, sub_names: *Vector<int64>) -> void {
     a: *Ast = (*g).ast
     c: ContractNode = vec_get((*a).contracts, cid)
     mut i: int64 = 0
@@ -80,7 +82,7 @@ func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>, s
 }
 
 // The contract's version attribute, defaulting to 1.
-func contract_version(g: *Cg, c: ContractNode) -> int64 {
+export func contract_version(g: *Cg, c: ContractNode) -> int64 {
     a: *Ast = (*g).ast
     mut i: int64 = 0
     while i < c.attrs_len {
@@ -100,7 +102,7 @@ func contract_version(g: *Cg, c: ContractNode) -> int64 {
 // The canonical signature string the shape hash eats: the contract name,
 // then each vow and pledge in declaration order under the checker's own
 // canonical type spellings.
-func shape_string(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -> string {
+export func shape_string(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -> string {
     a: *Ast = (*g).ast
     s: *Sigs = (*g).sigs
     c: ContractNode = vec_get((*a).contracts, cid)

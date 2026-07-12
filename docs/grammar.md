@@ -322,11 +322,11 @@ A standalone program declares exactly one `Main`:
 
 ```text
 contract Main {
-    pledge run(args: List<String>) -> Result<Int, Error>
+    pledge run(args: List<String>) -> Result<Int, E>
 }
 ```
 
-The emitted executable signs `Main`, fulfills `run`, maps `Ok(n)` to exit code n, and maps `Err` to a rendered diagnostic and a nonzero exit.
+`run` takes exactly one `List<String>` parameter, returns `Result<Int, E>` for any error type `E` the program declares, and must carry a body. The emitted executable signs `Main`, fulfills `run`, maps `Ok(n)` to exit code n truncated to its low eight bits, and maps `Err` to a rendered diagnostic on stderr and exit code 1.
 
 ## What the grammar deliberately leaves out
 

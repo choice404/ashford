@@ -50,6 +50,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1679,4 +1680,136 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
     default:
         return ASH_ERR_TYPE;
     }
+}
+
+/* ---- the debug renderer ---- */
+
+/* A counting sink: pos advances for every byte the render wants, and bytes
+ * land in buf only while they fit. The render runs once with a NULL buf to
+ * size the text and once more to write it, so a too-small cap writes
+ * nothing, the same promise ash_iname_dump makes. */
+typedef struct RenderSink {
+    char*  buf;
+    size_t cap;
+    size_t pos;
+} RenderSink;
+
+static void sink_put(RenderSink* s, const char* bytes, size_t n) {
+    if (s->buf && s->pos < s->cap) {
+        size_t room = s->cap - s->pos;
+        memcpy(s->buf + s->pos, bytes, n < room ? n : room);
+    }
+    s->pos += n;
+}
+
+static void sink_str(RenderSink* s, const char* z) {
+    sink_put(s, z, strlen(z));
+}
+
+static void sink_fmt(RenderSink* s, const char* fmt, ...) {
+    char tmp[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n > 0) sink_put(s, tmp, (size_t)n);
+}
+
+/* String bytes in the debug spelling: quote and backslash escaped, control
+ * bytes as \xNN, everything else raw, UTF-8 passing through untouched. */
+static void render_string(RenderSink* s, const AshString* str) {
+    sink_put(s, "\"", 1);
+    for (uint64_t i = 0; i < str->len; i++) {
+        uint8_t b = str->ptr[i];
+        if (b == '"') {
+            sink_put(s, "\\\"", 2);
+        } else if (b == '\\') {
+            sink_put(s, "\\\\", 2);
+        } else if (b < 0x20 || b == 0x7f) {
+            sink_fmt(s, "\\x%02x", (unsigned)b);
+        } else {
+            sink_put(s, (const char*)&str->ptr[i], 1);
+        }
+    }
+    sink_put(s, "\"", 1);
+}
+
+#define ASH_RENDER_DEPTH 8
+
+static void render_value(RenderSink* s, const AshValue* v, unsigned depth);
+
+static void render_elems(RenderSink* s, const AshValue* v, unsigned depth,
+                         const char* open, const char* close) {
+    sink_str(s, open);
+    const AshValue* xs = (const AshValue*)v->as.list.data;
+    for (uint64_t i = 0; i < v->as.list.len; i++) {
+        if (i) sink_str(s, ", ");
+        render_value(s, &xs[i], depth + 1);
+    }
+    sink_str(s, close);
+}
+
+static void render_box(RenderSink* s, const AshValue* v, unsigned depth,
+                       const char* name) {
+    sink_str(s, name);
+    sink_put(s, "(", 1);
+    if (v->as.box) {
+        render_value(s, (const AshValue*)v->as.box, depth + 1);
+    } else {
+        sink_put(s, "?", 1);
+    }
+    sink_put(s, ")", 1);
+}
+
+static void render_value(RenderSink* s, const AshValue* v, unsigned depth) {
+    if (depth > ASH_RENDER_DEPTH) {
+        sink_str(s, "...");
+        return;
+    }
+    switch ((AshTypeTag)v->ty) {
+    case ASH_TY_UNIT:   sink_str(s, "()"); return;
+    case ASH_TY_INT:    sink_fmt(s, "%lld", (long long)v->as.i); return;
+    case ASH_TY_UINT:   sink_fmt(s, "%llu", (unsigned long long)v->as.u); return;
+    case ASH_TY_FLOAT:  sink_fmt(s, "%g", v->as.f); return;
+    case ASH_TY_BOOL:   sink_str(s, v->as.b ? "true" : "false"); return;
+    case ASH_TY_BYTE:   sink_fmt(s, "%u", (unsigned)v->as.b); return;
+    case ASH_TY_CHAR:   sink_fmt(s, "U+%04X", (unsigned)v->as.ch); return;
+    case ASH_TY_STRING: render_string(s, &v->as.s); return;
+    case ASH_TY_LIST:   render_elems(s, v, depth, "[", "]"); return;
+    case ASH_TY_TUPLE:  render_elems(s, v, depth, "(", ")"); return;
+    case ASH_TY_RECORD: render_elems(s, v, depth, "{", "}"); return;
+    case ASH_TY_SUM:
+        sink_fmt(s, "#%u", (unsigned)v->tag);
+        if (v->as.list.len) render_elems(s, v, depth, "(", ")");
+        return;
+    case ASH_TY_OPTION:
+        if (v->tag == 0) { sink_str(s, "None"); return; }
+        render_box(s, v, depth, "Some");
+        return;
+    case ASH_TY_RESULT:
+        render_box(s, v, depth, v->tag == 0 ? "Ok" : "Err");
+        return;
+    case ASH_TY_MAP:        sink_str(s, "<map>"); return;
+    case ASH_TY_PLEDGE_REF: sink_str(s, "<pledge>"); return;
+    default:                sink_str(s, "<?>"); return;
+    }
+}
+
+/* Renders a value in its canonical debug spelling, the text the emitted
+ * standalone wrapper prints for a Main.run Err. The size protocol is
+ * ash_iname_dump's: *need receives the full size including the NUL, a cap at
+ * least that writes the text, anything smaller writes nothing and reports
+ * ASH_ERR_OOM, so a NULL buf with cap 0 sizes the buffer. */
+AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
+                           size_t* need) {
+    if (!v || !need) return ASH_ERR_TYPE;
+    if (!buf) cap = 0;
+    RenderSink size_pass = { NULL, 0, 0 };
+    render_value(&size_pass, v, 0);
+    *need = size_pass.pos + 1;
+    if (cap < *need) return ASH_ERR_OOM;
+    RenderSink write_pass = { buf, cap, 0 };
+    render_value(&write_pass, v, 0);
+    buf[write_pass.pos] = '\0';
+    return ASH_OK;
 }

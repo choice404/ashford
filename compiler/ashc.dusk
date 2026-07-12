@@ -7,7 +7,11 @@
 // file, its imports load and merge into one module, and the whole front end
 // runs over the merged tree. build then hands the checked tree to the code
 // generator: the module C lands in target/ashc-out and cc links it into a
-// shared library beside it, both named after the root file.
+// shared library beside it, both named after the root file. build --bin
+// checks the entry point rule, emits a main() wrapper beside the module C,
+// and links the pair against libashrt into an executable instead.
+// emit-header runs the front end and writes the C header spelling the
+// module's shape hashes and mangled names for a foreign host.
 //
 // Progress and error messages go to stderr, so stdout carries dump output
 // alone and a tool can diff it byte for byte. build expects to run from the
@@ -36,6 +40,8 @@
 @import tcrun
 @import reqsolve
 @import cgen
+@import cgenhdr
+@import cgenbin
 
 func version_string() -> string {
     return "ashc 0.0.1 (M0 spike)"
@@ -49,6 +55,8 @@ func usage() -> void {
     printerr("  parse <file>  dump the AST of a source file")
     printerr("  check <file>  load the program rooted at file and check it")
     printerr("  build <file>  emit the module C and link it into a shared library")
+    printerr("  build --bin <file>  link a standalone executable around the Main contract")
+    printerr("  emit-header <file>  write the C header naming the module's hashes and symbols")
 }
 
 // Runs the lexer on the file at path, printing one line per token to stdout
@@ -244,12 +252,40 @@ func link_module(cpath: string, sopath: string) -> int64 {
     return code
 }
 
+// Links the emitted wrapper and module C into a standalone executable. The
+// program needs libashrt beside it in target/ashc-out, which is where the
+// Makefile builds it, and the rpath keeps the pair relocatable together.
+// Returns the cc exit code, zero on success.
+func link_bin(wpath: string, cpath: string, binpath: string) -> int64 {
+    cmd: *StringBuilder = alloc(sb_new())
+    sb_push(cmd, "cc")
+    push_arg(cmd, wpath)
+    push_arg(cmd, cpath)
+    sb_push(cmd, " -I runtime/include -L target/ashc-out -lashrt")
+    push_arg(cmd, "-Wl,-rpath,$ORIGIN")
+    sb_push(cmd, " -o")
+    push_arg(cmd, binpath)
+    linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))
+    sb_free(cmd)
+    free(cmd)
+    printerr("[ashc] linking the executable with cc")
+    code: int64 = run(linkline)
+    free(linkline)
+    if code != 0 {
+        printerr("ashc: cc failed to link the executable")
+    }
+    return code
+}
+
 // Builds one program from its root .ash file: the whole front end first,
 // exactly the check path over the loaded and merged module, then the code
 // generator over the checked tree. Codegen faults are build errors like any
 // other; only a clean run writes the module C and links the shared library
-// beside it, both named after the root file.
-func cmd_build(path: string) -> int32 {
+// beside it, both named after the root file. With bin set the entry point
+// rule runs after the checks, a main() wrapper is written beside the module
+// C, and the pair links into an executable named after the root file
+// instead of a shared library.
+func cmd_build(path: string, bin: bool) -> int32 {
     prog: *Program = load_program(path)
     ld_print_errors(prog)
     if !(*prog).ok { return 1 }
@@ -266,6 +302,13 @@ func cmd_build(path: string) -> int32 {
     t: *TyArena = ty_arena_new()
     scratch: *Vector<Located> = alloc(vec_new())
     sigs: *Sigs = build_sigs(tree, res, t, scratch)
+
+    if bin {
+        merrs: *Vector<Located> = alloc(vec_new())
+        check_main(tree, res, sigs, t, merrs)
+        if emit_pass_errors(prog, merrs) > 0 { return 1 }
+    }
+
     gerrs: *Vector<Located> = alloc(vec_new())
     ccode: string = cgen_module(tree, res, sigs, t, gerrs)
     if emit_pass_errors(prog, gerrs) > 0 {
@@ -286,11 +329,14 @@ func cmd_build(path: string) -> int32 {
     soname0: string = join2("lib", stem)
     soname: string = join2(soname0, ".ash.so")
     sopath: string = join2(base, soname)
+    wname: string = join2(stem, ".main.c")
+    wpath: string = join2(base, wname)
+    binpath: string = join2(base, stem)
     free(cname)
     free(soname0)
     free(soname)
+    free(wname)
     free(base)
-    free(stem)
 
     werr := write_file(cpath0, ccode)
     free(ccode)
@@ -298,15 +344,96 @@ func cmd_build(path: string) -> int32 {
         printerr("ashc: could not write the module C")
         free(cpath0)
         free(sopath)
+        free(wpath)
+        free(binpath)
+        free(stem)
         return 1
     }
     printerr("[ashc] emitted module C")
 
+    if bin {
+        wcode: string = cgen_main_wrapper(stem)
+        werr2 := write_file(wpath, wcode)
+        free(wcode)
+        free(stem)
+        if werr2.exists() {
+            printerr("ashc: could not write the entry wrapper C")
+            free(cpath0)
+            free(sopath)
+            free(wpath)
+            free(binpath)
+            return 1
+        }
+        printerr("[ashc] emitted the entry wrapper C")
+        bcode: int64 = link_bin(wpath, cpath0, binpath)
+        free(cpath0)
+        free(sopath)
+        free(wpath)
+        free(binpath)
+        if bcode != 0 { return 1 }
+        printerr("[ashc] wrote the executable")
+        return 0
+    }
+    free(stem)
+
     code: int64 = link_module(cpath0, sopath)
     free(cpath0)
     free(sopath)
+    free(wpath)
+    free(binpath)
     if code != 0 { return 1 }
     printerr("[ashc] wrote the module library")
+    return 0
+}
+
+// Emits the C header for the program rooted at path: the front end runs
+// exactly as check does, then the header emitter renders the shape hashes
+// and mangled names into target/ashc-out/<stem>.ash.h.
+func cmd_emit_header(path: string) -> int32 {
+    prog: *Program = load_program(path)
+    ld_print_errors(prog)
+    if !(*prog).ok { return 1 }
+    tree: *Ast = (*prog).ast
+    res: *Resolved = resolve_file(tree, (*prog).decl_pkg)
+    if emit_pass_errors(prog, rs_errors(res)) > 0 { return 1 }
+    terrs: *Vector<Located> = typeck_file(tree, res)
+    reqsolve_file(tree, res, terrs)
+    if emit_pass_errors(prog, terrs) > 0 { return 1 }
+
+    t: *TyArena = ty_arena_new()
+    scratch: *Vector<Located> = alloc(vec_new())
+    sigs: *Sigs = build_sigs(tree, res, t, scratch)
+    gerrs: *Vector<Located> = alloc(vec_new())
+    stem: string = stem_of(path)
+    htext: string = cgen_header(tree, res, sigs, t, gerrs, stem)
+    if emit_pass_errors(prog, gerrs) > 0 {
+        free(htext)
+        free(stem)
+        return 1
+    }
+
+    out: string = out_dir()
+    if !make_out_dir(out) {
+        free(htext)
+        free(stem)
+        return 1
+    }
+    base: string = join2(out, "/")
+    hname: string = join2(stem, ".ash.h")
+    hpath: string = join2(base, hname)
+    free(hname)
+    free(base)
+    free(stem)
+
+    werr := write_file(hpath, htext)
+    free(htext)
+    if werr.exists() {
+        printerr("ashc: could not write the header")
+        free(hpath)
+        return 1
+    }
+    free(hpath)
+    printerr("[ashc] wrote the header")
     return 0
 }
 
@@ -351,7 +478,23 @@ func main(argc: int32, argv: string[]) -> int32 {
             usage()
             return 1
         }
-        return cmd_build(argv[2])
+        if str_eq(argv[2], "--bin") {
+            if argv.len < 4 {
+                printerr("ashc: build --bin needs a file argument")
+                usage()
+                return 1
+            }
+            return cmd_build(argv[3], true)
+        }
+        return cmd_build(argv[2], false)
+    }
+    if str_eq(cmd, "emit-header") {
+        if argv.len < 3 {
+            printerr("ashc: emit-header needs a file argument")
+            usage()
+            return 1
+        }
+        return cmd_emit_header(argv[2])
     }
     printerr("ashc: unknown command")
     usage()

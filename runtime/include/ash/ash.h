@@ -304,6 +304,18 @@ AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out);
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
                               AshValue* dst);
 
+/* Renders a value in its canonical debug spelling, the text a standalone
+ * executable prints for a Main.run Err: scalars as literals, strings quoted
+ * with control bytes escaped, [..] lists, (..) tuples, {..} records, #tag
+ * sums with their payload in parens, Some/None and Ok/Err through their
+ * boxes, recursion cut with "..." past a fixed depth. The size protocol is
+ * ash_iname_dump's: *need receives the full size including the terminating
+ * NUL; when cap is at least that, the text and its NUL are written to buf
+ * and the call returns ASH_OK, otherwise nothing is written and the call
+ * returns ASH_ERR_OOM, so a NULL buf with cap 0 sizes the buffer. */
+AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
+                           size_t* need);
+
 #ifdef __cplusplus
 }
 #endif
