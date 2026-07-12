@@ -26,15 +26,15 @@ MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan
 
 runtime: $(RT_SO)
 
-$(RT_SO): runtime/src/runtime.c runtime/include/ash/ash.h runtime/include/ash/ash_abi.h
+$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -pthread -I runtime/include runtime/src/runtime.c -ldl -o $(RT_SO)
+	$(CC) $(CFLAGS) -shared -pthread -I runtime/include runtime/src/runtime.c runtime/src/wire.c -ldl -o $(RT_SO)
 
 compiler: $(ASHC)
 
@@ -81,6 +81,17 @@ test-runtime:
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
 	    tests/runtime/test_value.c runtime/src/runtime.c -ldl -o $(OUT)/test_value
 	./$(OUT)/test_value
+
+# The wire codec gate under ASan: the canonical value encoding against its
+# checked-in byte goldens in tests/wire, the encode(decode(b)) == b canonicity
+# claim, and a negative corpus of truncations, forbidden tags, lying lengths,
+# and a depth bomb, every refusal watched for leaks. Regenerate the goldens
+# with ./$(OUT)/test_wire --emit tests/wire after a deliberate format change.
+test-wire:
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
+	    tests/runtime/test_wire.c runtime/src/wire.c runtime/src/runtime.c -ldl -o $(OUT)/test_wire
+	./$(OUT)/test_wire tests/wire
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.

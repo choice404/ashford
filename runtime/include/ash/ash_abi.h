@@ -109,7 +109,8 @@ typedef enum AshStatus {
     ASH_ERR_NAME,      /* no contract or pledge under that name */
     ASH_ERR_DEADLOCK,
     ASH_ERR_OOM,
-    ASH_ERR_LOAD       /* dlopen or registrar failure on a module */
+    ASH_ERR_LOAD,      /* dlopen or registrar failure on a module */
+    ASH_ERR_NET        /* the connection carrying this operation failed */
 } AshStatus;
 
 typedef enum AshContractState {
