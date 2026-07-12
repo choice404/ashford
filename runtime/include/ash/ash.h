@@ -29,9 +29,13 @@ typedef struct AshFuture   AshFuture;
 /* ---- runtime lifecycle ---- */
 
 /* Pool sizing. max_threads of 0 selects the default of 4 workers; a value
- * beyond 256 is refused with ASH_ERR_TYPE rather than obeyed blindly. */
+ * beyond 256 is refused with ASH_ERR_TYPE rather than obeyed blindly.
+ * handshake_ms is the timeout ash_runtime_connect gives a daemon to finish a
+ * handshake, 0 selecting the default of ten seconds; a peer that will not
+ * complete a HELLO in that window is not a peer and the connect fails. */
 typedef struct AshRuntimeConfig {
     uint32_t max_threads;
+    uint32_t handshake_ms;
 } AshRuntimeConfig;
 
 /* Brings up the runtime and its worker pool. NULL cfg means all defaults. */
@@ -44,6 +48,27 @@ void      ash_runtime_shutdown(AshRuntime* rt);
 /* dlopens a compiled module and calls its ash_module_register. The module
  * stays mapped until shutdown. ASH_ERR_STATE once the runtime is frozen. */
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
+
+/* Connects to an ashd daemon at addr, a host:port string, performs the
+ * handshake, and merges the daemon's whole iname table into this runtime's
+ * table with an origin mark naming the connection. token is the shared secret
+ * the daemon expects, NULL when the daemon runs without one. After a
+ * successful connect the remote entries appear in lookup, enumeration, and the
+ * canonical dump beside the local ones.
+ *
+ * Connect counts as registration and obeys the freeze law: ASH_ERR_STATE once
+ * the runtime is frozen, exactly like ash_module_load. A remote name that
+ * collides with a name already in the table, local or from another
+ * connection, fails with ASH_ERR_NAME and merges nothing. A version the
+ * daemon does not speak is ASH_ERR_VERSION; a refused token, an unreachable
+ * address, or a connection that dies during the handshake is ASH_ERR_NET. The
+ * handshake timeout is AshRuntimeConfig.handshake_ms, ten seconds by default.
+ *
+ * v1 fills the table only: signing and fulfilling a remote contract arrive in
+ * a later layer, and until then a remote-only contract name has no local
+ * descriptor to sign against. */
+AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
+                              const char* token);
 
 /* Called by a module's registrar. The runtime keeps the descriptor pointer,
  * it does not copy the tables. Registering also fills the iname table: one

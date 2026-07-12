@@ -16,8 +16,15 @@ CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -fPIC
 OUT     := target/ashc-out
 
+# The runtime translation units a standalone gate compiles into its own binary,
+# the shared library split into sources: the runtime, its wire codec, and the
+# socket helpers the codec and the client path lean on. Kept as one list so a
+# gate that links the runtime in gets net.c and wire.c with it.
+RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c
+
 RT_SO      := $(OUT)/libashrt.so
 ASHC       := target/dusk-out/ashc
+ASHD       := $(OUT)/ashd
 MODULE     := $(OUT)/libhello.ash.so
 MODULE_V2  := $(OUT)/libhello_v2.ash.so
 MODULE_PAY := $(OUT)/libpayment.ash.so
@@ -26,15 +33,15 @@ MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan tsan clean
 
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net tsan
 
 runtime: $(RT_SO)
 
-$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h
+$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/ash_net.h runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -pthread -I runtime/include runtime/src/runtime.c runtime/src/wire.c -ldl -o $(RT_SO)
+	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c -ldl -o $(RT_SO)
 
 compiler: $(ASHC)
 
@@ -67,6 +74,16 @@ $(HOST): skeleton/host.c $(RT_SO)
 	$(CC) $(CFLAGS) -pthread -I runtime/include skeleton/host.c -L $(OUT) -lashrt \
 	    -Wl,-rpath,'$$ORIGIN' -o $(HOST)
 
+daemon: $(ASHD)
+
+# The network daemon: a small main over the runtime that loads modules,
+# freezes, and serves the frozen iname table over TCP. It links libashrt like
+# any foreign host and reaches the internal socket helpers through ash_net.h.
+$(ASHD): runtime/src/ashd.c runtime/src/ash_net.h $(RT_SO)
+	$(CC) $(CFLAGS) -pthread -I runtime/include -I runtime/src \
+	    runtime/src/ashd.c -L $(OUT) -lashrt \
+	    -Wl,-rpath,'$$ORIGIN' -o $(ASHD)
+
 smoke: $(RT_SO) $(MODULE) $(HOST)
 	./$(HOST)
 
@@ -79,7 +96,7 @@ smoke: $(RT_SO) $(MODULE) $(HOST)
 test-runtime:
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_value.c runtime/src/runtime.c -ldl -o $(OUT)/test_value
+	    tests/runtime/test_value.c $(RT_UNITS) -ldl -o $(OUT)/test_value
 	./$(OUT)/test_value
 
 # The wire codec gate under ASan: the canonical value encoding against its
@@ -90,7 +107,7 @@ test-runtime:
 test-wire:
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_wire.c runtime/src/wire.c runtime/src/runtime.c -ldl -o $(OUT)/test_wire
+	    tests/runtime/test_wire.c $(RT_UNITS) -ldl -o $(OUT)/test_wire
 	./$(OUT)/test_wire tests/wire
 
 # The threading gate under ASan: the pool, the per-instance serialization,
@@ -98,7 +115,7 @@ test-wire:
 test-thread:
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_thread.c runtime/src/runtime.c -ldl -o $(OUT)/test_thread
+	    tests/runtime/test_thread.c $(RT_UNITS) -ldl -o $(OUT)/test_thread
 	./$(OUT)/test_thread
 
 # The iname gate under ASan: two compiled generations loaded side by side,
@@ -107,7 +124,7 @@ test-thread:
 test-iname: $(MODULE) $(MODULE_V2)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_iname.c runtime/src/runtime.c -ldl -o $(OUT)/test_iname
+	    tests/runtime/test_iname.c $(RT_UNITS) -ldl -o $(OUT)/test_iname
 	./$(OUT)/test_iname
 
 # The requirements gate under ASan: the compiled payment module's policy
@@ -117,7 +134,7 @@ test-iname: $(MODULE) $(MODULE_V2)
 test-partial: $(MODULE_PAY)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_partial.c runtime/src/runtime.c -ldl -o $(OUT)/test_partial
+	    tests/runtime/test_partial.c $(RT_UNITS) -ldl -o $(OUT)/test_partial
 	./$(OUT)/test_partial
 
 # The language lowering gate under ASan: the compiled gauntlet module walks
@@ -127,7 +144,7 @@ test-partial: $(MODULE_PAY)
 test-lang: $(MODULE_LANG)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_lang.c runtime/src/runtime.c -ldl -o $(OUT)/test_lang
+	    tests/runtime/test_lang.c $(RT_UNITS) -ldl -o $(OUT)/test_lang
 	./$(OUT)/test_lang
 
 # The standard library gate under ASan: the std_user module merges four
@@ -138,7 +155,7 @@ test-lang: $(MODULE_LANG)
 test-std: $(MODULE_STD)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_std.c runtime/src/runtime.c -ldl -o $(OUT)/test_std
+	    tests/runtime/test_std.c $(RT_UNITS) -ldl -o $(OUT)/test_std
 	./$(OUT)/test_std
 
 # The Python interop gate: the ctypes binding drives the payment walk and
@@ -176,7 +193,7 @@ test-header: $(ASHC) $(MODULE) $(RT_SO)
 	diff tests/golden/hello.ash.h $(OUT)/hello.ash.h
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic \
 	    -I runtime/include -I $(OUT) \
-	    tests/runtime/test_header.c runtime/src/runtime.c -ldl -o $(OUT)/test_header
+	    tests/runtime/test_header.c $(RT_UNITS) -ldl -o $(OUT)/test_header
 	./$(OUT)/test_header
 
 # The determinism gate: two builds of the same source must emit byte
@@ -218,6 +235,38 @@ test-determinism: $(ASHC) $(RT_SO)
 	rm -f $(OUT)/main_demo.c.first $(OUT)/main_demo.main.c.first $(OUT)/hello.ash.h.first
 	@echo "[determinism] ok"
 
+# The network gate: ashd serves libhello on loopback under a token, and a C
+# client links libashrt, connects with ash_runtime_connect, and asserts the
+# remote Greeter entries landed in its iname table, that the dump hash the
+# handshake checked held, and that a bad token, a forged version, and a dead
+# address each land their documented refusal. The harness fixes the port,
+# waits for the daemon to accept before the client dials, and kills it after,
+# so the socket timing cannot make the gate flaky.
+test-net: $(RT_SO) $(MODULE) $(ASHD)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -pthread -I runtime/include -I runtime/src \
+	    tests/net/test_handshake.c -L $(OUT) -lashrt \
+	    -Wl,-rpath,'$$ORIGIN' -o $(OUT)/test_handshake
+	tests/net/run_net.sh $(ASHD) $(OUT)/test_handshake $(MODULE)
+
+# The network gate under ThreadSanitizer: the daemon and the client both built
+# with the runtime and the socket code compiled in, so TSan watches the accept
+# loop, every connection thread, and the client's handshake for a race. The
+# dlopened module is not instrumented, which TSan tolerates; -rdynamic exports
+# the ash_* symbols it resolves against. Not in the default all gate because it
+# stands up a real daemon under a sanitizer; run it explicitly.
+test-net-tsan: $(MODULE)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/ashd_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    tests/net/test_handshake.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/test_handshake_tsan
+	tests/net/run_net.sh $(OUT)/ashd_tsan $(OUT)/test_handshake_tsan $(MODULE)
+
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
 # full host walk, runtime compiled into each binary so TSan sees every lock.
 # The dlopened module is not instrumented, which TSan tolerates; the runtime
@@ -225,15 +274,15 @@ test-determinism: $(ASHC) $(RT_SO)
 tsan: $(MODULE)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -I runtime/include \
-	    tests/runtime/test_thread.c runtime/src/runtime.c -ldl -o $(OUT)/test_thread_tsan
+	    tests/runtime/test_thread.c $(RT_UNITS) -ldl -o $(OUT)/test_thread_tsan
 	./$(OUT)/test_thread_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic -I runtime/include \
-	    skeleton/host.c runtime/src/runtime.c -ldl -o $(OUT)/host_tsan
+	    skeleton/host.c $(RT_UNITS) -ldl -o $(OUT)/host_tsan
 	./$(OUT)/host_tsan
 
 smoke-asan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    skeleton/host.c runtime/src/runtime.c -ldl -o $(OUT)/host_asan
+	    skeleton/host.c $(RT_UNITS) -ldl -o $(OUT)/host_asan
 	./$(OUT)/host_asan
 
 clean:

@@ -61,6 +61,8 @@
 
 #include <ash/ash.h>
 
+#include "ash_net.h"
+
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -68,6 +70,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+#define ASH_HANDSHAKE_MS_DEFAULT 10000
 
 #define ASH_MAX_CONTRACT_TYPES 64
 #define ASH_MAX_MODULES        64
@@ -149,6 +154,16 @@ typedef struct AshBinding {
     AshPledgeFn          fn;
 } AshBinding;
 
+/* A block of heap the runtime keeps for the life of a connection: the retained
+ * iname dump text a remote merge tokenizes in place, which the merged entries
+ * borrow into exactly the way a local pledge entry borrows into a module
+ * image. They are freed wholesale at shutdown. */
+typedef struct AshNetBuf {
+    struct AshNetBuf* next;
+    void*             p;
+    size_t            n;
+} AshNetBuf;
+
 struct AshRuntime {
     const AshContractDesc* descs[ASH_MAX_CONTRACT_TYPES];
     size_t                 ndescs;
@@ -170,6 +185,12 @@ struct AshRuntime {
     int                    frozen;
     pthread_mutex_t        lock;      /* guards the tables above */
 
+    /* The handshake timeout ash_runtime_connect gives a daemon, resolved from
+     * the config at init, and the retained buffers remote merges borrow into.
+     * net_bufs is guarded by lock, the same discipline the iname table keeps. */
+    uint32_t               handshake_ms;
+    AshNetBuf*             net_bufs;
+
     /* The pool: nworkers threads draining one unbounded intrusive queue of
      * futures. qmu and qcv are a leaf lock pair, never held with another. */
     pthread_t*             workers;
@@ -187,6 +208,11 @@ typedef AshStatus (*AshRegisterFn)(AshRuntime*);
  * evaluator further down; both run under the instance lock. */
 static int pledge_is_loose(const AshContractDesc* d, uint32_t i);
 static int sub_all(const AshContract* c, uint32_t s, uint8_t want);
+
+/* Whether a pointer falls inside one of the runtime's retained net buffers,
+ * the test that tells a remote iname string from a locally owned one at
+ * shutdown. Defined with the connect path at the end of the file. */
+static int net_owned(const AshRuntime* rt, const void* ptr);
 
 /* ---- locking primitives ---- */
 
@@ -502,6 +528,8 @@ AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out) {
         }
     }
     rt->nworkers = nworkers;
+    rt->handshake_ms = (cfg && cfg->handshake_ms != 0) ? cfg->handshake_ms
+                                                       : ASH_HANDSHAKE_MS_DEFAULT;
     *out = rt;
     return ASH_OK;
 }
@@ -545,11 +573,22 @@ void ash_runtime_shutdown(AshRuntime* rt) {
         free(c);
     }
     for (size_t i = 0; i < rt->ninames; i++) {
-        if (rt->inames[i].kind == ASH_INAME_CONTRACT) {
+        /* A local contract entry's mangled name is its own heap; a remote
+         * entry's strings live in a retained net buffer freed below, so it is
+         * skipped here to keep the free single owned. */
+        if (rt->inames[i].kind == ASH_INAME_CONTRACT &&
+            !net_owned(rt, rt->inames[i].mangled)) {
             free((char*)rt->inames[i].mangled);
         }
     }
     free(rt->inames);
+    AshNetBuf* nb = rt->net_bufs;
+    while (nb) {
+        AshNetBuf* next = nb->next;
+        free(nb->p);
+        free(nb);
+        nb = next;
+    }
     for (size_t i = 0; i < rt->nmodules; i++) {
         dlclose(rt->modules[i]);
     }
@@ -2023,4 +2062,269 @@ AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
     render_value(&write_pass, v, 0);
     buf[write_pass.pos] = '\0';
     return ASH_OK;
+}
+
+/* ---- the network client ---- */
+
+/* The retained buffer bookkeeping and the remote table merge behind
+ * ash_runtime_connect. A merge parses the daemon's canonical dump text back
+ * into iname entries and inserts them beside the local ones, the reverse of
+ * ash_iname_dump. The dump text carries a mangled name, a kind, a shape hash,
+ * and a version, which is everything discovery and the dump need; the owning
+ * contract name, the pledge symbol, and the argument count are not in the
+ * dump, so a remote entry leaves them empty until a later layer that fulfills
+ * across the wire needs them. */
+
+/* Whether a pointer falls inside one of the runtime's retained net buffers.
+ * Called under rt->lock at shutdown, and cheap because the buffer list is one
+ * entry per connection. */
+static int net_owned(const AshRuntime* rt, const void* ptr) {
+    const uint8_t* q = (const uint8_t*)ptr;
+    for (const AshNetBuf* b = rt->net_bufs; b; b = b->next) {
+        const uint8_t* base = (const uint8_t*)b->p;
+        if (q >= base && q < base + b->n) return 1;
+    }
+    return 0;
+}
+
+/* Hands one heap block to the runtime to hold until shutdown. Under rt->lock.
+ * On failure the caller still owns the block. */
+static AshStatus net_track(AshRuntime* rt, void* p, size_t n) {
+    AshNetBuf* b = (AshNetBuf*)malloc(sizeof(AshNetBuf));
+    if (!b) return ASH_ERR_OOM;
+    b->p = p;
+    b->n = n;
+    b->next = rt->net_bufs;
+    rt->net_bufs = b;
+    return ASH_OK;
+}
+
+/* Removes one entry by mangled name, the rollback when a later insert of the
+ * same merge fails. Under rt->lock. */
+static void iname_remove_one(AshRuntime* rt, const char* mangled) {
+    size_t pos;
+    if (!iname_find(rt, mangled, &pos)) return;
+    memmove(rt->inames + pos, rt->inames + pos + 1,
+            (rt->ninames - pos - 1) * sizeof(AshInameEntry));
+    rt->ninames--;
+}
+
+/* Parses the canonical dump text into iname entries and merges them all or
+ * nothing. The text is copied into a buffer the runtime retains, tokenized in
+ * place so each entry's mangled name borrows into it exactly as a local pledge
+ * entry borrows into a module image. A name that already exists, local or from
+ * an earlier connection, fails the whole merge with ASH_ERR_NAME and inserts
+ * nothing, the freeze law's collision rule carried to the network. */
+static AshStatus iname_merge_remote(AshRuntime* rt, const uint8_t* text,
+                                    uint32_t len) {
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) return ASH_ERR_OOM;
+    if (len) memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    AshInameEntry* ents = NULL;
+    size_t nents = 0, cap = 0;
+    AshStatus st = ASH_OK;
+    char* p = buf;
+    while (*p) {
+        char* line = p;
+        char* nl = strchr(p, '\n');
+        if (nl) {
+            *nl = '\0';
+            p = nl + 1;
+        } else {
+            p = line + strlen(line);
+        }
+        if (*line == '\0') continue;
+        char* sp = strchr(line, ' ');
+        if (!sp) {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        *sp = '\0';
+        char kindbuf[16];
+        unsigned long long hash = 0;
+        unsigned ver = 0;
+        if (sscanf(sp + 1, "%15s %llx v%u", kindbuf, &hash, &ver) != 3) {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        uint32_t kind;
+        if (strcmp(kindbuf, "contract") == 0) {
+            kind = ASH_INAME_CONTRACT;
+        } else if (strcmp(kindbuf, "pledge") == 0) {
+            kind = ASH_INAME_PLEDGE;
+        } else {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        if (nents == cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            AshInameEntry* grown = realloc(ents, ncap * sizeof(*grown));
+            if (!grown) {
+                st = ASH_ERR_OOM;
+                break;
+            }
+            ents = grown;
+            cap = ncap;
+        }
+        AshInameEntry e;
+        memset(&e, 0, sizeof e);
+        e.mangled = line;
+        e.kind = kind;
+        e.contract = NULL;
+        e.symbol = NULL;
+        e.shape_hash = (uint64_t)hash;
+        e.version = (uint32_t)ver;
+        e.nargs = 0;
+        ents[nents++] = e;
+    }
+    if (st != ASH_OK) {
+        free(ents);
+        free(buf);
+        return st;
+    }
+
+    pthread_mutex_lock(&rt->lock);
+    for (size_t i = 0; i < nents; i++) {
+        size_t pos;
+        if (iname_find(rt, ents[i].mangled, &pos)) {
+            st = ASH_ERR_NAME;
+            break;
+        }
+    }
+    size_t inserted = 0;
+    if (st == ASH_OK) {
+        for (; inserted < nents; inserted++) {
+            st = iname_insert(rt, &ents[inserted]);
+            if (st != ASH_OK) break;
+        }
+    }
+    if (st == ASH_OK) {
+        st = net_track(rt, buf, (size_t)len + 1);
+    }
+    if (st != ASH_OK) {
+        for (size_t i = 0; i < inserted; i++) {
+            iname_remove_one(rt, ents[i].mangled);
+        }
+        pthread_mutex_unlock(&rt->lock);
+        free(ents);
+        free(buf);
+        return st;
+    }
+    pthread_mutex_unlock(&rt->lock);
+    free(ents);
+    return ASH_OK;
+}
+
+/* Reads an ERROR frame's status, the mapping a client applies to a refusal:
+ * the status is the daemon's, the diagnostic string is for logs. A truncated
+ * ERROR payload falls back to ASH_ERR_NET, since a connection that cannot even
+ * carry a status is itself the failure. */
+static AshStatus error_status(const AshWireFrame* fr, const uint8_t* pl) {
+    if (fr->payload_len >= 4 && pl) return (AshStatus)ash_net_get_u32(pl);
+    return ASH_ERR_NET;
+}
+
+AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
+                              const char* token) {
+    if (!rt || !addr) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&rt->lock);
+    int frozen = rt->frozen;
+    uint32_t hs = rt->handshake_ms ? rt->handshake_ms
+                                   : ASH_HANDSHAKE_MS_DEFAULT;
+    pthread_mutex_unlock(&rt->lock);
+    if (frozen) return ASH_ERR_STATE;
+
+    int fd = ash_net_dial(addr);
+    if (fd < 0) return ASH_ERR_NET;
+    ash_net_set_rcvtimeo(fd, hs);
+
+    /* HELLO: the protocol version, then the token as a length prefixed string,
+     * empty when the client has none. */
+    size_t tlen = token ? strlen(token) : 0;
+    uint32_t plen = (uint32_t)(8 + tlen);
+    uint8_t* hp = (uint8_t*)malloc(plen);
+    if (!hp) {
+        close(fd);
+        return ASH_ERR_OOM;
+    }
+    ash_net_put_u32(hp, 1);
+    ash_net_put_u32(hp + 4, (uint32_t)tlen);
+    if (tlen) memcpy(hp + 8, token, tlen);
+    int wr = ash_net_send_frame(fd, ASH_WIRE_HELLO, 1, hp, plen);
+    free(hp);
+    if (wr != 0) {
+        close(fd);
+        return ASH_ERR_NET;
+    }
+
+    AshWireFrame fr;
+    uint8_t* pl = NULL;
+    if (ash_net_recv_frame(fd, &fr, &pl) != 0) {
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    if (fr.kind == ASH_WIRE_ERROR) {
+        AshStatus st = error_status(&fr, pl);
+        free(pl);
+        close(fd);
+        return st;
+    }
+    if (fr.kind != ASH_WIRE_HELLO_OK || fr.payload_len < 12 || !pl) {
+        free(pl);
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    uint32_t accepted = ash_net_get_u32(pl);
+    uint64_t table_hash = ash_net_get_u64(pl + 4);
+    free(pl);
+    pl = NULL;
+    if (accepted != 1) {
+        close(fd);
+        return ASH_ERR_VERSION;
+    }
+
+    /* INAME_SYNC fetches the whole discovery table in one INAME_TABLE reply. */
+    if (ash_net_send_frame(fd, ASH_WIRE_INAME_SYNC, 2, NULL, 0) != 0) {
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    if (ash_net_recv_frame(fd, &fr, &pl) != 0) {
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    if (fr.kind == ASH_WIRE_ERROR) {
+        AshStatus st = error_status(&fr, pl);
+        free(pl);
+        close(fd);
+        return st;
+    }
+    if (fr.kind != ASH_WIRE_INAME_TABLE || fr.payload_len < 4 || !pl) {
+        free(pl);
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    uint32_t dlen = ash_net_get_u32(pl);
+    if ((uint64_t)dlen + 4 > fr.payload_len) {
+        free(pl);
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    const uint8_t* dbytes = pl + 4;
+    /* The HELLO_OK hash is the daemon's claim about the table it is about to
+     * send; a mismatch means the two disagree and the connection is not to be
+     * trusted. */
+    if (ash_net_fnv1a64(dbytes, dlen) != table_hash) {
+        free(pl);
+        close(fd);
+        return ASH_ERR_NET;
+    }
+    AshStatus st = iname_merge_remote(rt, dbytes, dlen);
+    free(pl);
+    /* v1 fills the table and closes: there is no remote sign or fulfill yet to
+     * keep the socket open for. The daemon side sees the close and reaps its
+     * connection thread. */
+    close(fd);
+    return st;
 }
