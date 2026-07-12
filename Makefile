@@ -25,9 +25,9 @@ MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-python test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-determinism tsan
+all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-python test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -125,6 +125,20 @@ test-std: $(MODULE_STD)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
 	    tests/runtime/test_std.c runtime/src/runtime.c -ldl -o $(OUT)/test_std
 	./$(OUT)/test_std
+
+# The Python interop gate: the ctypes binding drives the payment walk and
+# the by reference protocol with no C written and no generated code, which
+# is the product claim that the documented ABI alone is enough for a foreign
+# host. Skips cleanly where python3 is not installed. There is no TSan
+# variant on purpose: the TSan runtime cannot be mixed into an
+# uninstrumented python3 process, so the concurrency surface stays covered
+# by the C tsan gate.
+test-python: $(RT_SO) $(MODULE) $(MODULE_PAY)
+	@if command -v python3 >/dev/null 2>&1; then \
+	    python3 interop/python/demo_payment.py; \
+	else \
+	    echo "[test-python] python3 not found, skipping"; \
+	fi
 
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash

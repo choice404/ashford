@@ -25,7 +25,34 @@ typedef struct AshValue {
 
 The numeric widths are fixed forever: `Int` is 64 bit signed, `UInt` 64 bit unsigned, `Float` is IEEE double, `Bool` and `Byte` one byte, `Char` a 32 bit Unicode scalar value. There is no implicit conversion at the boundary because there is none in the language.
 
+The type tags are numbers on the wire and the numbers are fixed, declaration order in the enum:
+
+```c
+typedef enum AshTypeTag {
+    ASH_TY_UNIT = 0, ASH_TY_INT, ASH_TY_UINT, ASH_TY_FLOAT, ASH_TY_BOOL,
+    ASH_TY_BYTE, ASH_TY_CHAR, ASH_TY_STRING, ASH_TY_LIST, ASH_TY_MAP,
+    ASH_TY_TUPLE, ASH_TY_OPTION, ASH_TY_RESULT, ASH_TY_RECORD,
+    ASH_TY_PLEDGE_REF, ASH_TY_SUM
+} AshTypeTag;
+```
+
 Strings are a fat value: a pointer and a byte length, UTF-8, no terminator. The bytes live wherever the value's owner put them; a compiled module points string constants into its own mapped image, and everything built at run time lives on a contract instance.
+
+```c
+typedef struct AshString {
+    uint8_t* ptr;
+    uint64_t len;
+} AshString;
+
+typedef struct AshList {
+    void*    data;   /* a contiguous AshValue array */
+    uint64_t len;
+    uint64_t cap;
+    uint32_t elem_ty;
+} AshList;
+```
+
+Every layout in this document uses the platform's natural C alignment and nothing is packed. On LP64 an `AshString` is 16 bytes, an `AshList` 32 with four bytes of tail padding after `elem_ty`, and an `AshValue` 40: two 32 bit tags and a union whose widest arm is the list. A foreign host that reconstructs these structs by hand, an FFI without the header, builds exactly these fields in exactly this order.
 
 `tag` carries the variant for the sum shaped types and is 0 for everything else:
 
@@ -44,6 +71,25 @@ A record rides the list arm too: `ASH_TY_RECORD`, the data pointer an `AshValue`
 
 The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_list_set`, `ash_tuple_new`, `ash_value_eq`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list, tuple, record, and sum elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own. `ash_value_eq` is the structural equality the language's `==` lowers onto for the deep shapes: type tags first, the sum shaped `tag` next, then elements recursively, with a Map or any other unsettled arm reading unequal.
 
+The value and allocation helpers cross the boundary with these shapes, every allocating one hanging its memory off the instance it was handed:
+
+```c
+uint8_t*  ash_bytes(AshContract* c, uint64_t n);
+AshValue* ash_box(AshContract* c);
+AshValue  ash_string_copy(AshContract* c, const uint8_t* utf8, uint64_t len);
+AshStatus ash_string_concat(AshContract* c, const AshValue* a,
+                            const AshValue* b, AshValue* out);
+AshStatus ash_list_new(AshContract* c, uint32_t elem_ty, uint64_t cap,
+                       AshValue* out);
+AshStatus ash_list_push(AshContract* c, AshValue* list, const AshValue* elem);
+const AshValue* ash_list_get(const AshValue* v, uint64_t idx);
+AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem);
+AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out);
+int       ash_value_eq(const AshValue* a, const AshValue* b);
+AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
+                              AshValue* dst);
+```
+
 **Indexing out of bounds.** Compiled code bounds checks every list element read and write, reads through `ash_list_get` and writes through `ash_list_set`. An index outside the list, a negative one included through the unsigned cast, makes the pledge return `ASH_ERR_TYPE` from its thunk: the status reports the fulfillment never produced a value, no latch moves, and host memory is never touched. This rule is normative for every compiled module.
 
 ## The thunk frame
@@ -60,6 +106,24 @@ typedef AshStatus (*AshPledgeFn)(void* ctx, const AshValue* args, size_t nargs,
 `args` is the full frame, one slot per declared parameter, and every slot is an instance owned deep copy the runtime built at fulfillment entry. A pledge body never sees host memory. When the caller passed trailing parameters by reference, those slots are mutable on purpose: an implementation that updates a by-reference parameter casts away the const on its own slot and writes the new value there, and the runtime carries the final slot values back to the host at delivery.
 
 A pledge that succeeds with an `Err` result still returns `ASH_OK`; the status word reports whether the thunk ran, the value reports what the pledge decided. The runtime latches the outcome either way.
+
+The frame is validated on the way in, not on the way out. The runtime checks the count and every argument tag before the body runs, and it trusts what the body wrote through `out`: v1 does not police a host bound implementation that writes a value of a different shape than the pledge declared. Compiled bodies cannot do this, the compiler already checked them; a host that does has broken its side of the contract, and what a compiled caller makes of the value is its own misfortune.
+
+## Runtime lifecycle
+
+```c
+typedef struct AshRuntimeConfig {
+    uint32_t max_threads;   /* 0 selects the default pool of 4 workers */
+} AshRuntimeConfig;
+
+AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out);
+void      ash_runtime_shutdown(AshRuntime* rt);
+AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
+```
+
+A NULL `cfg` means all defaults. `ash_module_load` hands `so_path` to dlopen as it stands, so a relative path resolves by the loader's rules from the process working directory; shutdown is described under Threading and frees everything the runtime tracked.
+
+**Loading the runtime dynamically.** A compiled module carries undefined references to the runtime's exported symbols, `ash_register_contract` and the allocation helpers its thunks call, and no library dependency of its own; the dynamic linker resolves them against the process global scope when the runtime dlopens the module. A C host that links libashrt into its executable gets this for free, because an executable's startup dependencies join the global scope. A host that opens libashrt dynamically itself, dlopen from C or ctypes from Python, must open it with `RTLD_GLOBAL`, or every module load fails to resolve and reports `ASH_ERR_LOAD`.
 
 ## Descriptor tables
 
@@ -121,6 +185,31 @@ AshStatus ash_module_register(AshRuntime* rt);
 
 `ash_contract_sign` finds the contract by name, checks the shape hash when the caller supplied one, and builds the instance's vow storage: declared defaults first, then the caller's `AshVowBinding` overrides. An override naming no vow is `ASH_ERR_NAME`, an override whose value carries the wrong type tag is `ASH_ERR_TYPE`, and a vow with neither a default nor an override is `ASH_ERR_UNBOUND`. A contract with any abstract pledge, an `fn` of NULL nothing has bound, refuses to sign with `ASH_ERR_UNBOUND`. No failure leaves an instance behind.
 
+```c
+typedef struct AshVowBinding {
+    const char* name;
+    AshValue    value;   /* copied onto the instance at sign */
+} AshVowBinding;
+
+AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
+                            const AshVowBinding* vows, size_t nvows,
+                            uint64_t expected_hash, AshContract** out);
+```
+
+NULL and 0 sign on the declared defaults alone, and an `expected_hash` of 0 skips the shape check. The instance's state and signature read back through calls whose enum values are as fixed as the type tags, `ASH_FULFILLED` sitting below `ASH_PARTIAL` because the enum declares it first:
+
+```c
+typedef enum AshContractState {
+    ASH_UNSIGNED = 0, ASH_SIGNED, ASH_FULFILLED, ASH_PARTIAL, ASH_BROKEN
+} AshContractState;
+
+AshContractState ash_contract_state(const AshContract* c);
+uint64_t         ash_contract_hash(const AshContract* c);
+int64_t          ash_contract_signed_at(const AshContract* c);
+const AshValue*  ash_vow_ref(AshContract* c, const char* name);
+AshStatus        ash_contract_break(AshContract* c);
+```
+
 ## Binding host implementations
 
 An abstract pledge, a declaration with no body, compiles to a descriptor entry whose `fn` is NULL. The host supplies the implementation:
@@ -131,6 +220,8 @@ AshStatus ash_pledge_bind(AshRuntime* rt, const char* pledge_name,
 ```
 
 `pledge_name` is either `"Contract.pledge"` or the pledge's mangled symbol; `ASH_ERR_NAME` when no registered contract carries it. The bound function runs in the uniform thunk frame with `ctx` = the signed instance, exactly like a compiled body, and everything it builds through the allocation helpers is instance owned. The descriptor tables are const data inside the module image, so the binding lives in an overlay the runtime keeps.
+
+The overlay holds the raw function pointer and nothing else. A host whose implementation is a generated trampoline, a ctypes callback or any FFI-made thunk, keeps that trampoline alive itself for as long as the runtime can dispatch it; the runtime takes no reference and cannot see a garbage collector coming. The simple rule for such a host is that a binding lives as long as the runtime does.
 
 Bindings resolve at sign. Signing walks the contract's pledges and fixes the instance's dispatch table then and there, the host binding beating the compiled body, a pledge with neither refusing the sign with `ASH_ERR_UNBOUND`. An instance signed before a bind keeps dispatching what it was signed with; a rebind replaces the binding for instances signed after it. A per-binding userdata is deferred; a bound implementation that needs state reaches it through its own globals for now, and reads the contract's vows through `ash_vow_ref` on `ctx` like any thunk.
 
@@ -151,7 +242,14 @@ AshStatus  ash_future_wait(AshFuture* f, AshValue* out);
 
 Every value argument is deep copied onto the instance at the fulfill call, on the caller's thread, so host argument lifetimes end when the call returns; the pledge body sees only the instance owned frame. `refs` pass trailing parameters by reference, `NULL` and 0 for none; the count rule is `nargs + nrefs == ` the pledge's declared parameter count, with the refs occupying the trailing slots.
 
-A future delivers exactly once. The first `ash_future_wait` blocks until the fulfillment completes, writes any ref slots back to host memory on the waiting thread, then copies the value out and returns the fulfillment's status; every later wait on the same future is `ASH_ERR_STATE`. The value's contents are owned by the instance that produced it, so wait before you break. `ash_pledge_fulfill_sync` remains as the two calls fused, on the same internal path, its write back happening before it returns.
+A future delivers exactly once. The first `ash_future_wait` blocks until the fulfillment completes, writes any ref slots back to host memory on the waiting thread, then copies the value out and returns the fulfillment's status; every later wait on the same future is `ASH_ERR_STATE`. The value's contents are owned by the instance that produced it, so wait before you break. `ash_pledge_fulfill_sync` remains as the two calls fused, on the same internal path, its write back happening before it returns:
+
+```c
+AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
+                                  const AshValue* args, size_t nargs,
+                                  const AshRef* refs, size_t nrefs,
+                                  AshValue* out);
+```
 
 ## By-reference arguments
 
@@ -343,6 +441,8 @@ Vows first, then pledges, each in declaration order, each type spelled in the ch
 A host that passes the expected hash to `ash_contract_sign` gets `ASH_ERR_VERSION` when the loaded module's shape disagrees, which is the whole defense against fulfilling yesterday's contract through today's module. Passing 0 skips the check.
 
 ## Status codes
+
+The numbers are part of the wire: `ASH_OK` is 0 and the rest count up in the order of this table, `ASH_ERR_STATE` 1 through `ASH_ERR_LOAD` 8.
 
 | status | meaning |
 |---|---|

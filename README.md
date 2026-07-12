@@ -93,6 +93,13 @@ The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 0
 make smoke DUSK=~/projects/cool-lang/target/release/dusk
 ```
 
+The runtime binds from anything that can load a C library, and the repository proves it with Python. `interop/python/ashford.py` is a ctypes binding written against [docs/abi.md](docs/abi.md) alone, no header parsed, no code generated, and `interop/python/demo_payment.py` walks the payment contract from Python: it binds a Python function over the abstract `charge` pledge, signs with a vow override, drives the partial, fulfilled, and broken paths, and takes a by-reference argument back through the write back.
+
+```sh
+# the payment walk from Python
+make test-python
+```
+
 ## Status
 
 The walking skeleton is green. `ashc`, written in dusk, compiles the skeleton contract to a shared module, the C runtime loads it, and a C host drives sign, fulfill, and break across the ABI with the sanitizers quiet. The emitted module is still canned: the compiler proves the pipeline, not the language. Next is the front end, the lexer and parser over the full contract grammar in [docs/grammar.md](docs/grammar.md), with golden and compile fail suites pinning every construct.
