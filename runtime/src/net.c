@@ -12,7 +12,9 @@
 #include "ash_net.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -130,7 +132,45 @@ static int split_addr(const char* addr, char* host_out, size_t host_cap,
     return 0;
 }
 
-int ash_net_dial(const char* addr) {
+/* Connects fd to sa, giving the handshake at most ms milliseconds, or blocking
+ * with no bound when ms is 0. The bounded form flips the socket non blocking,
+ * issues the connect, and waits the completion on a poll so a SYN a peer never
+ * answers times out rather than parking the thread; the socket is restored to
+ * blocking before it is handed back, whichever path ran. Returns 0 connected,
+ * -1 on any failure or the timeout. */
+static int connect_bound(int fd, const struct sockaddr* sa, socklen_t slen,
+                         uint32_t ms) {
+    if (ms == 0) {
+        return connect(fd, sa, slen) == 0 ? 0 : -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    int rc = connect(fd, sa, slen);
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        int pr;
+        do {
+            pr = poll(&pfd, 1, (int)ms);
+        } while (pr < 0 && errno == EINTR);
+        if (pr <= 0) {
+            /* zero is the timeout the whole hardening exists for; a negative is
+             * a poll error, both a failed connect. */
+            return -1;
+        }
+        int soerr = 0;
+        socklen_t elen = sizeof soerr;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &elen) != 0) return -1;
+        if (soerr != 0) return -1;
+        rc = 0;
+    }
+    if (fcntl(fd, F_SETFL, flags) < 0) return -1;
+    return rc == 0 ? 0 : -1;
+}
+
+int ash_net_dial_timeout(const char* addr, uint32_t ms) {
     char host[256], port[32];
     if (!addr || split_addr(addr, host, sizeof host, port, sizeof port) != 0) {
         return -1;
@@ -145,7 +185,7 @@ int ash_net_dial(const char* addr) {
     for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (connect_bound(fd, ai->ai_addr, ai->ai_addrlen, ms) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -155,6 +195,10 @@ int ash_net_dial(const char* addr) {
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
     }
     return fd;
+}
+
+int ash_net_dial(const char* addr) {
+    return ash_net_dial_timeout(addr, 0);
 }
 
 int ash_net_listen(const char* addr) {
@@ -191,6 +235,14 @@ int ash_net_set_rcvtimeo(int fd, uint32_t ms) {
     tv.tv_sec = (time_t)(ms / 1000u);
     tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0) return -1;
+    return 0;
+}
+
+int ash_net_set_sndtimeo(int fd, uint32_t ms) {
+    struct timeval tv;
+    tv.tv_sec = (time_t)(ms / 1000u);
+    tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) return -1;
     return 0;
 }
 

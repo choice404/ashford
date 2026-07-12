@@ -3240,9 +3240,14 @@ AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
     pthread_mutex_unlock(&rt->lock);
     if (frozen) return ASH_ERR_STATE;
 
-    int fd = ash_net_dial(addr);
+    /* The connect itself is on the handshake clock, so a peer that drops its
+     * SYNs cannot park the caller forever; the reads and writes of the HELLO
+     * round trip carry the same bound, the whole handshake finishing inside hs
+     * or failing ASH_ERR_NET. */
+    int fd = ash_net_dial_timeout(addr, hs);
     if (fd < 0) return ASH_ERR_NET;
     ash_net_set_rcvtimeo(fd, hs);
+    ash_net_set_sndtimeo(fd, hs);
 
     /* HELLO: the protocol version, then the token as a length prefixed string,
      * empty when the client has none. */
@@ -3326,9 +3331,11 @@ AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
     }
 
     /* The handshake is done; the connection now stays open under a reader
-     * thread that owns every later read. The timeout comes off so a fulfillment
-     * blocks as long as its pledge runs, exactly as a local wait does. */
+     * thread that owns every later read. Both clocks come off so a fulfillment
+     * blocks as long as its pledge runs, exactly as a local wait does, and a
+     * RESULT the size of the wire's cap is never a timed out write. */
     ash_net_set_rcvtimeo(fd, 0);
+    ash_net_set_sndtimeo(fd, 0);
     AshConn* conn = conn_new(rt, fd);
     if (!conn) {
         free(pl);

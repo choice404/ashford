@@ -160,4 +160,5 @@ Named so nothing is discovered missing by surprise. Each has a place to land lat
 - **By-reference arguments over the network**, refused with `ASH_ERR_TYPE` as described above.
 - **TLS, identity, and per contract authorization.** v1's token is a perimeter, nothing more.
 - **Fulfillment deadlines.** No protocol timeout on a running pledge, for the semantic reason given above.
+- **Live reconnect.** A dropped connection is final for the runtime that held it: its proxies stay Broken and its remote names stay merged, so reconnecting the same runtime to the same daemon collides on those names. A reconnect is a fresh runtime, and reviving a proxy across a new connection is future work.
 - **Partial iname queries and compression.** The whole table crosses at handshake, uncompressed; both are payload level changes if a table ever grows enough to want them.

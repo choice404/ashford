@@ -57,8 +57,17 @@ int ash_net_recv_frame(int fd, AshWireFrame* out, uint8_t** payload);
 /* Dials host:port and returns a connected stream socket, or -1. The address
  * is a host and a decimal port joined by the last colon, so a bare IPv4 or a
  * name both resolve; keepalive is turned on for the far peer that vanishes
- * without a FIN. */
+ * without a FIN. This blocks in connect(2) with no bound; ash_net_dial_timeout
+ * is the bounded form the handshake uses. */
 int ash_net_dial(const char* addr);
+
+/* Dials host:port giving the TCP connect at most ms milliseconds, so a peer
+ * that silently drops SYNs cannot park the caller forever, the connect half of
+ * the handshake clock. The connect runs non blocking and is waited on a poll,
+ * EINTR retried; the socket is handed back in blocking mode. ms of 0 blocks
+ * with no bound, the ash_net_dial behavior. Returns a connected stream socket
+ * or -1 on a resolution, connect, or timeout failure. */
+int ash_net_dial_timeout(const char* addr, uint32_t ms);
 
 /* Binds and listens on host:port, returning the listening socket or -1.
  * SO_REUSEADDR is set so a restart does not wait out TIME_WAIT. */
@@ -68,6 +77,13 @@ int ash_net_listen(const char* addr);
  * forever. The handshake arms this and the served loop clears it, the one
  * timeout the protocol has. Returns 0 on success, -1 on failure. */
 int ash_net_set_rcvtimeo(int fd, uint32_t ms);
+
+/* Sets the send timeout in milliseconds, 0 clearing it so writes block until
+ * the kernel takes the bytes. The client arms this across the handshake so a
+ * peer whose window never opens cannot stall a HELLO or an INAME_SYNC send
+ * forever, and clears it once the connection is served, where a write blocks
+ * only as long as the transport needs. Returns 0 on success, -1 on failure. */
+int ash_net_set_sndtimeo(int fd, uint32_t ms);
 
 /* FNV-1a 64 over n bytes, the hash HELLO_OK carries over the canonical iname
  * dump text so a client can tell one served world from another. */

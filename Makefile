@@ -34,7 +34,7 @@ MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 tsan
 
@@ -304,6 +304,45 @@ test-net2-tsan: $(MODULE_NETPAY)
 	    tests/net/test_remote.c runtime/src/runtime.c runtime/src/wire.c \
 	    runtime/src/net.c -ldl -o $(OUT)/test_remote_tsan
 	tests/net/run_net2.sh $(OUT)/ashd_net2_tsan $(OUT)/test_remote_tsan $(MODULE_NETPAY)
+
+# The N3 resilience gate: ashd serves the payment module on loopback and one
+# client hammers it from many connections at once, then tears the world down the
+# two violent ways a network can. Phase one is N connections times T threads
+# times K fulfillments concurrently, the load TSan needs to catch a race in the
+# reader, the waiters, the pool, or the per instance lock. Phase two is a storm
+# of short lived connections the daemon must survive while it keeps serving a
+# steady worker. Phase three SIGKILLs the daemon mid flight and demands
+# ASH_ERR_NET on every in flight wait, a clean state error after, and a clean
+# shutdown of every runtime. The client bounds itself with an alarm so a hung
+# teardown fails loudly. Kept out of the default all gate because it stands up a
+# real daemon and kills it under load; run it explicitly, and beside its own
+# ASan build to prove no leak survives the kill. Depends on the payment module
+# the N2 gate already builds.
+test-net-stress: $(RT_SO) $(MODULE_NETPAY) $(ASHD)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -pthread -I runtime/include -I runtime/src \
+	    tests/net/test_stress.c -L $(OUT) -lashrt \
+	    -Wl,-rpath,'$$ORIGIN' -o $(OUT)/test_stress
+	tests/net/run_stress.sh $(ASHD) $(OUT)/test_stress $(MODULE_NETPAY)
+
+# The N3 resilience gate under ThreadSanitizer: the daemon and the client both
+# built with the runtime and the socket code compiled in, so TSan watches the
+# accept loop, every connection and waiter thread, the client reader threads,
+# and every teardown race the kill storm opens between the waiters, the reader,
+# and instance break. The dlopened module is not instrumented, which TSan
+# tolerates; -rdynamic exports the ash_* symbols it resolves against. Explicit,
+# never in all, because it stands up a real daemon under a sanitizer.
+test-net-stress-tsan: $(MODULE_NETPAY)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/ashd_stress_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    tests/net/test_stress.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/test_stress_tsan
+	tests/net/run_stress.sh $(OUT)/ashd_stress_tsan $(OUT)/test_stress_tsan $(MODULE_NETPAY)
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
 # full host walk, runtime compiled into each binary so TSan sees every lock.

@@ -701,8 +701,11 @@ static void* conn_thread(void* arg) {
     int fd = g_conns[idx].fd;
     pthread_mutex_unlock(&g_conns_mu);
 
-    /* The handshake is on a clock; a stalled HELLO reaps the thread. */
+    /* The handshake is on a clock; a stalled HELLO reaps the thread, and the
+     * send side carries the same bound so a client that never drains its socket
+     * cannot park this thread on the HELLO_OK or the refusal write either. */
     ash_net_set_rcvtimeo(fd, d->handshake_ms);
+    ash_net_set_sndtimeo(fd, d->handshake_ms);
 
     AshWireFrame fr;
     uint8_t* pl = NULL;
@@ -710,9 +713,11 @@ static void* conn_thread(void* arg) {
     if (rc == 0 && fr.kind == ASH_WIRE_HELLO) {
         AshStatus st = check_hello(d, pl, fr.payload_len);
         if (st == ASH_OK) {
-            /* The handshake finished, so the clock comes off: a fulfillment
-             * runs as long as its pledge runs, no protocol deadline above it. */
+            /* The handshake finished, so the clocks come off: a fulfillment
+             * runs as long as its pledge runs, no protocol deadline above it,
+             * and a RESULT write waits on the transport rather than a clock. */
             ash_net_set_rcvtimeo(fd, 0);
+            ash_net_set_sndtimeo(fd, 0);
             ConnState* cs = connstate_new(d, fd);
             if (cs) {
                 serve(cs, fr.request_id);
