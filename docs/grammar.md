@@ -270,7 +270,18 @@ CtorExpr  ::= "Some" "(" Expr ")" | "None"
             | IDENT [ "(" Expr { "," Expr } ")" ]                        // sum variant
 ```
 
-There is no map literal in the first version. Maps are built through `ashstd`.
+There is no map literal. A map starts empty from its constructor form, `Map<K, V>()`, with the type arguments spelled out, and grows through index assignment:
+
+```text
+let mut ages = Map<String, Int>()
+ages["ada"] = 36
+let hit = ages["ada"]      // Option<Int>, Some(36)
+let miss = ages["bob"]     // None
+```
+
+Indexing a map reads an `Option<V>`, `None` on a missing key, so a miss is a value and never a fault; `m[k] = v` inserts or updates. Entries keep insertion order, which is the order any serialization sees. Removal and iteration over a map are not in the first version.
+
+An assignment target is a place, not a value, so the lvalue walk differs from reading in two ways. A map index in an assignment target names the value slot directly and types as `V`, not `Option<V>`: in final position `m[k] = v` inserts or updates and never faults, while a missing key in the middle of a chain, `m[k].field = v`, is a fault, the same status an out of range list index reports, because a place that does not exist cannot hang a `None` anywhere. And writing through a chain, `b.xs[0] = 99`, mutates the named binding in place; the copies value semantics make on reads never apply to the target being assigned.
 
 A record literal is ambiguous where a block can follow, so two rules keep the parse deterministic. A bare record literal is not allowed in the head expression of `if`, `while`, `for`, or `match`; wrap it in parentheses to opt back in. And the `{` of a record literal must sit on the same line as the name, since a line ending before `{` reads as the name alone with the brace opening a block.
 

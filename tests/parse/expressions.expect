@@ -146,6 +146,33 @@ File {
                             },
                             Let {
                                 mutable: false,
+                                name: "ages",
+                                ty: None,
+                                value: MapNew(
+                                    Named("Map", [
+                                        Named("String"),
+                                        Named("Int"),
+                                    ]),
+                                ),
+                            },
+                            Assign(
+                                Index(
+                                    Ident("ages"),
+                                    Str("ada"),
+                                ),
+                                Int(36),
+                            ),
+                            Let {
+                                mutable: false,
+                                name: "hit",
+                                ty: None,
+                                value: Index(
+                                    Ident("ages"),
+                                    Str("ada"),
+                                ),
+                            },
+                            Let {
+                                mutable: false,
                                 name: "m",
                                 ty: None,
                                 value: Mut(

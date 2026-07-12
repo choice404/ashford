@@ -1673,9 +1673,84 @@ AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem) {
     return ASH_OK;
 }
 
+/* ---- maps ---- */
+
+/* A map rides the list arm: the data pointer holds interleaved key, value
+ * pairs, entries[2i] the key and entries[2i+1] its value, len counts slots so
+ * it is always twice the pair count, and elem_ty is the key's tag alone; the
+ * value type is the checker's knowledge, not the runtime's. Pairs stay in
+ * insertion order, which is the order any serialization sees. Lookup and
+ * insert are a linear scan over the keys through ash_value_eq, O(n) in the
+ * pair count, the v1 tradeoff that keeps the repr one arm deep. */
+
+AshValue ash_map_new(AshContract* c, uint32_t key_ty) {
+    (void)c; /* an empty map allocates nothing; the ctx rides for symmetry */
+    AshValue v;
+    memset(&v, 0, sizeof(v));
+    v.ty = ASH_TY_MAP;
+    v.as.list.elem_ty = key_ty;
+    return v;
+}
+
+/* The slot index of k's value inside m, or -1 for a miss. Assumes m is a map
+ * and k matches its key tag; the public entry points check first. */
+static int64_t map_find(const AshValue* m, const AshValue* k) {
+    const AshValue* e = (const AshValue*)m->as.list.data;
+    for (uint64_t i = 0; i + 1 < m->as.list.len; i += 2) {
+        if (ash_value_eq(&e[i], k)) return (int64_t)(i + 1);
+    }
+    return -1;
+}
+
+AshStatus ash_map_set(AshContract* c, AshValue* m, const AshValue* k,
+                      const AshValue* v) {
+    if (!c || !m || !k || !v) return ASH_ERR_TYPE;
+    if (m->ty != ASH_TY_MAP) return ASH_ERR_TYPE;
+    if (k->ty != m->as.list.elem_ty) return ASH_ERR_TYPE;
+    /* Both halves are deep copied before anything is committed, so an OOM
+     * mid-copy leaves the map exactly as it was. */
+    AshValue vc;
+    AshStatus st = ash_value_deep_copy(c, v, &vc);
+    if (st != ASH_OK) return st;
+    int64_t hit = map_find(m, k);
+    if (hit >= 0) {
+        ((AshValue*)m->as.list.data)[hit] = vc;
+        return ASH_OK;
+    }
+    AshValue kc;
+    st = ash_value_deep_copy(c, k, &kc);
+    if (st != ASH_OK) return st;
+    if (m->as.list.len + 2 > m->as.list.cap) {
+        uint64_t cap = m->as.list.cap ? m->as.list.cap * 2 : 8;
+        AshValue* data = (AshValue*)ash_bytes(c, cap * sizeof(AshValue));
+        if (!data) return ASH_ERR_OOM;
+        if (m->as.list.len) {
+            memcpy(data, m->as.list.data, m->as.list.len * sizeof(AshValue));
+        }
+        m->as.list.data = data;
+        m->as.list.cap = cap;
+    }
+    AshValue* e = (AshValue*)m->as.list.data;
+    e[m->as.list.len] = kc;
+    e[m->as.list.len + 1] = vc;
+    m->as.list.len += 2;
+    return ASH_OK;
+}
+
+int ash_map_get(const AshValue* m, const AshValue* k, const AshValue** out) {
+    if (!m || !k || !out) return 0;
+    if (m->ty != ASH_TY_MAP) return 0;
+    if (k->ty != m->as.list.elem_ty) return 0;
+    int64_t hit = map_find(m, k);
+    if (hit < 0) return 0;
+    *out = (const AshValue*)m->as.list.data + hit;
+    return 1;
+}
+
 /* Structural equality, the recursion mirroring ash_value_deep_copy: what the
- * copy can reach, the compare can test. A tag mismatch reads unequal, and so
- * does an arm with no settled repr, Map today, rather than guessing. */
+ * copy can reach, the compare can test. A tag mismatch reads unequal. A map
+ * compares pair by pair in insertion order, keys and values both, the same
+ * order semantics serialization promises, so the answer is deterministic. */
 int ash_value_eq(const AshValue* a, const AshValue* b) {
     if (!a || !b) return 0;
     if (a->ty != b->ty) return 0;
@@ -1690,6 +1765,7 @@ int ash_value_eq(const AshValue* a, const AshValue* b) {
     case ASH_TY_STRING:
         return ash_string_eq(a, b);
     case ASH_TY_LIST:
+    case ASH_TY_MAP:
     case ASH_TY_TUPLE:
     case ASH_TY_RECORD:
     case ASH_TY_SUM: {
@@ -1713,7 +1789,6 @@ int ash_value_eq(const AshValue* a, const AshValue* b) {
     case ASH_TY_INSTANCE:
         /* An instance value is a reference handle; equality is identity. */
         return a->as.box == b->as.box;
-    case ASH_TY_MAP:
     case ASH_TY_PLEDGE_REF:
     default:
         return 0;
@@ -1735,10 +1810,10 @@ AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out) {
 }
 
 /* The recursive workhorse behind copy-in. Scalars are the struct copy, a
- * string copies its bytes, list, tuple, record, and sum payloads copy element
- * by element on the shared list arm, Option and Result rebox their payload.
- * Map waits for a settled repr; copying it today would freeze one by
- * accident. */
+ * string copies its bytes, list, map, tuple, record, and sum payloads copy
+ * element by element on the shared list arm, a map's interleaved keys and
+ * values riding along like any other elements, and Option and Result rebox
+ * their payload. */
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
                               AshValue* dst) {
     if (!c || !src || !dst) return ASH_ERR_TYPE;
@@ -1762,6 +1837,7 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
         if (src->as.s.len && !dst->as.s.ptr) return ASH_ERR_OOM;
         return ASH_OK;
     case ASH_TY_LIST:
+    case ASH_TY_MAP:
     case ASH_TY_TUPLE:
     case ASH_TY_RECORD:
     case ASH_TY_SUM: {
@@ -1797,7 +1873,6 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
         dst->as.box = boxed;
         return ASH_OK;
     }
-    case ASH_TY_MAP:
     default:
         return ASH_ERR_TYPE;
     }
@@ -1870,6 +1945,20 @@ static void render_elems(RenderSink* s, const AshValue* v, unsigned depth,
     sink_str(s, close);
 }
 
+/* A map in its canonical spelling: {k: v, ...} pairs in insertion order,
+ * which is the only order a map has. */
+static void render_map(RenderSink* s, const AshValue* v, unsigned depth) {
+    sink_put(s, "{", 1);
+    const AshValue* xs = (const AshValue*)v->as.list.data;
+    for (uint64_t i = 0; i + 1 < v->as.list.len; i += 2) {
+        if (i) sink_str(s, ", ");
+        render_value(s, &xs[i], depth + 1);
+        sink_str(s, ": ");
+        render_value(s, &xs[i + 1], depth + 1);
+    }
+    sink_put(s, "}", 1);
+}
+
 static void render_box(RenderSink* s, const AshValue* v, unsigned depth,
                        const char* name) {
     sink_str(s, name);
@@ -1910,7 +1999,7 @@ static void render_value(RenderSink* s, const AshValue* v, unsigned depth) {
     case ASH_TY_RESULT:
         render_box(s, v, depth, v->tag == 0 ? "Ok" : "Err");
         return;
-    case ASH_TY_MAP:        sink_str(s, "<map>"); return;
+    case ASH_TY_MAP:        render_map(s, v, depth); return;
     case ASH_TY_PLEDGE_REF: sink_str(s, "<pledge>"); return;
     case ASH_TY_INSTANCE:   sink_str(s, "<instance>"); return;
     default:                sink_str(s, "<?>"); return;

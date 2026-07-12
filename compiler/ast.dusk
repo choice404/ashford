@@ -107,6 +107,9 @@ export func xk_none() -> int64 { return 17 }
 export func xk_ok() -> int64 { return 18 }
 export func xk_err() -> int64 { return 19 }
 export func xk_mut() -> int64 { return 20 }
+// The map constructor Map<K, V>(): a holds the parsed type node carrying the
+// two type arguments, lowered by the checker like any annotation.
+export func xk_map_new() -> int64 { return 21 }
 
 export func uop_neg() -> int64 { return 0 }
 export func uop_not() -> int64 { return 1 }

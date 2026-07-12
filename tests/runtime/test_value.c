@@ -54,6 +54,7 @@ static int value_eq(const AshValue* a, const AshValue* b) {
     case ASH_TY_CHAR:   return a->as.ch == b->as.ch;
     case ASH_TY_STRING: return ash_string_eq(a, b);
     case ASH_TY_LIST:
+    case ASH_TY_MAP:
     case ASH_TY_TUPLE:
     case ASH_TY_RECORD:
     case ASH_TY_SUM: {
@@ -191,12 +192,92 @@ static void test_option_result_nesting(AshContract* arena,
     CHECK(copy.ty == ASH_TY_OPTION && copy.tag == 0 && copy.as.box == NULL,
           "None copies to None");
 
-    /* Maps are v1 unsupported and refuse loudly. */
-    AshValue map;
-    memset(&map, 0, sizeof(map));
-    map.ty = ASH_TY_MAP;
-    CHECK(ash_value_deep_copy(dst_arena, &map, &copy) == ASH_ERR_TYPE,
-          "deep copy of a map reports ASH_ERR_TYPE");
+}
+
+static void check_render(const AshValue* v, const char* want,
+                         const char* what);
+
+static void test_map(AshContract* arena, AshContract* dst_arena) {
+    AshValue m = ash_map_new(arena, ASH_TY_STRING);
+    CHECK(m.ty == ASH_TY_MAP && m.as.list.elem_ty == ASH_TY_STRING &&
+              m.as.list.len == 0,
+          "a fresh map is empty and carries its key tag");
+
+    /* Insert, then update in place: the pair count stays put and the key
+     * keeps its insertion slot. */
+    AshValue ka = str_val("ada");
+    AshValue kb = str_val("bob");
+    AshValue v36 = int_val(36);
+    CHECK(ash_map_set(arena, &m, &ka, &v36) == ASH_OK, "map set ada");
+    AshValue v40 = int_val(40);
+    CHECK(ash_map_set(arena, &m, &kb, &v40) == ASH_OK, "map set bob");
+    AshValue v37 = int_val(37);
+    CHECK(ash_map_set(arena, &m, &ka, &v37) == ASH_OK, "map update ada");
+    CHECK(m.as.list.len == 4, "two pairs after the update, len 4");
+
+    const AshValue* got = NULL;
+    CHECK(ash_map_get(&m, &ka, &got) == 1 && got && got->as.i == 37,
+          "get ada reads the updated value");
+    CHECK(ash_map_get(&m, &kb, &got) == 1 && got && got->as.i == 40,
+          "get bob hits");
+    AshValue kz = str_val("zed");
+    CHECK(ash_map_get(&m, &kz, &got) == 0, "get zed misses, never a fault");
+    AshValue ki = int_val(7);
+    CHECK(ash_map_get(&m, &ki, &got) == 0,
+          "a key of the wrong tag reads as a miss");
+    CHECK(ash_map_set(arena, &m, &ki, &v37) == ASH_ERR_TYPE,
+          "set with a key of the wrong tag is refused");
+
+    /* The set deep copied the host's key bytes. */
+    const AshValue* k0 = &((const AshValue*)m.as.list.data)[0];
+    CHECK(k0->as.s.ptr != ka.as.s.ptr, "the stored key owns its own bytes");
+
+    /* Deep copy shares nothing with its source and compares equal. */
+    AshValue copy;
+    CHECK(ash_value_deep_copy(dst_arena, &m, &copy) == ASH_OK,
+          "deep copy of a map");
+    CHECK(value_eq(&m, &copy), "map copy is structurally equal");
+    CHECK(ash_value_eq(&m, &copy), "the runtime eq agrees");
+    CHECK(copy.as.list.data != m.as.list.data,
+          "map copy owns its own pair array");
+    const AshValue* ck0 = &((const AshValue*)copy.as.list.data)[0];
+    CHECK(ck0->as.s.ptr != k0->as.s.ptr,
+          "map copy owns its own key bytes");
+
+    /* Insertion order is part of equality: the same pairs written in the
+     * other order read unequal. */
+    AshValue swapped = ash_map_new(arena, ASH_TY_STRING);
+    CHECK(ash_map_set(arena, &swapped, &kb, &v40) == ASH_OK, "swapped bob");
+    CHECK(ash_map_set(arena, &swapped, &ka, &v37) == ASH_OK, "swapped ada");
+    CHECK(!ash_value_eq(&m, &swapped),
+          "the same pairs in another insertion order read unequal");
+
+    /* The canonical render: pairs in insertion order, and {} when empty. */
+    check_render(&m, "{\"ada\": 37, \"bob\": 40}", "render a map");
+    AshValue empty = ash_map_new(arena, ASH_TY_STRING);
+    check_render(&empty, "{}", "render an empty map");
+
+    /* An Option nests as a map value: the box deep copies with the map. */
+    AshValue optmap = ash_map_new(arena, ASH_TY_STRING);
+    AshValue some;
+    memset(&some, 0, sizeof(some));
+    some.ty = ASH_TY_OPTION;
+    some.tag = 1;
+    some.as.box = ash_box(arena);
+    *(AshValue*)some.as.box = int_val(7);
+    AshValue kq = str_val("maybe");
+    CHECK(ash_map_set(arena, &optmap, &kq, &some) == ASH_OK,
+          "set a Some valued pair");
+    CHECK(ash_map_get(&optmap, &kq, &got) == 1 && got &&
+              got->ty == ASH_TY_OPTION && got->tag == 1 &&
+              got->as.box != some.as.box,
+          "the stored Some owns its own box");
+    AshValue optcopy;
+    CHECK(ash_value_deep_copy(dst_arena, &optmap, &optcopy) == ASH_OK,
+          "deep copy of an Option valued map");
+    CHECK(value_eq(&optmap, &optcopy), "Option valued map copy is equal");
+    check_render(&optmap, "{\"maybe\": Some(7)}",
+                 "render an Option valued map");
 }
 
 static void test_record_copy(AshContract* arena, AshContract* dst_arena) {
@@ -405,6 +486,7 @@ int main(void) {
     if (src && dst && cap) {
         test_list_of_tuples(src, dst);
         test_option_result_nesting(src, dst);
+        test_map(src, dst);
         test_record_copy(src, dst);
         test_sum_copy(src, dst);
         test_render(src);

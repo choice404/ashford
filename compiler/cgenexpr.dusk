@@ -13,10 +13,12 @@
 // ash_pledge_fulfill_sync with the callee's result deep copied home, and
 // instance.break() through ash_contract_break. An instance value is the
 // internal ASH_TY_INSTANCE handle in as.box, value semantics' one exception:
-// a let or a bind copies the handle, not the contract. What stays out, the
-// first class pledge value read off an instance and Map operations, is a
-// named build error through cg_unsupported, so no thunk ever ships C the
-// emitter was guessing at. The type questions were all settled by the
+// a let or a bind copies the handle, not the contract. Map operations lower
+// onto the runtime's map helpers: the constructor through ash_map_new and
+// the index read through ash_map_get, wrapped into the Option the checker
+// promised. What stays out, the first class pledge value read off an
+// instance, is a named build error through cg_unsupported, so no thunk ever
+// ships C the emitter was guessing at. The type questions were all settled by the
 // checker before codegen runs; the types read here pick union fields, never
 // report faults.
 
@@ -197,7 +199,8 @@ func gen_concat(g: *Cg, l: CVal, r: CVal) -> CVal {
 // struct assignment aliases them and a copy has to walk the whole shape.
 export func cg_is_composite(t: *TyArena, tyid: int64) -> bool {
     k: int64 = ty_get(t, tyid).kind
-    if k == tyk_named() || k == tyk_list() || k == tyk_tuple() { return true }
+    if k == tyk_named() || k == tyk_list() || k == tyk_map() { return true }
+    if k == tyk_tuple() { return true }
     return k == tyk_option() || k == tyk_result()
 }
 
@@ -512,14 +515,46 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
     return bad_val(g)
 }
 
+// A map index read: ash_map_get borrows the value slot on a hit, and the
+// result is Option<V>, Some around a deep copy of the slot so the Option owns
+// what it carries, None on a miss, never a fault.
+func gen_map_index(g: *Cg, base: CVal, e: ExprNode) -> CVal {
+    t: *TyArena = (*g).ty
+    n: TyNode = ty_get(t, base.ty)
+    key: CVal = gen_expr(g, e.b, n.a)
+    p: string = cg_tmp(g)
+    cg_line(g, tmsg3("const AshValue* ", p, " = NULL;"))
+    f: string = cg_tmp(g)
+    cg_line(g, tmsg7("int ", f, " = ash_map_get(&", base.cvar, ", &", key.cvar, tmsg3(", &", p, ");")))
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_OPTION")
+    cg_line(g, tmsg3("if (", f, ") {"))
+    (*g).indent = (*g).indent + 1
+    b: string = cg_tmp(g)
+    cg_line(g, tmsg3("AshValue* ", b, " = ash_box(cc);"))
+    cg_line(g, tmsg3("if (!", b, ") return ASH_ERR_OOM;"))
+    st: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, ", p, ", ", b, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg3(v, ".tag = 1;", ""))
+    cg_line(g, tmsg5(v, ".as.box = ", b, ";", ""))
+    (*g).indent = (*g).indent - 1
+    cg_line(g, "}")
+    return CVal { cvar: v, ty: ty_option(t, n.b) }
+}
+
 // A list index read, bounds checked through ash_list_get: an index outside
 // the list, negative included through the unsigned cast, is a clean
-// ASH_ERR_TYPE from the pledge.
+// ASH_ERR_TYPE from the pledge. A map index read routes to gen_map_index,
+// the type driving the split the way the checker settled it.
 func gen_index(g: *Cg, e: ExprNode) -> CVal {
     t: *TyArena = (*g).ty
     base: CVal = gen_expr(g, e.a, -1)
-    idx: CVal = gen_expr(g, e.b, ty_int(t))
     n: TyNode = ty_get(t, base.ty)
+    if n.kind == tyk_map() {
+        return gen_map_index(g, base, e)
+    }
+    idx: CVal = gen_expr(g, e.b, ty_int(t))
     if n.kind != tyk_list() {
         cg_unsupported(g, e.lo, e.hi, "indexing this type in a pledge body")
         return bad_val(g)
@@ -809,6 +844,15 @@ export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
     if e.kind == xk_ok() { return gen_ok_err(g, e, want, true) }
     if e.kind == xk_err() { return gen_ok_err(g, e, want, false) }
     if e.kind == xk_mut() { return gen_expr(g, e.a, want) }
+    if e.kind == xk_map_new() {
+        // Map<K, V>(): an empty map value carrying its key tag. Nothing is
+        // allocated, so the helper returns the value directly.
+        mt: int64 = lower_type((*g).sigs, e.a, e.lo, e.hi)
+        mn: TyNode = ty_get(t, mt)
+        mv: string = cg_tmp(g)
+        cg_line(g, tmsg7("AshValue ", mv, " = ash_map_new(cc, ", cg_tag_of(g, mn.a), ");", "", ""))
+        return CVal { cvar: mv, ty: mt }
+    }
     if e.kind == xk_call() { return gen_call(g, e) }
     if e.kind == xk_member() { return gen_member(g, e) }
     if e.kind == xk_index() { return gen_index(g, e) }

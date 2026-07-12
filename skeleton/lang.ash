@@ -1,15 +1,26 @@
 // The language gauntlet: one contract whose pledge bodies walk every
 // construct the code generator lowers. Loops with break and continue,
 // assignment to locals, record fields, and list elements, list, tuple, and
-// record literals, sum construction and matching with payload bindings,
-// Option and Result matching, the propagation operator, deep equality, and
-// the Byte, UInt, and Char literal forms. tests/runtime/test_lang.c drives
-// every pledge from C and asserts each path, the out of bounds index
-// included, which returns ASH_ERR_TYPE from the thunk by the ABI's rule.
+// record literals, map construction, reads, and writes, sum construction and
+// matching with payload bindings, Option and Result matching, the
+// propagation operator, deep equality, and the Byte, UInt, and Char literal
+// forms. tests/runtime/test_lang.c drives every pledge from C and asserts
+// each path, the out of bounds index included, which returns ASH_ERR_TYPE
+// from the thunk by the ABI's rule.
 
 record Point {
     x: Int
     y: Int
+}
+
+record Tally {
+    label: String
+    counts: Map<String, Int>
+}
+
+record Board {
+    label: String
+    rows: List<Int>
 }
 
 Grade is either Pass(score: Int) or Fail(reason: String) or Skip
@@ -203,6 +214,142 @@ contract LangGauntlet {
         row[0] = 99
         let check = outer[0]
         return Ok(check[0] * 100 + row[0])
+    }
+
+    // Map basics: build from the constructor, update an existing key in
+    // place, and read through the Option an index yields, hit and miss both.
+    pledge map_probe(k: String) -> Result<Int, Int> {
+        let mut ages = Map<String, Int>()
+        ages["ada"] = 36
+        ages["bob"] = 40
+        ages["ada"] = 37
+        match ages[k] {
+            Some(v) -> {
+                return Ok(v)
+            }
+            None -> {
+                return Err(404)
+            }
+        }
+        return Err(9)
+    }
+
+    // Value semantics on a map: the bound copy takes the write and the
+    // source keeps what it held, the same promise lists and records make.
+    pledge map_copy() -> Result<Int, Int> {
+        let mut a = Map<String, Int>()
+        a["x"] = 1
+        let mut b = a
+        b["x"] = 99
+        match a["x"] {
+            Some(x) -> {
+                match b["x"] {
+                    Some(y) -> {
+                        return Ok(x * 100 + y)
+                    }
+                    None -> {
+                        return Err(2)
+                    }
+                }
+            }
+            None -> {
+                return Err(1)
+            }
+        }
+        return Err(9)
+    }
+
+    // A map inside a record: a field slot carries any composite, so the map
+    // rides one and lifts out as its own copy on the read.
+    pledge tally_count(k: String) -> Result<Int, Int> {
+        let mut m = Map<String, Int>()
+        m["a"] = 5
+        m["b"] = 6
+        let t = Tally { label: "t", counts: m }
+        let c = t.counts
+        match c[k] {
+            Some(v) -> {
+                return Ok(v)
+            }
+            None -> {
+                return Err(404)
+            }
+        }
+        return Err(9)
+    }
+
+    // An Int keyed map, another member of the keyable set.
+    pledge map_int(k: Int) -> Result<String, Int> {
+        let mut names = Map<Int, String>()
+        names[1] = "one"
+        names[2] = "two"
+        match names[k] {
+            Some(s) -> {
+                return Ok(s)
+            }
+            None -> {
+                return Err(0)
+            }
+        }
+        return Err(9)
+    }
+
+    // A map crossing the boundary in an Ok box, insertion order preserved:
+    // the host reads ada before bob because ada was written first, and the
+    // update to ada moved its value, not its position.
+    pledge snapshot() -> Result<Map<String, Int>, Int> {
+        let mut m = Map<String, Int>()
+        m["ada"] = 1
+        m["bob"] = 2
+        m["ada"] = 3
+        return Ok(m)
+    }
+
+    // The nested lvalue chain: assignment resolves its target in place, so
+    // a write through record.list[i] lands in the record's own storage and
+    // the read right after sees it. An out of range i keeps the standing
+    // ASH_ERR_TYPE rule through the chain.
+    pledge board_write(i: Int) -> Result<Int, Int> {
+        let mut b = Board { label: "b", rows: [1, 2, 3] }
+        b.rows[i] = 99
+        return Ok(b.rows[i])
+    }
+
+    // record.map[k] in lvalue position: insert and update land in the
+    // field's own map, and reads through the same chain see them.
+    pledge tally_write(k: String) -> Result<Int, Int> {
+        let mut t = Tally { label: "t", counts: Map<String, Int>() }
+        t.counts["a"] = 1
+        t.counts["a"] = 2
+        t.counts["b"] = 5
+        match t.counts[k] {
+            Some(v) -> {
+                return Ok(v)
+            }
+            None -> {
+                return Err(404)
+            }
+        }
+        return Err(9)
+    }
+
+    // The deep chain: a map value holding a record holding a list, written
+    // through the whole chain in place. A mid-chain map miss in lvalue
+    // position is the ASH_ERR_TYPE fault, since an lvalue has no Option to
+    // hang a None on.
+    pledge deep_write(k: String) -> Result<Int, Int> {
+        let mut m = Map<String, Board>()
+        m["b"] = Board { label: "b", rows: [1, 2, 3] }
+        m[k].rows[1] = 42
+        match m["b"] {
+            Some(b) -> {
+                return Ok(b.rows[1])
+            }
+            None -> {
+                return Err(1)
+            }
+        }
+        return Err(9)
     }
 
     // Clauses: contract private helpers the pledges below reach by bare

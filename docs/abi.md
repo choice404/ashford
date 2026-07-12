@@ -67,11 +67,13 @@ An Option or Result payload rides in `as.box` as a pointer to a single `AshValue
 
 A list carries its elements as a contiguous `AshValue` array behind `as.list.data`, `len` of them live, `cap` allocated, `elem_ty` the declared element tag. A tuple rides the same union arm: the data pointer is the `AshValue` array, `len` is the arity, `cap` equals `len`, and `elem_ty` is 0 because a tuple's elements need not agree.
 
-A record rides the list arm too: `ASH_TY_RECORD`, the data pointer an `AshValue` array holding the fields in declaration order, `len` the field count, `cap` equal to `len`, `elem_ty` 0. A sum variant's payload is the same shape, `ASH_TY_SUM` with the variant's fields in declaration order behind the data pointer; a variant with no payload carries an empty arm, data NULL and `len` 0. Field access in compiled code is a slot read by declaration index, so the order is normative. Maps have no settled runtime representation yet; a deep copy that meets one reports `ASH_ERR_TYPE` rather than freeze a representation by accident.
+A record rides the list arm too: `ASH_TY_RECORD`, the data pointer an `AshValue` array holding the fields in declaration order, `len` the field count, `cap` equal to `len`, `elem_ty` 0. A sum variant's payload is the same shape, `ASH_TY_SUM` with the variant's fields in declaration order behind the data pointer; a variant with no payload carries an empty arm, data NULL and `len` 0. Field access in compiled code is a slot read by declaration index, so the order is normative.
+
+**The map representation.** A map, `ASH_TY_MAP`, rides the list arm as well, and this layout is canonical: the data pointer holds interleaved key, value pairs in insertion order, the key of pair i at slot 2i and its value at slot 2i+1, `len` counts slots so it is always twice the pair count, `cap` is allocated slots, and `elem_ty` is the key's tag alone, one of the keyable scalars `Int`, `UInt`, `Bool`, `Byte`, `Char`, `String`. The value type is the checker's knowledge; the runtime never records or checks it. Insertion order is normative: it is the order any serialization sees, the order equality compares, and updating an existing key replaces its value without moving its pair. Lookup and insert scan the keys linearly through `ash_value_eq`, O(n) in the pair count, the v1 tradeoff that keeps the representation one union arm deep.
 
 **The internal instance tag.** `ASH_TY_INSTANCE`, the tag after `ASH_TY_SUM`, is internal to compiled modules and never crosses the ABI. It is the signed instance handle a cross-contract `Contract.sign(...)` returns inside a pledge body: `as.box` holds the `AshContract*`. The language already rejects a contract type at every boundary position, pledge parameters and returns, vows, record and variant fields, and provisional clause signatures, so no thunk frame, vow storage, or descriptor value ever carries this tag, and a foreign host never meets it. Its helper arms are the reference-handle semantics the language pins: `ash_value_deep_copy` copies the handle, not the contract, the one deliberate exception to value semantics, and `ash_value_eq` is handle identity. The debug renderer spells it `<instance>`.
 
-The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_list_set`, `ash_tuple_new`, `ash_value_eq`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list, tuple, record, and sum elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own. `ash_value_eq` is the structural equality the language's `==` lowers onto for the deep shapes: type tags first, the sum shaped `tag` next, then elements recursively, with a Map or any other unsettled arm reading unequal.
+The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_list_set`, `ash_map_new`, `ash_map_set`, `ash_map_get`, `ash_tuple_new`, `ash_value_eq`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list, map, tuple, record, and sum elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own. `ash_value_eq` is the structural equality the language's `==` lowers onto for the deep shapes: type tags first, the sum shaped `tag` next, then elements recursively. Two maps compare pair by pair in insertion order, keys and values both, so the same pairs written in another order read unequal, which keeps the answer deterministic and matches what serialization sees.
 
 The value and allocation helpers cross the boundary with these shapes, every allocating one hanging its memory off the instance it was handed:
 
@@ -86,6 +88,11 @@ AshStatus ash_list_new(AshContract* c, uint32_t elem_ty, uint64_t cap,
 AshStatus ash_list_push(AshContract* c, AshValue* list, const AshValue* elem);
 const AshValue* ash_list_get(const AshValue* v, uint64_t idx);
 AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem);
+AshValue  ash_map_new(AshContract* c, uint32_t key_ty);
+AshStatus ash_map_set(AshContract* c, AshValue* m, const AshValue* k,
+                      const AshValue* v);
+int       ash_map_get(const AshValue* m, const AshValue* k,
+                      const AshValue** out);
 AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out);
 int       ash_value_eq(const AshValue* a, const AshValue* b);
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
@@ -94,6 +101,8 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
 
 **Indexing out of bounds.** Compiled code bounds checks every list element read and write, reads through `ash_list_get` and writes through `ash_list_set`. An index outside the list, a negative one included through the unsigned cast, makes the pledge return `ASH_ERR_TYPE` from its thunk: the status reports the fulfillment never produced a value, no latch moves, and host memory is never touched. This rule is normative for every compiled module.
 
+**Indexing a map.** A map read is never a fault: compiled code lowers `m[k]` onto `ash_map_get` and wraps the answer in the `Option` the language promises, `Some` around an instance owned deep copy of the value on a hit, `None` on a miss. `m[k] = v` lowers onto `ash_map_set`, which deep copies the key and the value onto the instance before committing, replaces in place when the key exists, and appends in insertion order when it does not. `ash_map_new` builds the empty map; it allocates nothing, so it returns the value directly. `ash_map_get` hands back a borrow into the map's own pair storage, which a later `ash_map_set` on the same map may move, so a host copies it out before the next write.
+
 **The debug renderer.** The runtime renders any supported value into its canonical debug spelling, the text a standalone executable prints for a `Main.run` error and a convenience for any host that wants a value it can log:
 
 ```c
@@ -101,7 +110,7 @@ AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
                            size_t* need);
 ```
 
-The spelling: `Int`, `UInt`, and `Float` as C would print them, `Bool` as `true` or `false`, `Byte` as its decimal value, `Char` as `U+0041`, `Unit` as `()`, strings quoted with `"` and `\` escaped and control bytes as `\xNN`, lists as `[a, b]`, tuples as `(a, b)`, records as `{a, b}` with the fields in declaration order, a sum as `#tag` with its payload in parens when it carries one, and `None`, `Some(v)`, `Ok(v)`, `Err(v)` through their boxes. Nesting deeper than eight levels renders as `...`, so a cyclic or absurd value cannot run the renderer away. Maps have no settled representation and render as `<map>`. The size protocol is `ash_iname_dump`'s: `*need` receives the full size including the terminating NUL, a `cap` at least that writes the text and returns `ASH_OK`, anything smaller writes nothing and returns `ASH_ERR_OOM`, so a NULL `buf` with `cap` 0 sizes the buffer.
+The spelling: `Int`, `UInt`, and `Float` as C would print them, `Bool` as `true` or `false`, `Byte` as its decimal value, `Char` as `U+0041`, `Unit` as `()`, strings quoted with `"` and `\` escaped and control bytes as `\xNN`, lists as `[a, b]`, tuples as `(a, b)`, records as `{a, b}` with the fields in declaration order, a sum as `#tag` with its payload in parens when it carries one, and `None`, `Some(v)`, `Ok(v)`, `Err(v)` through their boxes. A map renders as `{k: v, ...}` with its pairs in insertion order, the only order a map has, and an empty map as `{}`. Nesting deeper than eight levels renders as `...`, so a cyclic or absurd value cannot run the renderer away. The size protocol is `ash_iname_dump`'s: `*need` receives the full size including the terminating NUL, a `cap` at least that writes the text and returns `ASH_OK`, anything smaller writes nothing and returns `ASH_ERR_OOM`, so a NULL `buf` with `cap` 0 sizes the buffer.
 
 ## The thunk frame
 

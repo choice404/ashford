@@ -200,23 +200,29 @@ func infer_question(tc: *Tc, e: ExprNode) -> int64 {
     return ty_unknown(t)
 }
 
+// Indexing: a List takes an Int and yields its element; a Map takes its key
+// type and yields Option of its value type, None on a miss, so a miss is a
+// value and never a fault.
 func infer_index(tc: *Tc, e: ExprNode) -> int64 {
     t: *TyArena = (*tc).ty
     bt: int64 = infer_expr(tc, e.a, -1)
-    it: int64 = infer_expr(tc, e.b, ty_int(t))
     n: TyNode = ty_get(t, bt)
+    if n.kind == tyk_map() {
+        kt: int64 = infer_expr(tc, e.b, n.a)
+        if !compat(t, n.a, kt) {
+            tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "this map is keyed by ", n.a, ", got ", kt))
+        }
+        return ty_option(t, n.b)
+    }
+    it: int64 = infer_expr(tc, e.b, ty_int(t))
     if n.kind == tyk_list() {
         if !compat(t, it, ty_int(t)) {
             tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "a list index must be ", ty_int(t), ", got ", it))
         }
         return n.a
     }
-    if n.kind == tyk_map() {
-        tc_emit(tc, e.lo, e.hi, "not yet supported: indexing a Map")
-        return n.b
-    }
     if n.kind == tyk_unknown() { return ty_unknown(t) }
-    tc_emit(tc, e.lo, e.hi, tmsg3("cannot index a value of type '", ty_render(t, bt), "'; only a List is indexed"))
+    tc_emit(tc, e.lo, e.hi, tmsg3("cannot index a value of type '", ty_render(t, bt), "'; only a List or a Map is indexed"))
     return ty_unknown(t)
 }
 
@@ -423,5 +429,10 @@ export func infer_expr(tc: *Tc, id: int64, want: int64) -> int64 {
     if e.kind == xk_ok() { return infer_ok_err(tc, e, want, true) }
     if e.kind == xk_err() { return infer_ok_err(tc, e, want, false) }
     if e.kind == xk_mut() { return infer_expr(tc, e.a, want) }
+    if e.kind == xk_map_new() {
+        // Map<K, V>(): the type arguments lower like any annotation, which
+        // is where the arity and the keyable key rule are enforced.
+        return lower_type((*tc).sigs, e.a, e.lo, e.hi)
+    }
     return ty_unknown(t)
 }

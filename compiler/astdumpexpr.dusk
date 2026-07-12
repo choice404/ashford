@@ -301,6 +301,12 @@ export func render_expr(out: *StringBuilder, a: *Ast, id: int64, level: int64) -
         close_wrap(out, level)
         return
     }
+    if k == xk_map_new() {
+        open_wrap(out, "MapNew", level)
+        render_type(out, a, e.a, level + 1)
+        close_wrap(out, level)
+        return
+    }
     open_wrap(out, "Mut", level)
     render_expr(out, a, e.a, level + 1)
     close_wrap(out, level)

@@ -84,9 +84,115 @@ func check_let(tc: *Tc, s: StmtNode) -> void {
     declare(tc, s.a, bound, s.d == 1)
 }
 
+// The type an lvalue chain resolves to, walked in assignment position. The
+// one place this differs from the value read is a map index: reading m[k]
+// yields Option<V>, but writing through m[k] targets the value V itself, a
+// mid-chain miss becoming the runtime fault ASH_ERR_TYPE since an lvalue
+// has no Option to hang a None on. Record fields and list elements type
+// exactly as their reads do.
+func lvalue_type(tc: *Tc, eid: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    e: ExprNode = vec_get((*a).exprs, eid)
+    if e.kind == xk_index() {
+        bt: int64 = lvalue_type(tc, e.a)
+        n: TyNode = ty_get(t, bt)
+        if n.kind == tyk_map() {
+            kt: int64 = infer_expr(tc, e.b, n.a)
+            if !compat(t, n.a, kt) {
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "this map is keyed by ", n.a, ", got ", kt))
+            }
+            return n.b
+        }
+        it: int64 = infer_expr(tc, e.b, ty_int(t))
+        if n.kind == tyk_list() {
+            if !compat(t, it, ty_int(t)) {
+                tc_emit(tc, e.lo, e.hi, tmsg_types(tc, "a list index must be ", ty_int(t), ", got ", it))
+            }
+            return n.a
+        }
+        if n.kind == tyk_unknown() { return ty_unknown(t) }
+        tc_emit(tc, e.lo, e.hi, tmsg3("cannot assign through an index on '", ty_render(t, bt), "'; only a List or a Map is indexed"))
+        return ty_unknown(t)
+    }
+    if e.kind == xk_member() {
+        bt2: int64 = lvalue_type(tc, e.a)
+        n2: TyNode = ty_get(t, bt2)
+        if n2.kind == tyk_named() {
+            tname: string = ty_name_of(t, bt2)
+            tid: int64 = ast_intern(a, tname)
+            g: GEntry = rs_global((*tc).res, tid)
+            if g.kind == gk_record() {
+                rs: RecSig = sig_rec((*tc).sigs, tid)
+                mut j: int64 = 0
+                while j < rs.len {
+                    f: FieldSig = sig_field((*tc).sigs, rs.off, j)
+                    if f.name == e.b { return f.ty }
+                    j = j + 1
+                }
+                tc_emit(tc, e.lo, e.hi, tmsg5("'", tname, "' has no field '", ast_name(a, e.b), "'"))
+                return ty_unknown(t)
+            }
+        }
+        if n2.kind == tyk_unknown() { return ty_unknown(t) }
+        tc_emit(tc, e.lo, e.hi, tmsg3("cannot assign through a member of type '", ty_render(t, bt2), "'"))
+        return ty_unknown(t)
+    }
+    // The root of the chain: a binding or a vow, the value read's business.
+    return infer_expr(tc, eid, -1)
+}
+
 func check_assign(tc: *Tc, s: StmtNode) -> void {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
+    le: ExprNode = vec_get((*a).exprs, s.a)
+    // An index target walks its base as an lvalue, so the container may sit
+    // at the end of any chain of fields and elements. On a Map the statement
+    // is the insert-or-update form: the target type is the value type V,
+    // not the Option<V> a read yields.
+    if le.kind == xk_index() {
+        bt: int64 = lvalue_type(tc, le.a)
+        bn: TyNode = ty_get(t, bt)
+        check_assignable(tc, s.a)
+        if bn.kind == tyk_map() {
+            kt: int64 = infer_expr(tc, le.b, bn.a)
+            if !compat(t, bn.a, kt) {
+                tc_emit(tc, le.lo, le.hi, tmsg_types(tc, "this map is keyed by ", bn.a, ", got ", kt))
+            }
+            rt0: int64 = infer_expr(tc, s.b, bn.b)
+            if !compat(t, bn.b, rt0) {
+                re0: ExprNode = vec_get((*a).exprs, s.b)
+                tc_emit(tc, re0.lo, re0.hi, tmsg_types(tc, "this map holds values of type ", bn.b, " but the value has type ", rt0))
+            }
+            return
+        }
+        it: int64 = infer_expr(tc, le.b, ty_int(t))
+        mut lte: int64 = ty_unknown(t)
+        if bn.kind == tyk_list() {
+            if !compat(t, it, ty_int(t)) {
+                tc_emit(tc, le.lo, le.hi, tmsg_types(tc, "a list index must be ", ty_int(t), ", got ", it))
+            }
+            lte = bn.a
+        } else if bn.kind != tyk_unknown() {
+            tc_emit(tc, le.lo, le.hi, tmsg3("cannot assign through an index on '", ty_render(t, bt), "'; only a List or a Map is indexed"))
+        }
+        rte: int64 = infer_expr(tc, s.b, lte)
+        if !compat(t, lte, rte) {
+            ree: ExprNode = vec_get((*a).exprs, s.b)
+            tc_emit(tc, ree.lo, ree.hi, tmsg_types(tc, "the assignment target has type ", lte, " but the value has type ", rte))
+        }
+        return
+    }
+    if le.kind == xk_member() {
+        lt2: int64 = lvalue_type(tc, s.a)
+        check_assignable(tc, s.a)
+        rt2: int64 = infer_expr(tc, s.b, lt2)
+        if !compat(t, lt2, rt2) {
+            re2: ExprNode = vec_get((*a).exprs, s.b)
+            tc_emit(tc, re2.lo, re2.hi, tmsg_types(tc, "the assignment target has type ", lt2, " but the value has type ", rt2))
+        }
+        return
+    }
     lt: int64 = infer_expr(tc, s.a, -1)
     check_assignable(tc, s.a)
     rt: int64 = infer_expr(tc, s.b, lt)

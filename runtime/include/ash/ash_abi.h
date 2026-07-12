@@ -69,7 +69,16 @@ typedef struct AshList {
  * in declaration order, len is the field count, cap equals len, elem_ty is 0.
  * A declared sum is ASH_TY_SUM: tag is the variant's declaration index, and
  * the list arm carries the variant's payload fields in declaration order, an
- * empty arm, data NULL and len 0, for a variant with no payload. */
+ * empty arm, data NULL and len 0, for a variant with no payload.
+ *
+ * A map, ASH_TY_MAP, rides the list arm as well, and this is its canonical
+ * repr: data holds interleaved key, value pairs in insertion order, the key
+ * of pair i at slot 2i and its value at 2i+1, len counts slots so it is
+ * always twice the pair count, cap is allocated slots, and elem_ty is the
+ * key's tag alone, one of the keyable scalars Int, UInt, Bool, Byte, Char,
+ * String; the value type is enforced by the checker and never recorded here.
+ * Insertion order is normative: it is the order serialization sees and the
+ * order equality compares. */
 
 /* The one value shape. ty picks the union arm. tag carries the variant for
  * the sum shaped types: Option 0 None 1 Some, Result 0 Ok 1 Err, the

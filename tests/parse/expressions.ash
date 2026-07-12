@@ -1,8 +1,9 @@
 // The expression ladder end to end: every binary level and its
 // associativity, unary operators, the postfix set with propagation, tuple
-// and list literals, constructors, record literals, mut(), labeled call
-// arguments, keyword member names, and an argument list wrapped across
-// lines, which the grouping rule must keep as one statement.
+// and list literals, constructors, the map constructor with its spelled
+// type arguments, record literals, mut(), labeled call arguments, keyword
+// member names, and an argument list wrapped across lines, which the
+// grouping rule must keep as one statement.
 
 contract Calc {
     pledge run(args: List<String>) -> Result<Int, MathError> {
@@ -14,6 +15,9 @@ contract Calc {
         let t = (1, "two", 3.5)
         let l = [1, 2, 3]
         let empty = []
+        let ages = Map<String, Int>()
+        ages["ada"] = 36
+        let hit = ages["ada"]
         let m = mut(a)
         let q = Some(a + 1)
         let r = None

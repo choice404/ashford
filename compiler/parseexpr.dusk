@@ -387,6 +387,18 @@ func parse_ident_primary(p: *Parser, t: Token) -> int64 {
         p_bump(p)
         return ast_expr(p_ast(p), xk_none(), t.lo, t.hi, 0, 0, 0, 0)
     }
+    // The map constructor, Map<K, V>(): the one place type arguments open an
+    // expression. Map is a builtin composite name, so 'Map' followed by '<'
+    // can only be this form; the type grammar eats the arguments and the
+    // empty parentheses close the constructor.
+    if str_eq_range((*p).src, t.lo, t.hi, "Map") {
+        if p_kind2(p) == k_lt() {
+            mty: int64 = parse_type(p)
+            p_expect(p, k_lparen(), "'(' after the Map constructor type")
+            p_expect(p, k_rparen(), "')'; a Map starts empty, its constructor takes no arguments")
+            return ast_expr(p_ast(p), xk_map_new(), t.lo, p_prev_hi(p), mty, 0, 0, 0)
+        }
+    }
     name: int64 = intern_range((*p_ast(p)).interner, (*p).src, (*p).n, t.lo, t.hi)
     p_bump(p)
     if p_at(p, k_lbrace()) {

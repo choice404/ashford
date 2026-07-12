@@ -3,8 +3,9 @@
 // the emitter, so an ashford binding lives exactly as long as the C variable
 // that carries it. The statement set is the whole grammar now: let with a
 // fresh copy per binding so a later assignment never writes through an
-// aliased name, assignment to a mut local, a record field slot, or a bounds
-// checked list slot, if with else, while and for lowered onto real C loops so
+// aliased name, assignment through the in-place lvalue walk, a mut local, a
+// record field slot, a bounds checked list slot, or a map entry, chained to
+// any depth, if with else, while and for lowered onto real C loops so
 // break and continue map one to one, and return, which writes the pledge's
 // value through the thunk's out parameter and reports ASH_OK, the one exit
 // convention every thunk shares.
@@ -68,57 +69,122 @@ func gen_if(g: *Cg, s: StmtNode) -> void {
     cg_line(g, "}")
 }
 
-// Assignment. The target is a mut local, a record field of one, or a list
-// element of one, the exact lvalue set the checker admitted. A field write
-// lands in the record's slot array in place; a list write goes through
-// ash_list_set, whose bounds check turns a bad index into ASH_ERR_TYPE from
-// the pledge.
+// The resolved storage slot of an lvalue chain: a C AshValue* aimed at the
+// exact memory the assignment writes.
+struct LSlot { pvar: string, ty: int64, ok: bool }
+
+func bad_slot() -> LSlot {
+    return LSlot { pvar: "bad", ty: -1, ok: false }
+}
+
+// The lvalue walk. An assignment target resolves in place, pointer by
+// pointer down the chain, never through the copy-on-read path an rvalue
+// takes: the root is the address of the binding's own C variable, a record
+// field is the address of its slot in the live field array, a list element
+// is its bounds checked address through ash_list_get, out of range being the
+// standing ASH_ERR_TYPE fault, and a mid-chain map index is the borrowed
+// value slot through ash_map_get, a miss being ASH_ERR_TYPE too, since an
+// lvalue has no Option to hang a None on. The borrowed pointers stay valid
+// through the statement: nothing between the walk and the final write can
+// insert into a walked container, because the right hand side sees only
+// copies, so no realloc moves the slot out from under the write.
+func gen_lvalue(g: *Cg, eid: int64) -> LSlot {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    e: ExprNode = vec_get((*a).exprs, eid)
+    if e.kind == xk_ident() {
+        bind: CBind = cg_lookup(g, e.a)
+        if bind.found {
+            p: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshValue* ", p, " = &", bind.cvar, ";", "", ""))
+            return LSlot { pvar: p, ty: bind.ty, ok: true }
+        }
+        cg_unsupported(g, e.lo, e.hi, tmsg3("assignment to '", ast_name(a, e.a), "' in a pledge body"))
+        return bad_slot()
+    }
+    if e.kind == xk_member() {
+        base: LSlot = gen_lvalue(g, e.a)
+        if !base.ok { return bad_slot() }
+        cn: CNamed = cg_named(g, base.ty)
+        if cn.kind == gk_record() {
+            cf: CField = cg_rec_field(g, cn.name, e.b)
+            if cf.found {
+                p2: string = cg_tmp(g)
+                cg_line(g, tmsg7("AshValue* ", p2, " = ((AshValue*)", base.pvar, "->as.list.data) + ", int_to_string(cf.idx), ";"))
+                return LSlot { pvar: p2, ty: cf.ty, ok: true }
+            }
+        }
+        cg_unsupported(g, e.lo, e.hi, "assignment to this field in a pledge body")
+        return bad_slot()
+    }
+    if e.kind == xk_index() {
+        base2: LSlot = gen_lvalue(g, e.a)
+        if !base2.ok { return bad_slot() }
+        n: TyNode = ty_get(t, base2.ty)
+        if n.kind == tyk_list() {
+            idx: CVal = gen_expr(g, e.b, ty_int(t))
+            p3: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshValue* ", p3, " = (AshValue*)ash_list_get(", base2.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+            cg_line(g, tmsg3("if (!", p3, ") return ASH_ERR_TYPE;"))
+            return LSlot { pvar: p3, ty: n.a, ok: true }
+        }
+        if n.kind == tyk_map() {
+            key: CVal = gen_expr(g, e.b, n.a)
+            q: string = cg_tmp(g)
+            cg_line(g, tmsg3("const AshValue* ", q, " = NULL;"))
+            f: string = cg_tmp(g)
+            cg_line(g, tmsg7("if (!ash_map_get(", base2.pvar, ", &", key.cvar, ", &", q, ")) return ASH_ERR_TYPE;"))
+            cg_line(g, tmsg7("AshValue* ", f, " = (AshValue*)", q, ";", "", ""))
+            return LSlot { pvar: f, ty: n.b, ok: true }
+        }
+        cg_unsupported(g, e.lo, e.hi, "assignment through this index in a pledge body")
+        return bad_slot()
+    }
+    cg_unsupported(g, e.lo, e.hi, "assignment to this expression in a pledge body")
+    return bad_slot()
+}
+
+// Assignment. The target resolves through the lvalue walk above to the slot
+// it names, however deep the chain of fields and elements runs, and the
+// value lands there in place. The one form that writes no single slot is a
+// final map index, m[k] = v at the end of any chain, which is the insert-or-
+// update onto the map ash_map_set carries out, deep copying both halves
+// onto the instance itself, so no copy-out rides in front of it. Every other
+// target takes a deep copied value, the same isolation a let makes.
 func gen_assign(g: *Cg, s: StmtNode) -> void {
     a: *Ast = (*g).ast
     t: *TyArena = (*g).ty
     lv: ExprNode = vec_get((*a).exprs, s.a)
-    if lv.kind == xk_ident() {
-        bind: CBind = cg_lookup(g, lv.a)
-        if bind.found {
-            v: CVal = gen_expr(g, s.b, bind.ty)
-            cv: CVal = cg_copy_out(g, v)
-            cg_line(g, tmsg5(bind.cvar, " = ", cv.cvar, ";", ""))
+    if lv.kind == xk_index() {
+        base: LSlot = gen_lvalue(g, lv.a)
+        if !base.ok { return }
+        n: TyNode = ty_get(t, base.ty)
+        if n.kind == tyk_map() {
+            key: CVal = gen_expr(g, lv.b, n.a)
+            mv: CVal = gen_expr(g, s.b, n.b)
+            stm: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshStatus ", stm, " = ash_map_set(cc, ", base.pvar, ", &", key.cvar, tmsg3(", &", mv.cvar, ");")))
+            cg_line(g, tmsg5("if (", stm, " != ASH_OK) return ", stm, ";"))
             return
         }
-        cg_unsupported(g, lv.lo, lv.hi, tmsg3("assignment to '", ast_name(a, lv.a), "' in a pledge body"))
-        return
-    }
-    if lv.kind == xk_member() {
-        base: CVal = gen_expr(g, lv.a, -1)
-        cn: CNamed = cg_named(g, base.ty)
-        if cn.kind == gk_record() {
-            cf: CField = cg_rec_field(g, cn.name, lv.b)
-            if cf.found {
-                v2: CVal = gen_expr(g, s.b, cf.ty)
-                cv2: CVal = cg_copy_out(g, v2)
-                cg_line(g, tmsg7("((AshValue*)", base.cvar, ".as.list.data)[", int_to_string(cf.idx), "] = ", tmsg2(cv2.cvar, ";"), ""))
-                return
-            }
-        }
-        cg_unsupported(g, lv.lo, lv.hi, "assignment to this field in a pledge body")
-        return
-    }
-    if lv.kind == xk_index() {
-        base2: CVal = gen_expr(g, lv.a, -1)
-        idx: CVal = gen_expr(g, lv.b, ty_int(t))
-        n: TyNode = ty_get(t, base2.ty)
         if n.kind == tyk_list() {
+            idx: CVal = gen_expr(g, lv.b, ty_int(t))
+            p: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshValue* ", p, " = (AshValue*)ash_list_get(", base.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+            cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_TYPE;"))
             v3: CVal = gen_expr(g, s.b, n.a)
             cv3: CVal = cg_copy_out(g, v3)
-            st: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshStatus ", st, " = ash_list_set(&", base2.cvar, ", (uint64_t)", idx.cvar, tmsg3(".as.i, &", cv3.cvar, ");")))
-            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            cg_line(g, tmsg5("*", p, " = ", cv3.cvar, ";"))
             return
         }
         cg_unsupported(g, lv.lo, lv.hi, "assignment through this index in a pledge body")
         return
     }
-    cg_unsupported(g, lv.lo, lv.hi, "assignment to this expression in a pledge body")
+    slot: LSlot = gen_lvalue(g, s.a)
+    if !slot.ok { return }
+    v: CVal = gen_expr(g, s.b, slot.ty)
+    cv: CVal = cg_copy_out(g, v)
+    cg_line(g, tmsg5("*", slot.pvar, " = ", cv.cvar, ";"))
 }
 
 // while lowers onto an unconditional C loop with the condition re-evaluated

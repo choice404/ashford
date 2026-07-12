@@ -303,28 +303,57 @@ const AshValue* ash_list_get(const AshValue* v, uint64_t idx);
 AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem);
 
 /* Structural equality over two values; 1 or 0. Scalars compare by value,
- * strings by bytes, list, tuple, record, and sum element by element with the
- * sum shaped tags compared first, Option and Result through their boxes. A
- * type tag mismatch or an unsupported arm, Map today, reads unequal. */
+ * strings by bytes, list, map, tuple, record, and sum element by element with
+ * the sum shaped tags compared first, Option and Result through their boxes.
+ * A map compares its pairs in insertion order, keys and values both, the
+ * order semantics the language pins, so two maps holding the same pairs in a
+ * different insertion order read unequal. A type tag mismatch or an
+ * unsupported arm reads unequal. */
 int ash_value_eq(const AshValue* a, const AshValue* b);
+
+/* ---- maps ---- */
+
+/* An empty instance owned map whose keys carry key_ty, one of the keyable
+ * tags: ASH_TY_INT, ASH_TY_UINT, ASH_TY_BOOL, ASH_TY_BYTE, ASH_TY_CHAR, or
+ * ASH_TY_STRING. The value type is the checker's business alone; the runtime
+ * never records it. An empty map allocates nothing, so the call cannot fail.
+ * The repr rides the list arm: interleaved key, value pairs behind data in
+ * insertion order, len twice the pair count, elem_ty the key tag. */
+AshValue ash_map_new(AshContract* c, uint32_t key_ty);
+
+/* Inserts or updates one pair. The key and the value are both deep copied
+ * onto the instance before anything is committed, so the caller keeps what it
+ * owns and an OOM mid-copy leaves the map untouched. An existing key, found
+ * by ash_value_eq, has its value replaced in place and keeps its insertion
+ * position; a new key appends. The scan is linear in the pair count, the v1
+ * tradeoff for a one arm repr. ASH_ERR_TYPE when m is not a map or the key's
+ * tag disagrees with the map's key tag. */
+AshStatus ash_map_set(AshContract* c, AshValue* m, const AshValue* k,
+                      const AshValue* v);
+
+/* Looks one key up; 1 on a hit with *out aimed at the value slot inside the
+ * map's own storage, a borrow that a later ash_map_set on the same map may
+ * move, so copy before storing it. 0 on a miss, on a non-map m, or on a key
+ * whose tag disagrees, never a fault: a miss is a value in this language. */
+int ash_map_get(const AshValue* m, const AshValue* k, const AshValue** out);
 
 /* An instance owned tuple of count zeroed slots, filled in place through
  * ash_list_get or the data pointer. */
 AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out);
 
 /* Recursively copies src into instance owned memory: scalars by value,
- * string bytes copied, list, tuple, record, and sum payloads copied element
- * by element, Option and Result payloads reboxed. After it returns, nothing
- * in dst aliases memory the instance does not own. Map values are not
- * supported in v1 and report ASH_ERR_TYPE. */
+ * string bytes copied, list, map, tuple, record, and sum payloads copied
+ * element by element, Option and Result payloads reboxed. After it returns,
+ * nothing in dst aliases memory the instance does not own. */
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
                               AshValue* dst);
 
 /* Renders a value in its canonical debug spelling, the text a standalone
  * executable prints for a Main.run Err: scalars as literals, strings quoted
- * with control bytes escaped, [..] lists, (..) tuples, {..} records, #tag
- * sums with their payload in parens, Some/None and Ok/Err through their
- * boxes, recursion cut with "..." past a fixed depth. The size protocol is
+ * with control bytes escaped, [..] lists, (..) tuples, {..} records,
+ * {k: v, ..} maps in insertion order, #tag sums with their payload in
+ * parens, Some/None and Ok/Err through their boxes, recursion cut with
+ * "..." past a fixed depth. The size protocol is
  * ash_iname_dump's: *need receives the full size including the terminating
  * NUL; when cap is at least that, the text and its NUL are written to buf
  * and the call returns ASH_OK, otherwise nothing is written and the call
