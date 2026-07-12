@@ -38,9 +38,10 @@ export func gk_variant() -> int64 { return 2 }
 export func gk_prov() -> int64 { return 3 }
 export func gk_contract() -> int64 { return 4 }
 
-// A global name: its kind, its id in the matching arena, and the span of the
-// declaration that owns it. kind -1 is the miss sentinel the lookups return.
-export struct GEntry { kind: int64, id: int64, lo: int64, hi: int64 }
+// A global name: its kind, its id in the matching arena, the package of the
+// file that declared it, and the span of the declaration that owns it. kind
+// -1 is the miss sentinel the lookups return.
+export struct GEntry { kind: int64, id: int64, pkg: int64, lo: int64, hi: int64 }
 
 // A contract member: its ast member kind, its arena id, and for a pledge the
 // subcontract it was declared in, -1 when it sits directly in the contract.
@@ -57,6 +58,7 @@ export struct Resolved {
     sub_pledges: *Map<int64>,
     incs: *Map<int64>,
     imports: *Map<int64>,
+    decl_pkg: *Vector<int64>,
     errors: *Vector<Located>,
 }
 
@@ -95,7 +97,7 @@ export func rs_ikey(cid: int64, provid: int64) -> string {
 }
 
 func no_gentry() -> GEntry {
-    return GEntry { kind: -1, id: -1, lo: 0, hi: 0 }
+    return GEntry { kind: -1, id: -1, pkg: -1, lo: 0, hi: 0 }
 }
 
 func no_mentry() -> MEntry {
@@ -172,8 +174,10 @@ func mk_word(kind: int64) -> string {
     return "subcontract"
 }
 
-// Records the imports and rejects a repeated path. Module resolution proper
-// is a later milestone; the table only remembers what the file asked for.
+// Records the imports the merged tree carries. Path resolution, duplicate
+// detection, and cycle detection all happened in the loader, which knows
+// which file each import line sits in; the table here only remembers what
+// the program asked for.
 func collect_imports(r: *Resolved) -> void {
     a: *Ast = (*r).ast
     imps: *Vector<ImportNode> = (*a).imports
@@ -183,9 +187,7 @@ func collect_imports(r: *Resolved) -> void {
         imp: ImportNode = vec_get(imps, i)
         path: string = ast_name(a, imp.path)
         if str_len(path) > 0 {
-            if map_has(tab, path) {
-                emit(r, imp.lo, imp.hi, msg3("duplicate import '", path, "'"))
-            } else {
+            if !map_has(tab, path) {
                 map_put(tab, path, 1)
             }
         }
@@ -193,11 +195,27 @@ func collect_imports(r: *Resolved) -> void {
     }
 }
 
+// The package of the i-th declaration, for the signature builder's own walk
+// over the declaration list.
+export func rs_pkg_at(r: *Resolved, i: int64) -> int64 {
+    return decl_pkg_at(r, i)
+}
+
+// The package of the i-th declaration, 0 when the loader supplied no table,
+// which is the single file case where every declaration shares one package.
+func decl_pkg_at(r: *Resolved, i: int64) -> int64 {
+    tab: *Vector<int64> = (*r).decl_pkg
+    if i < vec_len(tab) {
+        return vec_get(tab, i)
+    }
+    return 0
+}
+
 // Declares one global name. A repeat of any kind is an error, named for the
 // later declaration; the first entry stays in the table so downstream lookups
 // see one stable answer. An empty name is a parse recovery placeholder and is
 // skipped, since the parse already reported it.
-func declare_global(r: *Resolved, kind: int64, id: int64, name: int64, lo: int64, hi: int64) -> void {
+func declare_global(r: *Resolved, kind: int64, id: int64, pkg: int64, name: int64, lo: int64, hi: int64) -> void {
     text: string = ast_name((*r).ast, name)
     if str_len(text) == 0 {
         return
@@ -208,37 +226,39 @@ func declare_global(r: *Resolved, kind: int64, id: int64, name: int64, lo: int64
         emit(r, lo, hi, msg5("duplicate ", gk_word(kind), " '", text, "'"))
         return
     }
-    map_put(tab, key, GEntry { kind: kind, id: id, lo: lo, hi: hi })
+    map_put(tab, key, GEntry { kind: kind, id: id, pkg: pkg, lo: lo, hi: hi })
 }
 
-// Fills the global namespace in declaration order. Sum variants are global
-// constructors, so each one takes a slot beside its sum; a variant has no
-// span of its own and borrows the sum's for its diagnostics.
+// Fills the global namespace in declaration order, every file of the program
+// sharing the one namespace. Sum variants are global constructors, so each
+// one takes a slot beside its sum; a variant has no span of its own and
+// borrows the sum's for its diagnostics.
 func collect_globals(r: *Resolved) -> void {
     a: *Ast = (*r).ast
     decls: *Vector<DeclNode> = (*a).decls
     mut i: int64 = 0
     while i < vec_len(decls) {
         d: DeclNode = vec_get(decls, i)
+        pkg: int64 = decl_pkg_at(r, i)
         if d.kind == dk_record() {
             rec: RecordNode = vec_get((*a).records, d.id)
-            declare_global(r, gk_record(), d.id, rec.name, rec.lo, rec.hi)
+            declare_global(r, gk_record(), d.id, pkg, rec.name, rec.lo, rec.hi)
         } else if d.kind == dk_sum() {
             s: SumNode = vec_get((*a).sums, d.id)
-            declare_global(r, gk_sum(), d.id, s.name, s.lo, s.hi)
+            declare_global(r, gk_sum(), d.id, pkg, s.name, s.lo, s.hi)
             mut j: int64 = 0
             while j < s.variants_len {
                 vid: int64 = vec_get((*a).kids, s.variants_off + j)
                 v: VariantNode = vec_get((*a).variants, vid)
-                declare_global(r, gk_variant(), vid, v.name, s.lo, s.hi)
+                declare_global(r, gk_variant(), vid, pkg, v.name, s.lo, s.hi)
                 j = j + 1
             }
         } else if d.kind == dk_prov() {
             pv: ProvNode = vec_get((*a).provs, d.id)
-            declare_global(r, gk_prov(), d.id, pv.name, pv.lo, pv.hi)
+            declare_global(r, gk_prov(), d.id, pkg, pv.name, pv.lo, pv.hi)
         } else if d.kind == dk_contract() {
             c: ContractNode = vec_get((*a).contracts, d.id)
-            declare_global(r, gk_contract(), d.id, c.name, c.lo, c.hi)
+            declare_global(r, gk_contract(), d.id, pkg, c.name, c.lo, c.hi)
         }
         i = i + 1
     }
@@ -339,7 +359,7 @@ func collect_members(r: *Resolved, cid: int64) -> void {
 // matches is the type checker's question; the name being there settles this
 // pass. provided maps each contributed clause name to the provisional clause
 // that brought it, for the conflict message.
-func resolve_incorporate(r: *Resolved, cid: int64, cname: string, incid: int64, provided: *Map<string>) -> void {
+func resolve_incorporate(r: *Resolved, cid: int64, cname: string, cpkg: int64, incid: int64, provided: *Map<string>) -> void {
     a: *Ast = (*r).ast
     inc: IncNode = vec_get((*a).incs, incid)
     text: string = ast_name(a, inc.name)
@@ -354,6 +374,15 @@ func resolve_incorporate(r: *Resolved, cid: int64, cname: string, incid: int64, 
     if g.kind != gk_prov() {
         emit(r, inc.lo, inc.hi, msg3("'", text, "' is not a provisional clause"))
         return
+    }
+    // The package boundary: an internal provisional clause is visible to its
+    // own directory alone, so an incorporate from another package is a fault.
+    pv0: ProvNode = vec_get((*a).provs, g.id)
+    if pv0.internal {
+        if g.pkg != cpkg {
+            emit(r, inc.lo, inc.hi, msg3("internal provisional clause '", text, "' is not visible outside its package"))
+            return
+        }
     }
     ikey: string = rs_ikey(cid, g.id)
     itab: *Map<int64> = (*r).incs
@@ -388,12 +417,13 @@ func resolve_incorporates(r: *Resolved, cid: int64) -> void {
     a: *Ast = (*r).ast
     c: ContractNode = vec_get((*a).contracts, cid)
     cname: string = ast_name(a, c.name)
+    cg: GEntry = rs_global(r, c.name)
     provided: *Map<string> = alloc(map_new())
     mut i: int64 = 0
     while i < c.members_len {
         mkind: int64 = vec_get((*a).kids, c.members_off + i)
         if mkind == mk_incorporate() {
-            resolve_incorporate(r, cid, cname, vec_get((*a).kids, c.members_off + i + 1), provided)
+            resolve_incorporate(r, cid, cname, cg.pkg, vec_get((*a).kids, c.members_off + i + 1), provided)
         }
         i = i + 2
     }
@@ -508,9 +538,11 @@ func resolve_requirements(r: *Resolved, cid: int64) -> void {
 
 // The pass. Imports and globals first, then every contract's member table,
 // and only then the incorporate and requirements checks, so a reference to a
-// contract or member declared later in the file resolves the same as one
-// declared earlier.
-export func resolve_file(a: *Ast) -> *Resolved {
+// contract or member declared later in the program resolves the same as one
+// declared earlier. decl_pkg is the loader's package id per declaration, in
+// declaration order; an empty vector reads as one package, the single file
+// case.
+export func resolve_file(a: *Ast, decl_pkg: *Vector<int64>) -> *Resolved {
     globals: *Map<GEntry> = alloc(map_new())
     members: *Map<MEntry> = alloc(map_new())
     sub_pledges: *Map<int64> = alloc(map_new())
@@ -524,6 +556,7 @@ export func resolve_file(a: *Ast) -> *Resolved {
         sub_pledges: sub_pledges,
         incs: incs,
         imports: imports,
+        decl_pkg: decl_pkg,
         errors: errors,
     })
     collect_imports(r)

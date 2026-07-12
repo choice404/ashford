@@ -1,0 +1,1 @@
+internal contract 'Secret' is not visible outside its package

@@ -136,6 +136,11 @@ func check_contract(tc: *Tc, cid: int64) -> void {
     (*tc).cur_cid = cid
     check_incorporates(tc, cid)
     c: ContractNode = vec_get((*a).contracts, cid)
+    // The bodies below lower let annotations through the sig tables, and an
+    // internal contract named there is visible to this contract's package
+    // alone, so the current package rides along for that check.
+    cg: GEntry = rs_global((*tc).res, c.name)
+    (*(*tc).sigs).cur_pkg = cg.pkg
     mut i: int64 = 0
     while i < c.members_len {
         mkind: int64 = vec_get((*a).kids, c.members_off + i)

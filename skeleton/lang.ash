@@ -204,4 +204,44 @@ contract LangGauntlet {
         let check = outer[0]
         return Ok(check[0] * 100 + row[0])
     }
+
+    // Clauses: contract private helpers the pledges below reach by bare
+    // name. suffix_for returns a plain String, the any type rule a clause
+    // enjoys and a pledge does not, and scaled calls a sibling clause from
+    // inside a clause body.
+    clause suffix_for(n: Int) -> String {
+        if n > 9 {
+            return "big"
+        }
+        return "small"
+    }
+
+    clause bump(n: Int) -> Int {
+        return n + 1
+    }
+
+    clause scaled(n: Int) -> Int {
+        return bump(n) * 2
+    }
+
+    clause total_of(xs: List<Int>) -> Int {
+        let mut t = 0
+        for x in xs {
+            t = t + x
+        }
+        return t
+    }
+
+    pledge label(n: Int) -> Result<String, Int> {
+        let s = suffix_for(n)
+        return Ok(s + ":" + suffix_for(0))
+    }
+
+    pledge scale(n: Int) -> Result<Int, Int> {
+        return Ok(scaled(n))
+    }
+
+    pledge total_twice(xs: List<Int>) -> Result<Int, Int> {
+        return Ok(total_of(xs) + total_of(xs))
+    }
 }

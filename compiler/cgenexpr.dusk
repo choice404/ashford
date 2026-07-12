@@ -6,7 +6,8 @@
 // operators including String concatenation and deep equality, the Option and
 // Result constructors, list, tuple, and record literals, record field reads,
 // list indexing, sum variant construction, the propagation operator, and
-// match, which lives in cgenmatch. What stays out, calls into clauses and
+// match, which lives in cgenmatch, and the bare clause call, which lands on
+// the contract's static clause function. What stays out, calls into
 // contracts, member access on instances, and Map operations, is a named
 // build error through cg_unsupported, so no thunk ever ships C the emitter
 // was guessing at. The type questions were all settled by the checker before
@@ -539,15 +540,77 @@ func gen_question(g: *Cg, e: ExprNode) -> CVal {
     return CVal { cvar: v, ty: inner }
 }
 
-// A call expression. The one callable the lowered subset owns is a sum
-// variant constructor; clause calls and the contract operations stay named
-// build errors until their milestone.
+// A bare clause call. The arguments lower against the clause's checked
+// parameter types, land in one stack array, and the static clause function
+// runs in the thunk's exit convention: a status that is not ASH_OK exits the
+// enclosing body with it, exactly as the runtime helpers do, and the value
+// arrives through the out slot. Propagation inside the clause is invisible
+// here: a clause that early-returns its None or Err reports ASH_OK with that
+// value in out, which is simply the clause's result.
+func gen_clause_call(g: *Cg, name: int64, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    cid: int64 = (*g).cur_cid
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    cs: ClauseSigT = sig_clause((*g).sigs, cid, name)
+    vals: *Vector<CVal> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < e.c {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+        mut w: int64 = -1
+        if i < cs.params.len { w = sig_param((*g).sigs, cs.params, i) }
+        vec_push(vals, gen_expr(g, arg.expr, w))
+        i = i + 1
+    }
+    mut argref: string = "NULL"
+    if vec_len(vals) > 0 {
+        arr: string = cg_tmp(g)
+        line: *StringBuilder = alloc(sb_new())
+        sb_push(line, "AshValue ")
+        sb_push(line, arr)
+        sb_push_char(line, 91)
+        sb_push_int(line, vec_len(vals))
+        sb_push(line, "] = { ")
+        mut j: int64 = 0
+        while j < vec_len(vals) {
+            if j > 0 { sb_push(line, ", ") }
+            sb_push(line, vec_get(vals, j).cvar)
+            j = j + 1
+        }
+        sb_push(line, " };")
+        text: string = substring(sb_cstr(line), 0, sb_size(line))
+        sb_free(line)
+        free(line)
+        cg_line(g, text)
+        free(text)
+        argref = arr
+    }
+    fname: string = cg_clause_fn(cname, ast_name(a, name))
+    rv: string = new_value(g)
+    st: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st, " = ", fname, "(cc, ", argref, tmsg3(", &", rv, ");")))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    mut ret: int64 = cs.ret
+    if ret < 0 { ret = ty_unknown(t) }
+    return CVal { cvar: rv, ty: ret }
+}
+
+// A call expression. The lowered callables are a sum variant constructor and
+// a bare clause of the enclosing contract; the contract operations stay
+// named build errors until their milestone.
 func gen_call(g: *Cg, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
     cn: ExprNode = vec_get((*a).exprs, e.a)
     if cn.kind == xk_ident() {
         b: CBind = cg_lookup(g, cn.a)
         if !b.found {
+            if (*g).cur_cid >= 0 {
+                m: MEntry = rs_member((*g).res, (*g).cur_cid, cn.a)
+                if m.kind == mk_clause() {
+                    return gen_clause_call(g, cn.a, e)
+                }
+            }
             ge: GEntry = rs_global((*g).res, cn.a)
             if ge.kind == gk_variant() {
                 return gen_variant(g, cn.a, e.b, e.c, e.lo, e.hi)

@@ -2,10 +2,12 @@
 // version prints the build string. lex runs the lexer over an .ash file and
 // dumps one token per line to stdout, the golden format tests/lex diffs.
 // parse runs the lexer and the parser and dumps the AST to stdout, the
-// golden format tests/parse diffs. check runs the whole front end and
-// reports faults alone. build runs the front end and then the M3 code
+// golden format tests/parse diffs; both read exactly one file. check and
+// build go through the module loader: the argument is the program's root
+// file, its imports load and merge into one module, and the whole front end
+// runs over the merged tree. build then hands the checked tree to the code
 // generator: the module C lands in target/ashc-out and cc links it into a
-// shared library beside it.
+// shared library beside it, both named after the root file.
 //
 // Progress and error messages go to stderr, so stdout carries dump output
 // alone and a tool can diff it byte for byte. build expects to run from the
@@ -27,6 +29,7 @@
 @import parse
 @import parseitem
 @import astdump
+@import loader
 @import resolve
 @import ty
 @import tysigs
@@ -44,7 +47,7 @@ func usage() -> void {
     printerr("  version       print the compiler version")
     printerr("  lex <file>    dump the token stream of a source file")
     printerr("  parse <file>  dump the AST of a source file")
-    printerr("  check <file>  lex, parse, resolve, and type check a source file")
+    printerr("  check <file>  load the program rooted at file and check it")
     printerr("  build <file>  emit the module C and link it into a shared library")
 }
 
@@ -122,61 +125,39 @@ func cmd_parse(path: string) -> int32 {
     return 0
 }
 
-// Runs the lexer, the parser, the resolver, the type checker, and the
-// requirements solver on the file at path. Nothing goes to stdout; faults go
-// to stderr and decide the exit code. A file that faulted in the lexer or
-// the parser never reaches the resolver, since the recovery placeholders in
-// its tree would only echo the earlier faults as phantom names, and a file
-// that faulted in the resolver never reaches the type checker, whose sig
-// tables assume every name is unique. A clean file reports one line so a
-// caller watching stderr sees the pass happened.
-func cmd_check(path: string) -> int32 {
-    s, e := source_load(path)
-    if e.exists() {
-        printerr("ashc: cannot read source file")
-        return 1
-    }
-    src: string = s.text
-    n: int64 = s.len
-    lx: *Lexer = lex(src, n)
-    p: *Parser = parser_new(lx_tokens(lx), src, n)
-    tree: *Ast = parse_file(p)
-    lerrs: *Vector<Located> = lx_errors(lx)
+// Prints every fault a pass collected against the file it came from, through
+// the loader's span map. Returns how many there were.
+func emit_pass_errors(prog: *Program, errs: *Vector<Located>) -> int64 {
     mut i: int64 = 0
-    while i < vec_len(lerrs) {
-        emit_located(path, src, n, vec_get(lerrs, i))
+    while i < vec_len(errs) {
+        ld_emit(prog, vec_get(errs, i))
         i = i + 1
     }
-    perrs: *Vector<Located> = p_errors(p)
-    mut j: int64 = 0
-    while j < vec_len(perrs) {
-        emit_located(path, src, n, vec_get(perrs, j))
-        j = j + 1
-    }
-    if vec_len(lerrs) > 0 {
+    return vec_len(errs)
+}
+
+// Loads the whole program rooted at path, then runs the resolver, the type
+// checker, and the requirements solver over the merged module. Nothing goes
+// to stdout; faults go to stderr and decide the exit code. A program that
+// faulted while loading never reaches the resolver, since the recovery
+// placeholders in its tree would only echo the earlier faults as phantom
+// names, and one that faulted in the resolver never reaches the type
+// checker, whose sig tables assume every name is unique. A clean program
+// reports one line so a caller watching stderr sees the pass happened.
+func cmd_check(path: string) -> int32 {
+    prog: *Program = load_program(path)
+    ld_print_errors(prog)
+    if !(*prog).ok {
         return 1
     }
-    if vec_len(perrs) > 0 {
-        return 1
-    }
-    res: *Resolved = resolve_file(tree)
-    rerrs: *Vector<Located> = rs_errors(res)
-    mut k: int64 = 0
-    while k < vec_len(rerrs) {
-        emit_located(path, src, n, vec_get(rerrs, k))
-        k = k + 1
-    }
-    if vec_len(rerrs) > 0 {
+    tree: *Ast = (*prog).ast
+    res: *Resolved = resolve_file(tree, (*prog).decl_pkg)
+    if emit_pass_errors(prog, rs_errors(res)) > 0 {
         return 1
     }
     terrs: *Vector<Located> = typeck_file(tree, res)
     reqsolve_file(tree, res, terrs)
-    mut q: int64 = 0
-    while q < vec_len(terrs) {
-        emit_located(path, src, n, vec_get(terrs, q))
-        q = q + 1
-    }
-    if vec_len(terrs) > 0 {
+    if emit_pass_errors(prog, terrs) > 0 {
         return 1
     }
     printerr("[ashc] check ok")
@@ -263,51 +244,21 @@ func link_module(cpath: string, sopath: string) -> int64 {
     return code
 }
 
-// Builds one .ash file: the whole front end first, exactly the check path,
-// then the code generator over the checked tree. Codegen faults are build
-// errors like any other; only a clean run writes the module C and links the
-// shared library beside it.
+// Builds one program from its root .ash file: the whole front end first,
+// exactly the check path over the loaded and merged module, then the code
+// generator over the checked tree. Codegen faults are build errors like any
+// other; only a clean run writes the module C and links the shared library
+// beside it, both named after the root file.
 func cmd_build(path: string) -> int32 {
-    s, e := source_load(path)
-    if e.exists() {
-        printerr("ashc: cannot read source file")
-        return 1
-    }
-    src: string = s.text
-    n: int64 = s.len
-    lx: *Lexer = lex(src, n)
-    p: *Parser = parser_new(lx_tokens(lx), src, n)
-    tree: *Ast = parse_file(p)
-    lerrs: *Vector<Located> = lx_errors(lx)
-    mut li: int64 = 0
-    while li < vec_len(lerrs) {
-        emit_located(path, src, n, vec_get(lerrs, li))
-        li = li + 1
-    }
-    perrs: *Vector<Located> = p_errors(p)
-    mut pi: int64 = 0
-    while pi < vec_len(perrs) {
-        emit_located(path, src, n, vec_get(perrs, pi))
-        pi = pi + 1
-    }
-    if vec_len(lerrs) > 0 { return 1 }
-    if vec_len(perrs) > 0 { return 1 }
-    res: *Resolved = resolve_file(tree)
-    rerrs: *Vector<Located> = rs_errors(res)
-    mut ri: int64 = 0
-    while ri < vec_len(rerrs) {
-        emit_located(path, src, n, vec_get(rerrs, ri))
-        ri = ri + 1
-    }
-    if vec_len(rerrs) > 0 { return 1 }
+    prog: *Program = load_program(path)
+    ld_print_errors(prog)
+    if !(*prog).ok { return 1 }
+    tree: *Ast = (*prog).ast
+    res: *Resolved = resolve_file(tree, (*prog).decl_pkg)
+    if emit_pass_errors(prog, rs_errors(res)) > 0 { return 1 }
     terrs: *Vector<Located> = typeck_file(tree, res)
     reqsolve_file(tree, res, terrs)
-    mut ti: int64 = 0
-    while ti < vec_len(terrs) {
-        emit_located(path, src, n, vec_get(terrs, ti))
-        ti = ti + 1
-    }
-    if vec_len(terrs) > 0 { return 1 }
+    if emit_pass_errors(prog, terrs) > 0 { return 1 }
 
     // The checker's own arena and tables were internal to it; the code
     // generator rebuilds them the same deterministic way. Annotation faults
@@ -317,12 +268,7 @@ func cmd_build(path: string) -> int32 {
     sigs: *Sigs = build_sigs(tree, res, t, scratch)
     gerrs: *Vector<Located> = alloc(vec_new())
     ccode: string = cgen_module(tree, res, sigs, t, gerrs)
-    mut gi: int64 = 0
-    while gi < vec_len(gerrs) {
-        emit_located(path, src, n, vec_get(gerrs, gi))
-        gi = gi + 1
-    }
-    if vec_len(gerrs) > 0 {
+    if emit_pass_errors(prog, gerrs) > 0 {
         free(ccode)
         return 1
     }

@@ -100,6 +100,8 @@ The builtin named types are `Int`, `UInt`, `Float`, `Bool`, `Byte`, `Char`, `Str
 
 A `PledgeType` is the type of a first class pledge value. The value is always bound to a signed contract instance, so calling one fulfills that pledge on that instance.
 
+A contract name used as a type denotes a signed instance, and an instance never crosses the boundary. A contract type is therefore rejected anywhere a value would cross it: a pledge parameter or return, a vow, a record or sum field, and a provisional clause signature, at any nesting depth. Clause parameters, clause returns, and local bindings may carry contract types freely, since they never leave the module.
+
 ## Program structure
 
 ```text

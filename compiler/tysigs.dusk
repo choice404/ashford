@@ -4,10 +4,15 @@
 // enforced at the annotation: type arguments belong to the builtin composites
 // alone and arrive in the right number, Map keys stay in the keyable set, a
 // user named type takes no arguments, and a pledge returns Result, Option, or
-// Unit and nothing else. A name no declaration owns lowers to an opaque named
-// type rather than a fault, because imports resolve in a later milestone and
-// an imported type must be usable by name today. The canonical signature
-// string built here is deterministic, the spelling later shape hashes eat.
+// Unit and nothing else. A contract type is rejected at every ABI position,
+// pledge signatures, vow types, record and variant fields, and provisional
+// clause signatures, however deeply it nests, since a signed instance has no
+// tagged representation the boundary could carry or check; clause signatures
+// and let annotations keep it, and there an internal contract is nameable
+// only inside its own package. A name no declaration owns lowers to an
+// opaque named type rather than a fault, because a module of another program
+// may own it. The canonical signature string built here is deterministic,
+// the spelling later shape hashes eat.
 //
 // Table keys reuse the resolver's spelling: rs_mkey for contract members,
 // rs_skey for pledges inside a named subcontract, and the global name id in
@@ -45,6 +50,8 @@ export struct Sigs {
     pledges: *Map<PledgeSigT>,
     clauses: *Map<ClauseSigT>,
     provsigs: *Map<ClauseSigT>,
+    abi_pos: bool,
+    cur_pkg: int64,
     errors: *Vector<Located>,
 }
 
@@ -182,6 +189,24 @@ func lower_named(s: *Sigs, n: TypeNode, lo: int64, hi: int64) -> int64 {
     }
     g: GEntry = rs_global((*s).res, n.a)
     if g.kind == gk_contract() {
+        // A signed instance has no tagged ABI representation, so a contract
+        // type is rejected at every position a value crosses the boundary
+        // through: pledge signatures, vow types, record and variant fields,
+        // and provisional clause signatures. Clause signatures and let
+        // annotations stay legal, where the value never leaves the module.
+        if (*s).abi_pos {
+            sig_emit(s, lo, hi, smsg3("contract type '", name, "' cannot cross the contract boundary"))
+            return ty_unknown(t)
+        }
+        // The package boundary on the annotation form: an internal contract
+        // is nameable as a type only inside its own package.
+        cn: ContractNode = vec_get((*a).contracts, g.id)
+        if cn.internal {
+            if g.pkg != (*s).cur_pkg {
+                sig_emit(s, lo, hi, smsg3("internal contract '", name, "' is not visible outside its package"))
+                return ty_unknown(t)
+            }
+        }
         return ty_contract(t, name)
     }
     if g.kind == gk_variant() {
@@ -268,8 +293,10 @@ func check_pledge_ret(s: *Sigs, pl: PledgeNode, ret: int64) -> void {
 func collect_pledge(s: *Sigs, key: string, pid: int64, sub: int64) -> void {
     a: *Ast = (*s).ast
     pl: PledgeNode = vec_get((*a).pledges, pid)
+    (*s).abi_pos = true
     params: TyList = lower_params(s, pl.params_off, pl.params_len, pl.lo, pl.hi)
     ret: int64 = lower_type(s, pl.ret, pl.lo, pl.hi)
+    (*s).abi_pos = false
     check_pledge_ret(s, pl, ret)
     tab: *Map<PledgeSigT> = (*s).pledges
     if !map_has(tab, key) {
@@ -289,7 +316,10 @@ func collect_contract(s: *Sigs, cid: int64) -> void {
             vkey: string = rs_mkey(cid, v.name)
             vows: *Map<VowSigT> = (*s).vows
             if !map_has(vows, vkey) {
-                map_put(vows, vkey, VowSigT { ty: lower_type(s, v.ty, v.lo, v.hi), has_init: v.init >= 0, found: true })
+                (*s).abi_pos = true
+                vty: int64 = lower_type(s, v.ty, v.lo, v.hi)
+                (*s).abi_pos = false
+                map_put(vows, vkey, VowSigT { ty: vty, has_init: v.init >= 0, found: true })
             }
         } else if mkind == mk_pledge() {
             pl: PledgeNode = vec_get((*a).pledges, mid)
@@ -337,12 +367,14 @@ export func build_sigs(a: *Ast, r: *Resolved, t: *TyArena, errors: *Vector<Locat
         plists: plists, fields: fields,
         recs: recs, variants: variants, vows: vows,
         pledges: pledges, clauses: clauses, provsigs: provsigs,
+        abi_pos: false, cur_pkg: 0,
         errors: errors,
     })
     decls: *Vector<DeclNode> = (*a).decls
     mut i: int64 = 0
     while i < vec_len(decls) {
         d: DeclNode = vec_get(decls, i)
+        (*s).cur_pkg = rs_pkg_at(r, i)
         if d.kind == dk_record() {
             collect_record(s, d.id)
         } else if d.kind == dk_sum() {
@@ -365,12 +397,14 @@ func collect_record(s: *Sigs, rid: int64) -> void {
     if map_has(tab, key) { return }
     fields: *Vector<FieldSig> = (*s).fields
     off: int64 = vec_len(fields)
+    (*s).abi_pos = true
     mut i: int64 = 0
     while i < rec.fields_len {
         f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, rec.fields_off + i))
         vec_push(fields, FieldSig { name: f.name, ty: lower_type(s, f.ty, rec.lo, rec.hi) })
         i = i + 1
     }
+    (*s).abi_pos = false
     map_put(tab, key, RecSig { off: off, len: rec.fields_len, found: true })
 }
 
@@ -386,12 +420,14 @@ func collect_sum(s: *Sigs, sid: int64) -> void {
         if !map_has(tab, key) {
             fields: *Vector<FieldSig> = (*s).fields
             off: int64 = vec_len(fields)
+            (*s).abi_pos = true
             mut j: int64 = 0
             while j < v.fields_len {
                 f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, v.fields_off + j))
                 vec_push(fields, FieldSig { name: f.name, ty: lower_type(s, f.ty, sum.lo, sum.hi) })
                 j = j + 1
             }
+            (*s).abi_pos = false
             map_put(tab, key, VariantSig { off: off, len: v.fields_len, owner: sum.name, found: true })
         }
         i = i + 1
@@ -407,8 +443,11 @@ func collect_prov(s: *Sigs, pvid: int64) -> void {
         key: string = sig_pkey(pvid, sig.name)
         tab: *Map<ClauseSigT> = (*s).provsigs
         if !map_has(tab, key) {
+            (*s).abi_pos = true
             params: TyList = lower_params(s, sig.params_off, sig.params_len, pv.lo, pv.hi)
-            map_put(tab, key, ClauseSigT { params: params, ret: lower_type(s, sig.ret, pv.lo, pv.hi), found: true })
+            pret: int64 = lower_type(s, sig.ret, pv.lo, pv.hi)
+            (*s).abi_pos = false
+            map_put(tab, key, ClauseSigT { params: params, ret: pret, found: true })
         }
         i = i + 1
     }

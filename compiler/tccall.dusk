@@ -266,6 +266,27 @@ func member_with_base(tc: *Tc, e: ExprNode, bt: int64) -> int64 {
     return ty_unknown(t)
 }
 
+// The package boundary on sign: an internal contract signs only from a body
+// inside its own package. The signer's package is its enclosing contract's,
+// read back through the global table the resolver stamped.
+func check_internal_sign(tc: *Tc, scid: int64, cname_id: int64, cname: string, lo: int64, hi: int64) -> void {
+    a: *Ast = (*tc).ast
+    cnode: ContractNode = vec_get((*a).contracts, scid)
+    if !cnode.internal {
+        return
+    }
+    tg: GEntry = rs_global((*tc).res, cname_id)
+    mut mypkg: int64 = tg.pkg
+    if (*tc).cur_cid >= 0 {
+        myc: ContractNode = vec_get((*a).contracts, (*tc).cur_cid)
+        mg: GEntry = rs_global((*tc).res, myc.name)
+        mypkg = mg.pkg
+    }
+    if mypkg != tg.pkg {
+        tc_emit(tc, lo, hi, tmsg3("internal contract '", cname, "' is not visible outside its package"))
+    }
+}
+
 // Whether the base expression names a contract statically: a bare identifier
 // no local shadows that resolves to a contract. Returns the contract id.
 func static_contract(tc: *Tc, base_id: int64) -> int64 {
@@ -390,6 +411,7 @@ export func infer_call(tc: *Tc, e: ExprNode) -> int64 {
             cname: string = ast_name(a, be.a)
             mtext: string = ast_name(a, cn.b)
             if str_eq(mtext, "sign") {
+                check_internal_sign(tc, scid, be.a, cname, e.lo, e.hi)
                 return check_sign(tc, scid, cname, e)
             }
             walk_args(tc, e.b, e.c)

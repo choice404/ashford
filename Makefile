@@ -22,11 +22,12 @@ MODULE     := $(OUT)/libhello.ash.so
 MODULE_V2  := $(OUT)/libhello_v2.ash.so
 MODULE_PAY := $(OUT)/libpayment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
+MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-std test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-partial test-lang test-determinism tsan
+all: smoke test-runtime test-thread test-iname test-partial test-lang test-std test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -52,6 +53,9 @@ $(MODULE_PAY): $(ASHC) skeleton/payment.ash runtime/include/ash/ash_abi.h
 
 $(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/lang.ash
+
+$(MODULE_STD): $(ASHC) skeleton/std_user.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/std_user.ash
 
 host: $(HOST)
 
@@ -111,6 +115,17 @@ test-lang: $(MODULE_LANG)
 	    tests/runtime/test_lang.c runtime/src/runtime.c -ldl -o $(OUT)/test_lang
 	./$(OUT)/test_lang
 
+# The standard library gate under ASan: the std_user module merges four
+# ashstd modules through the loader, and the host signs MathOps, ListOps,
+# and StdUser out of the one library, driving the integer and float
+# arithmetic, the list reductions and their Option answers, the error sums
+# in the Err box, and the sort that runs through an incorporated clause.
+test-std: $(MODULE_STD)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
+	    tests/runtime/test_std.c runtime/src/runtime.c -ldl -o $(OUT)/test_std
+	./$(OUT)/test_std
+
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
 # in the iname story reproducible.
@@ -132,7 +147,11 @@ test-determinism: $(ASHC)
 	mv $(OUT)/lang.c $(OUT)/lang.c.first
 	$(ASHC) build skeleton/lang.ash
 	diff $(OUT)/lang.c.first $(OUT)/lang.c
-	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first $(OUT)/lang.c.first
+	$(ASHC) build skeleton/std_user.ash
+	mv $(OUT)/std_user.c $(OUT)/std_user.c.first
+	$(ASHC) build skeleton/std_user.ash
+	diff $(OUT)/std_user.c.first $(OUT)/std_user.c
+	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first $(OUT)/lang.c.first $(OUT)/std_user.c.first
 	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the

@@ -1,0 +1,494 @@
+// loader: the M8 module loader. Given a root .ash file it loads the whole
+// program: every import resolves to a file, every file lexes and parses into
+// one shared AST arena, and the merged declaration list flows into resolve,
+// typeck, and cgen exactly as a single file always has, so one module comes
+// out of a build however many files went in.
+//
+// The search order per import: the dotted path becomes a relative file path,
+// util -> util.ash and foo.bar -> foo/bar.ash, probed first beside the root
+// file and then under ASH_HOME, which defaults to lib/ in the working
+// directory when the variable is unset. Imports walk depth first in
+// declaration order, each file loads exactly once, and an import that lands
+// on a file still being loaded is a cycle and a fault. A path that repeats
+// inside one file is a duplicate import fault here, where the file is known,
+// since the merged import table can no longer tell two files apart.
+//
+// Every span in the shared tree is shifted by a per file base so spans stay
+// globally unique; the files table maps a shifted span back to its file and
+// local offset when a later pass reports a fault. The dir a file sits in is
+// its package: each file gets a package id, and every declaration remembers
+// its package so internal visibility can be enforced downstream.
+//
+// Load faults are rendered to strings here, where the faulting file's source
+// is at hand; later passes keep returning Located values and ld_emit maps
+// them back. Strings and tables live as long as the process, the front end's
+// convention throughout.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.os
+@import std.functional.maybe
+@import source
+@import diag
+@import token
+@import lex
+@import ast
+@import parse
+@import parseitem
+
+// One loaded file: its path, its whole text, and the base every span from it
+// was shifted by. pkg is the id of the directory the file sits in.
+export struct LdFile { path: string, src: string, len: int64, base: int64, pkg: int64 }
+
+// A loaded program: the merged tree, the files behind its spans, one package
+// id per declaration in declaration order, and the load faults already
+// rendered. ok is false when anything failed, in which case the tree is not
+// checked further.
+export struct Program {
+    ast: *Ast,
+    files: *Vector<LdFile>,
+    decl_pkg: *Vector<int64>,
+    errors: *Vector<string>,
+    ok: bool,
+}
+
+// The loader state one load carries: the program under construction, the
+// status of every path seen, 1 while its imports are still loading and 2
+// once done, the dir to package id table, and the two search roots.
+struct Ld {
+    ast: *Ast,
+    files: *Vector<LdFile>,
+    decl_pkg: *Vector<int64>,
+    errors: *Vector<string>,
+    status: *Map<int64>,
+    pkgs: *Map<int64>,
+    npkgs: int64,
+    rootdir: string,
+    home: string,
+    base: int64,
+    ok: bool,
+}
+
+// The arena lengths before one file parses, so the spans that file added can
+// be shifted afterward and its declarations tagged with its package.
+struct Marks {
+    exprs: int64,
+    imports: int64,
+    records: int64,
+    sums: int64,
+    provs: int64,
+    vows: int64,
+    pledges: int64,
+    clauses: int64,
+    subs: int64,
+    reqs: int64,
+    reqblocks: int64,
+    incs: int64,
+    contracts: int64,
+    decls: int64,
+}
+
+func lmsg3(s1: string, s2: string, s3: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, s1)
+    sb_push(b, s2)
+    sb_push(b, s3)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The directory of a path, "." when the path has no separator, the base the
+// sibling and dotted import forms resolve against.
+func dir_of(path: string) -> string {
+    n: int64 = str_len(path)
+    mut last: int64 = -1
+    mut i: int64 = 0
+    while i < n {
+        if path[i] == 47 { last = i }
+        i = i + 1
+    }
+    if last <= 0 {
+        if last == 0 { return "/" }
+        return "."
+    }
+    return substring(path, 0, last)
+}
+
+// A dotted import path as a relative file path with the .ash extension:
+// foo.bar becomes foo/bar.ash.
+func import_rel(imp: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    n: int64 = str_len(imp)
+    mut i: int64 = 0
+    while i < n {
+        if imp[i] == 46 {
+            sb_push_char(b, 47)
+        } else {
+            sb_push_char(b, imp[i])
+        }
+        i = i + 1
+    }
+    sb_push(b, ".ash")
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func path_under(dir: string, rel: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, dir)
+    sb_push_char(b, 47)
+    sb_push(b, rel)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The second search root: ASH_HOME when set, otherwise lib/ in the working
+// directory, the spot the ashstd modules live in a checkout.
+func ash_home() -> string {
+    h: string = env("ASH_HOME")
+    if str_len(h) > 0 { return h }
+    return "lib"
+}
+
+// The package id of a directory, assigned in first encounter order so a
+// rebuild numbers the packages the same way.
+func pkg_of(ld: *Ld, dir: string) -> int64 {
+    tab: *Map<int64> = (*ld).pkgs
+    if map_has(tab, dir) {
+        return unwrap_or(map_get(tab, dir), 0)
+    }
+    id: int64 = (*ld).npkgs
+    (*ld).npkgs = id + 1
+    map_put(tab, dir, id)
+    return id
+}
+
+func take_marks(a: *Ast) -> Marks {
+    exprs: *Vector<ExprNode> = (*a).exprs
+    imports: *Vector<ImportNode> = (*a).imports
+    records: *Vector<RecordNode> = (*a).records
+    sums: *Vector<SumNode> = (*a).sums
+    provs: *Vector<ProvNode> = (*a).provs
+    vows: *Vector<VowNode> = (*a).vows
+    pledges: *Vector<PledgeNode> = (*a).pledges
+    clauses: *Vector<ClauseNode> = (*a).clauses
+    subs: *Vector<SubNode> = (*a).subs
+    reqs: *Vector<ReqNode> = (*a).reqs
+    reqblocks: *Vector<ReqBlockNode> = (*a).reqblocks
+    incs: *Vector<IncNode> = (*a).incs
+    contracts: *Vector<ContractNode> = (*a).contracts
+    decls: *Vector<DeclNode> = (*a).decls
+    return Marks {
+        exprs: vec_len(exprs),
+        imports: vec_len(imports),
+        records: vec_len(records),
+        sums: vec_len(sums),
+        provs: vec_len(provs),
+        vows: vec_len(vows),
+        pledges: vec_len(pledges),
+        clauses: vec_len(clauses),
+        subs: vec_len(subs),
+        reqs: vec_len(reqs),
+        reqblocks: vec_len(reqblocks),
+        incs: vec_len(incs),
+        contracts: vec_len(contracts),
+        decls: vec_len(decls),
+    }
+}
+
+// Shifts every span one file's parse added by that file's base, walking each
+// span carrying arena from its mark. Statement, type, and pattern nodes carry
+// no spans of their own, so the expression and declaration arenas cover the
+// tree.
+func shift_spans(a: *Ast, m: Marks, base: int64) -> void {
+    if base == 0 { return }
+    exprs: *Vector<ExprNode> = (*a).exprs
+    mut i: int64 = m.exprs
+    while i < vec_len(exprs) {
+        e: ExprNode = vec_get(exprs, i)
+        vec_set(exprs, i, ExprNode { kind: e.kind, lo: e.lo + base, hi: e.hi + base, a: e.a, b: e.b, c: e.c, d: e.d })
+        i = i + 1
+    }
+    imports: *Vector<ImportNode> = (*a).imports
+    i = m.imports
+    while i < vec_len(imports) {
+        im: ImportNode = vec_get(imports, i)
+        vec_set(imports, i, ImportNode { path: im.path, lo: im.lo + base, hi: im.hi + base })
+        i = i + 1
+    }
+    records: *Vector<RecordNode> = (*a).records
+    i = m.records
+    while i < vec_len(records) {
+        rc: RecordNode = vec_get(records, i)
+        vec_set(records, i, RecordNode { name: rc.name, lo: rc.lo + base, hi: rc.hi + base, fields_off: rc.fields_off, fields_len: rc.fields_len })
+        i = i + 1
+    }
+    sums: *Vector<SumNode> = (*a).sums
+    i = m.sums
+    while i < vec_len(sums) {
+        sm: SumNode = vec_get(sums, i)
+        vec_set(sums, i, SumNode { name: sm.name, lo: sm.lo + base, hi: sm.hi + base, variants_off: sm.variants_off, variants_len: sm.variants_len })
+        i = i + 1
+    }
+    provs: *Vector<ProvNode> = (*a).provs
+    i = m.provs
+    while i < vec_len(provs) {
+        pv: ProvNode = vec_get(provs, i)
+        vec_set(provs, i, ProvNode { internal: pv.internal, name: pv.name, lo: pv.lo + base, hi: pv.hi + base, sigs_off: pv.sigs_off, sigs_len: pv.sigs_len })
+        i = i + 1
+    }
+    vows: *Vector<VowNode> = (*a).vows
+    i = m.vows
+    while i < vec_len(vows) {
+        vw: VowNode = vec_get(vows, i)
+        vec_set(vows, i, VowNode { name: vw.name, lo: vw.lo + base, hi: vw.hi + base, ty: vw.ty, init: vw.init })
+        i = i + 1
+    }
+    pledges: *Vector<PledgeNode> = (*a).pledges
+    i = m.pledges
+    while i < vec_len(pledges) {
+        pl: PledgeNode = vec_get(pledges, i)
+        vec_set(pledges, i, PledgeNode { name: pl.name, lo: pl.lo + base, hi: pl.hi + base, params_off: pl.params_off, params_len: pl.params_len, ret: pl.ret, attrs_off: pl.attrs_off, attrs_len: pl.attrs_len, body: pl.body })
+        i = i + 1
+    }
+    clauses: *Vector<ClauseNode> = (*a).clauses
+    i = m.clauses
+    while i < vec_len(clauses) {
+        cl: ClauseNode = vec_get(clauses, i)
+        vec_set(clauses, i, ClauseNode { name: cl.name, lo: cl.lo + base, hi: cl.hi + base, params_off: cl.params_off, params_len: cl.params_len, ret: cl.ret, body: cl.body })
+        i = i + 1
+    }
+    subs: *Vector<SubNode> = (*a).subs
+    i = m.subs
+    while i < vec_len(subs) {
+        sb2: SubNode = vec_get(subs, i)
+        vec_set(subs, i, SubNode { name: sb2.name, lo: sb2.lo + base, hi: sb2.hi + base, pledges_off: sb2.pledges_off, pledges_len: sb2.pledges_len })
+        i = i + 1
+    }
+    reqs: *Vector<ReqNode> = (*a).reqs
+    i = m.reqs
+    while i < vec_len(reqs) {
+        rq: ReqNode = vec_get(reqs, i)
+        vec_set(reqs, i, ReqNode { kind: rq.kind, lo: rq.lo + base, hi: rq.hi + base, a: rq.a, b: rq.b })
+        i = i + 1
+    }
+    reqblocks: *Vector<ReqBlockNode> = (*a).reqblocks
+    i = m.reqblocks
+    while i < vec_len(reqblocks) {
+        rb: ReqBlockNode = vec_get(reqblocks, i)
+        vec_set(reqblocks, i, ReqBlockNode { lo: rb.lo + base, hi: rb.hi + base, fulfill: rb.fulfill, partial: rb.partial, brk: rb.brk })
+        i = i + 1
+    }
+    incs: *Vector<IncNode> = (*a).incs
+    i = m.incs
+    while i < vec_len(incs) {
+        ic: IncNode = vec_get(incs, i)
+        vec_set(incs, i, IncNode { name: ic.name, lo: ic.lo + base, hi: ic.hi + base })
+        i = i + 1
+    }
+    contracts: *Vector<ContractNode> = (*a).contracts
+    i = m.contracts
+    while i < vec_len(contracts) {
+        ct: ContractNode = vec_get(contracts, i)
+        vec_set(contracts, i, ContractNode { internal: ct.internal, name: ct.name, lo: ct.lo + base, hi: ct.hi + base, attrs_off: ct.attrs_off, attrs_len: ct.attrs_len, members_off: ct.members_off, members_len: ct.members_len })
+        i = i + 1
+    }
+}
+
+// Renders one load fault against its file and keeps the string.
+func ld_error(ld: *Ld, path: string, src: string, n: int64, lo: int64, hi: int64, msg: string) -> void {
+    vec_push((*ld).errors, render_file_diag(path, src, n, located(lo, hi, msg)))
+    (*ld).ok = false
+}
+
+// Resolves one import to the file it names, probing beside the root first
+// and then under the home root. A path already loaded or loading counts as
+// found without touching the disk again.
+struct LdTarget { found: bool, path: string }
+
+func resolve_import(ld: *Ld, imp: string) -> LdTarget {
+    status: *Map<int64> = (*ld).status
+    rel: string = import_rel(imp)
+    c1: string = path_under((*ld).rootdir, rel)
+    if map_has(status, c1) {
+        return LdTarget { found: true, path: c1 }
+    }
+    if source_is_file(c1) {
+        return LdTarget { found: true, path: c1 }
+    }
+    c2: string = path_under((*ld).home, rel)
+    if map_has(status, c2) {
+        return LdTarget { found: true, path: c2 }
+    }
+    if source_is_file(c2) {
+        return LdTarget { found: true, path: c2 }
+    }
+    free(rel)
+    return LdTarget { found: false, path: "" }
+}
+
+// Loads one file and, depth first, everything it imports. The file is marked
+// loading before its imports walk and done after, which is what makes a
+// cycle observable as an import landing on a loading file.
+func load_file(ld: *Ld, path: string) -> void {
+    map_put((*ld).status, path, 1)
+    s, e := source_load(path)
+    if e.exists() {
+        vec_push((*ld).errors, lmsg3("ashc: cannot read source file '", path, "'"))
+        (*ld).ok = false
+        map_put((*ld).status, path, 2)
+        return
+    }
+
+    a: *Ast = (*ld).ast
+    m: Marks = take_marks(a)
+    lx: *Lexer = lex(s.text, s.len)
+    p: *Parser = parser_new_in(lx_tokens(lx), s.text, s.len, a)
+    parse_file(p)
+
+    mut bad: bool = false
+    lerrs: *Vector<Located> = lx_errors(lx)
+    mut li: int64 = 0
+    while li < vec_len(lerrs) {
+        le: Located = vec_get(lerrs, li)
+        ld_error(ld, path, s.text, s.len, le.lo, le.hi, le.msg)
+        bad = true
+        li = li + 1
+    }
+    perrs: *Vector<Located> = p_errors(p)
+    mut pi: int64 = 0
+    while pi < vec_len(perrs) {
+        pe: Located = vec_get(perrs, pi)
+        ld_error(ld, path, s.text, s.len, pe.lo, pe.hi, pe.msg)
+        bad = true
+        pi = pi + 1
+    }
+
+    base: int64 = (*ld).base
+    (*ld).base = base + s.len + 1
+    shift_spans(a, m, base)
+    pkg: int64 = pkg_of(ld, dir_of(path))
+    vec_push((*ld).files, LdFile { path: path, src: s.text, len: s.len, base: base, pkg: pkg })
+    decls: *Vector<DeclNode> = (*a).decls
+    mut di: int64 = m.decls
+    while di < vec_len(decls) {
+        vec_push((*ld).decl_pkg, pkg)
+        di = di + 1
+    }
+    imports: *Vector<ImportNode> = (*a).imports
+    imp_lo: int64 = m.imports
+    imp_hi: int64 = vec_len(imports)
+    map_put((*ld).status, path, 2)
+
+    // A faulted parse keeps its diagnostics and stops here: its import list
+    // may be recovery debris, and the program is already rejected.
+    if bad { return }
+
+    // The file's imports, in declaration order. A repeated path is reported
+    // once and walked once; a fresh one resolves and loads depth first. The
+    // status table makes a second sighting of a file free and a sighting of
+    // a still loading file a cycle.
+    seen: *Map<int64> = alloc(map_new())
+    mut ii: int64 = imp_lo
+    while ii < imp_hi {
+        imp: ImportNode = vec_get(imports, ii)
+        text: string = ast_name(a, imp.path)
+        if str_len(text) > 0 {
+            if map_has(seen, text) {
+                ld_error(ld, path, s.text, s.len, imp.lo - base, imp.hi - base, lmsg3("duplicate import '", text, "'"))
+            } else {
+                map_put(seen, text, 1)
+                t: LdTarget = resolve_import(ld, text)
+                if !t.found {
+                    ld_error(ld, path, s.text, s.len, imp.lo - base, imp.hi - base, lmsg3("cannot resolve import '", text, "'"))
+                } else {
+                    st: int64 = unwrap_or(map_get((*ld).status, t.path), 0)
+                    if st == 1 {
+                        ld_error(ld, path, s.text, s.len, imp.lo - base, imp.hi - base, lmsg3("import cycle detected through '", text, "'"))
+                    } else if st == 0 {
+                        // The importer is marked loading again around the
+                        // walk into its import, so a cycle back into this
+                        // file is caught however deep it closes.
+                        map_put((*ld).status, path, 1)
+                        load_file(ld, t.path)
+                        map_put((*ld).status, path, 2)
+                    }
+                }
+            }
+        }
+        ii = ii + 1
+    }
+}
+
+// Loads the whole program rooted at root_path. The returned Program owns the
+// merged tree; when ok is false the errors were already rendered and the
+// tree must not be checked.
+export func load_program(root_path: string) -> *Program {
+    files: *Vector<LdFile> = alloc(vec_new())
+    decl_pkg: *Vector<int64> = alloc(vec_new())
+    errors: *Vector<string> = alloc(vec_new())
+    status: *Map<int64> = alloc(map_new())
+    pkgs: *Map<int64> = alloc(map_new())
+    ld: *Ld = alloc(Ld {
+        ast: ast_new(),
+        files: files,
+        decl_pkg: decl_pkg,
+        errors: errors,
+        status: status,
+        pkgs: pkgs,
+        npkgs: 0,
+        rootdir: dir_of(root_path),
+        home: ash_home(),
+        base: 0,
+        ok: true,
+    })
+    load_file(ld, root_path)
+    return alloc(Program {
+        ast: (*ld).ast,
+        files: (*ld).files,
+        decl_pkg: (*ld).decl_pkg,
+        errors: (*ld).errors,
+        ok: (*ld).ok,
+    })
+}
+
+// Prints every rendered load fault to stderr.
+export func ld_print_errors(prog: *Program) -> void {
+    errs: *Vector<string> = (*prog).errors
+    mut i: int64 = 0
+    while i < vec_len(errs) {
+        printerr(vec_get(errs, i))
+        i = i + 1
+    }
+}
+
+// Maps a fault with shifted spans back to its file and prints it against
+// that file's source. A span outside every file, which no pass produces,
+// falls back to the first file so the message is never lost.
+export func ld_emit(prog: *Program, e: Located) -> void {
+    files: *Vector<LdFile> = (*prog).files
+    mut i: int64 = 0
+    while i < vec_len(files) {
+        f: LdFile = vec_get(files, i)
+        if e.lo >= f.base {
+            if e.lo <= f.base + f.len {
+                emit_located(f.path, f.src, f.len, located(e.lo - f.base, e.hi - f.base, e.msg))
+                return
+            }
+        }
+        i = i + 1
+    }
+    if vec_len(files) > 0 {
+        f0: LdFile = vec_get(files, 0)
+        emit_located(f0.path, f0.src, f0.len, located(0, 0, e.msg))
+    }
+}

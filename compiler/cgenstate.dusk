@@ -140,6 +140,21 @@ export func cg_lookup(g: *Cg, name: int64) -> CBind {
     return CBind { cvar: "", ty: -1, found: false }
 }
 
+// The C name of a compiled clause. Clauses are contract private, so the
+// function is static and the name needs no hash or version: contract names
+// are unique across the program and member names within their contract.
+export func cg_clause_fn(cname: string, clname: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    sb_push(b, "ash_clause_")
+    sb_push(b, cname)
+    sb_push_char(b, 95)
+    sb_push(b, clname)
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
 // The AshTypeTag spelling of a checked type, or "" for a shape the ABI does
 // not tag one to one, which the callers treat as no check or a build fault.
 // A named type resolves through the file's declarations: a record is

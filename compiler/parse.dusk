@@ -35,12 +35,18 @@ export struct Parser {
 }
 
 export func parser_new(toks: *Vector<Token>, src: string, n: int64) -> *Parser {
+    return parser_new_in(toks, src, n, ast_new())
+}
+
+// A parser over an existing AST arena, the form the module loader uses so
+// every file of a program parses into one shared tree and one interner.
+export func parser_new_in(toks: *Vector<Token>, src: string, n: int64, a: *Ast) -> *Parser {
     errs: *Vector<Located> = alloc(vec_new())
     return alloc(Parser {
         toks: toks,
         pos: 0,
         errors: errs,
-        ast: ast_new(),
+        ast: a,
         src: src,
         n: n,
         group_depth: 0,

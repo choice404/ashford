@@ -282,6 +282,25 @@ int main(void) {
     CHECK(result_int(&out, 0, 199),
           "nested_copy: row read out of the slot is its own copy, Ok(199)");
 
+    /* ---- clauses: bare calls onto the static clause functions ---- */
+
+    out = run1(c, "label", int_val(12), "label 12");
+    CHECK(result_str(&out, 0, "big:small"),
+          "label: two clause calls concatenate to Ok(\"big:small\")");
+
+    out = run1(c, "label", int_val(3), "label 3");
+    CHECK(result_str(&out, 0, "small:small"),
+          "label: the small arm is Ok(\"small:small\")");
+
+    out = run1(c, "scale", int_val(5), "scale 5");
+    CHECK(result_int(&out, 0, 12),
+          "scale: a clause calling a clause is Ok((5+1)*2)");
+
+    AshValue clause_elems[3] = { int_val(1), int_val(2), int_val(3) };
+    out = run1(c, "total_twice", int_list(clause_elems, 3), "total_twice");
+    CHECK(result_int(&out, 0, 12),
+          "total_twice: a list argument crosses the clause twice, Ok(12)");
+
     CHECK(ash_contract_break(c) == ASH_OK, "break the instance");
     ash_runtime_shutdown(rt);
     if (g_fail) return 1;

@@ -1,8 +1,10 @@
 // cgen: the module level C emitter, the M3 replacement for the canned M0
 // module. Given a checked file it emits one C translation unit: a static
-// thunk per compiled pledge body in the uniform frame, the vow and pledge
-// descriptor tables, one contract descriptor per contract with its shape
-// hash and version baked in, and the single exported ash_module_register.
+// function per clause, a static thunk per compiled pledge body in the
+// uniform frame, the vow and pledge descriptor tables, one contract
+// descriptor per contract with its shape hash and version baked in, and the
+// single exported ash_module_register. Internal contracts emit nothing at
+// all, which is what keeps them out of the descriptor and iname story.
 // The emitted C includes ash/ash.h and nothing else defines a layout.
 //
 // The shape hash is FNV-1a 64 of the contract's canonical signature string:
@@ -275,18 +277,110 @@ func emit_thunk(g: *Cg, cid: int64, info: PlInfo, mangled: string) -> void {
     (*g).cur_ret = -1
 }
 
-// Emits one contract: its thunks, its descriptor tables, and the contract
-// descriptor the registrar hands over.
+// The contract's clauses in declaration order.
+func collect_clauses(g: *Cg, cid: int64, out: *Vector<int64>) -> void {
+    a: *Ast = (*g).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_clause() {
+            vec_push(out, vec_get((*a).kids, c.members_off + i + 1))
+        }
+        i = i + 2
+    }
+}
+
+// Emits one clause as a static C function in the thunk's exit convention:
+// the value lands through out and the status rides the return, so return,
+// propagation, and the runtime helpers lower inside a clause body exactly as
+// they do inside a pledge body. Argument counts and types were settled by
+// the checker, and every call site is in this translation unit, so the frame
+// carries no runtime checks. A body that runs off its end reports Unit.
+func emit_clause(g: *Cg, cid: int64, cname: string, clid: int64) -> void {
+    a: *Ast = (*g).ast
+    cl: ClauseNode = vec_get((*a).clauses, clid)
+    cs: ClauseSigT = sig_clause((*g).sigs, cid, cl.name)
+
+    old_body: *StringBuilder = (*g).body
+    (*g).body = alloc(sb_new())
+    (*g).tmp = 0
+    (*g).indent = 0
+    (*g).cur_cid = cid
+    (*g).cur_ret = cs.ret
+    (*g).cur_lo = cl.lo
+    (*g).cur_hi = cl.hi
+
+    cg_push_scope(g)
+    mut i: int64 = 0
+    while i < cl.params_len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, cl.params_off + i))
+        mut pt: int64 = ty_unknown((*g).ty)
+        if i < cs.params.len { pt = sig_param((*g).sigs, cs.params, i) }
+        cg_declare(g, f.name, tmsg3("args[", int_to_string(i), "]"), pt)
+        i = i + 1
+    }
+    gen_block(g, cl.body)
+    cg_pop_scope(g)
+
+    fname: string = cg_clause_fn(cname, ast_name(a, cl.name))
+    cg_top(g, tmsg3("static AshStatus ", fname, "(AshContract* cc, const AshValue* args, AshValue* out) {"))
+    cg_top(g, "    (void)cc;")
+    cg_top(g, "    (void)args;")
+    body_text: string = substring(sb_cstr((*g).body), 0, sb_size((*g).body))
+    sb_push((*g).out, body_text)
+    free(body_text)
+    cg_top(g, "    out->ty = ASH_TY_UNIT;")
+    cg_top(g, "    return ASH_OK;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    free(fname)
+
+    sb_free((*g).body)
+    free((*g).body)
+    (*g).body = old_body
+    (*g).cur_cid = -1
+    (*g).cur_ret = -1
+}
+
+// Emits one contract: its clauses, its thunks, its descriptor tables, and
+// the contract descriptor the registrar hands over. Clause prototypes come
+// first so a clause body can call a sibling declared after it and mutual
+// recursion resolves without an ordering rule.
 func emit_contract(g: *Cg, cid: int64) -> void {
     a: *Ast = (*g).ast
     s: *Sigs = (*g).sigs
     c: ContractNode = vec_get((*a).contracts, cid)
     cname: string = ast_name(a, c.name)
+    // Body lowering re-lowers let annotations through the sig tables, whose
+    // internal visibility check reads the current package; keep it in step
+    // with the contract being emitted so a legal annotation stays legal here.
+    cg0: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = cg0.pkg
     vows: *Vector<VowInfo> = alloc(vec_new())
     pls: *Vector<PlInfo> = alloc(vec_new())
     sub_ids: *Vector<int64> = alloc(vec_new())
     sub_names: *Vector<int64> = alloc(vec_new())
     collect(g, cid, vows, pls, sub_ids, sub_names)
+
+    clauses: *Vector<int64> = alloc(vec_new())
+    collect_clauses(g, cid, clauses)
+    mut ci: int64 = 0
+    while ci < vec_len(clauses) {
+        cl0: ClauseNode = vec_get((*a).clauses, vec_get(clauses, ci))
+        proto: string = cg_clause_fn(cname, ast_name(a, cl0.name))
+        cg_top(g, tmsg3("static AshStatus ", proto, "(AshContract* cc, const AshValue* args, AshValue* out);"))
+        free(proto)
+        ci = ci + 1
+    }
+    if vec_len(clauses) > 0 {
+        cg_top(g, "")
+    }
+    mut cj: int64 = 0
+    while cj < vec_len(clauses) {
+        emit_clause(g, cid, cname, vec_get(clauses, cj))
+        cj = cj + 1
+    }
 
     version: int64 = contract_version(g, c)
     shape: string = shape_string(g, cid, vows, pls)
@@ -384,7 +478,13 @@ export func cgen_module(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *V
     while i < vec_len(decls) {
         d: DeclNode = vec_get(decls, i)
         if d.kind == dk_contract() {
-            emit_contract(g, d.id)
+            // An internal contract stays inside its package: no thunks, no
+            // descriptor, and no registration, so it never reaches the iname
+            // table or a foreign host.
+            ci: ContractNode = vec_get((*a).contracts, d.id)
+            if !ci.internal {
+                emit_contract(g, d.id)
+            }
         }
         i = i + 1
     }
@@ -396,8 +496,10 @@ export func cgen_module(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *V
         d2: DeclNode = vec_get(decls, j)
         if d2.kind == dk_contract() {
             c: ContractNode = vec_get((*a).contracts, d2.id)
-            cg_top(g, tmsg3("    st = ash_register_contract(rt, &k_", ast_name(a, c.name), ");"))
-            cg_top(g, "    if (st != ASH_OK) return st;")
+            if !c.internal {
+                cg_top(g, tmsg3("    st = ash_register_contract(rt, &k_", ast_name(a, c.name), ");"))
+                cg_top(g, "    if (st != ASH_OK) return st;")
+            }
         }
         j = j + 1
     }

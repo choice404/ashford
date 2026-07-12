@@ -17,6 +17,7 @@
 
 foreign "C" {
     func cool_file_size(path: *void) -> int64
+    func cool_is_file(path: *void) -> int64
 }
 
 // A loaded source file: its path and its full text. len is the true byte
@@ -65,6 +66,16 @@ export func source_load(path: string) -> (Source, error) {
         return (Source { path: path, text: text, len: 0 }, error { message: "source is not valid UTF-8" })
     }
     return (Source { path: path, text: text, len: n }, error {})
+}
+
+// Whether path names a regular file, the probe the module loader's search
+// order runs before it commits to reading a candidate. A stat failure is a
+// plain false, so a missing candidate falls through to the next root quietly.
+export func source_is_file(path: string) -> bool {
+    buf: *raw char = to_cbuf(path)
+    r: int64 = cool_is_file(buf)
+    free(buf)
+    return r == 1
 }
 
 // Releases the file text a successful load allocated. Only call this on a
