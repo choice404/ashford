@@ -28,14 +28,15 @@ ASHD       := $(OUT)/ashd
 MODULE     := $(OUT)/libhello.ash.so
 MODULE_V2  := $(OUT)/libhello_v2.ash.so
 MODULE_PAY := $(OUT)/libpayment.ash.so
+MODULE_NETPAY := $(OUT)/libnet_payment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan tsan clean
 
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 tsan
 
 runtime: $(RT_SO)
 
@@ -58,6 +59,9 @@ $(MODULE_V2): $(ASHC) skeleton/hello_v2.ash runtime/include/ash/ash_abi.h
 
 $(MODULE_PAY): $(ASHC) skeleton/payment.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/payment.ash
+
+$(MODULE_NETPAY): $(ASHC) skeleton/net_payment.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/net_payment.ash
 
 $(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/lang.ash
@@ -266,6 +270,40 @@ test-net-tsan: $(MODULE)
 	    tests/net/test_handshake.c runtime/src/runtime.c runtime/src/wire.c \
 	    runtime/src/net.c -ldl -o $(OUT)/test_handshake_tsan
 	tests/net/run_net.sh $(OUT)/ashd_tsan $(OUT)/test_handshake_tsan $(MODULE)
+
+# The N2 transparency gate: ashd serves the payment module on loopback, and one
+# client links libashrt and runs the same sign, fulfill, partial, and break
+# sequence twice, once by loading the module locally and once by connecting to
+# the daemon, asserting the identical outcome from each so the host code is
+# proven to not care which side of the wire the contract lives on. A third phase
+# kills the daemon mid fulfillment and asserts ASH_ERR_NET on the in flight
+# waits. The client is handed the daemon's pid so it severs the connection
+# itself, which is how the disconnect is timed against a live wait.
+test-net2: $(RT_SO) $(MODULE_NETPAY) $(ASHD)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -pthread -I runtime/include -I runtime/src \
+	    tests/net/test_remote.c -L $(OUT) -lashrt \
+	    -Wl,-rpath,'$$ORIGIN' -o $(OUT)/test_remote
+	tests/net/run_net2.sh $(ASHD) $(OUT)/test_remote $(MODULE_NETPAY)
+
+# The N2 gate under ThreadSanitizer: the daemon and the client both built with
+# the runtime and the socket code compiled in, so TSan watches the accept loop,
+# every connection and waiter thread, the client's reader thread, and the
+# detached-waiter versus break race across the disconnect. The dlopened module
+# is not instrumented, which TSan tolerates; -rdynamic exports the ash_* symbols
+# it resolves against. Not in the default all gate because it stands up a real
+# daemon under a sanitizer; run it explicitly.
+test-net2-tsan: $(MODULE_NETPAY)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/ashd_net2_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
+	    -I runtime/include -I runtime/src \
+	    tests/net/test_remote.c runtime/src/runtime.c runtime/src/wire.c \
+	    runtime/src/net.c -ldl -o $(OUT)/test_remote_tsan
+	tests/net/run_net2.sh $(OUT)/ashd_net2_tsan $(OUT)/test_remote_tsan $(MODULE_NETPAY)
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
 # full host walk, runtime compiled into each binary so TSan sees every lock.

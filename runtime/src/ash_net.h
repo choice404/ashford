@@ -73,6 +73,62 @@ int ash_net_set_rcvtimeo(int fd, uint32_t ms);
  * dump text so a client can tell one served world from another. */
 uint64_t ash_net_fnv1a64(const uint8_t* bytes, size_t n);
 
+/* ---- message payload builders and readers ----
+ *
+ * The frame codec moves the header and a byte count; these turn the message
+ * payloads of docs/network.md into and out of those bytes. Both C parties link
+ * them, so a SIGN the client writes and the daemon reads is one format with one
+ * implementation. Payload strings are a u32 byte length then the bytes, no
+ * terminator, distinct from the u64 length a String value carries inside the
+ * value encoding. */
+
+/* A growable byte buffer a message is written into. err latches on any
+ * allocation or overflow, so a caller may append a whole message and check
+ * once at the end; a builder whose err is set has a NULL, zero length payload
+ * and must not be sent. */
+typedef struct AshWBuf {
+    uint8_t* data;
+    size_t   len;
+    size_t   cap;
+    int      err;
+} AshWBuf;
+
+void ash_wbuf_init(AshWBuf* w);
+void ash_wbuf_free(AshWBuf* w);
+void ash_wbuf_u32(AshWBuf* w, uint32_t v);
+void ash_wbuf_u64(AshWBuf* w, uint64_t v);
+void ash_wbuf_i64(AshWBuf* w, int64_t v);
+void ash_wbuf_bytes(AshWBuf* w, const void* p, size_t n);
+/* A u32 length prefixed payload string. */
+void ash_wbuf_str(AshWBuf* w, const char* s, size_t n);
+/* Encodes one AshValue in the canonical wire form. Sets err on a value that
+ * cannot cross, an instance handle or a pledge ref, so a refused value fails
+ * the whole message rather than sending half of it. */
+void ash_wbuf_value(AshWBuf* w, const AshValue* v);
+
+/* A bounds checked cursor over a received payload. Every read checks the bytes
+ * that remain before it advances, so a truncated or lying payload is a clean
+ * failure rather than a read past the buffer. Returns 1 on success, 0 when the
+ * bytes are not there. */
+typedef struct AshRBuf {
+    const uint8_t* p;
+    size_t         left;
+} AshRBuf;
+
+void ash_rbuf_init(AshRBuf* r, const uint8_t* p, size_t n);
+int  ash_rbuf_u32(AshRBuf* r, uint32_t* out);
+int  ash_rbuf_u64(AshRBuf* r, uint64_t* out);
+int  ash_rbuf_i64(AshRBuf* r, int64_t* out);
+/* A payload string: *out aims into the cursor's own bytes, borrowed for the
+ * life of the payload buffer, *len is its byte length. Not NUL terminated. */
+int  ash_rbuf_str(AshRBuf* r, const char** out, uint32_t* len);
+/* How many payload bytes remain unread, so a value decode can be handed the
+ * rest of the frame. */
+size_t ash_rbuf_left(const AshRBuf* r);
+/* Advances the cursor past n bytes a value decode consumed. Returns 1 when the
+ * bytes were there. */
+int  ash_rbuf_skip(AshRBuf* r, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

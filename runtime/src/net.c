@@ -204,3 +204,146 @@ uint64_t ash_net_fnv1a64(const uint8_t* bytes, size_t n) {
     }
     return h;
 }
+
+/* ---- message payload builders ---- */
+
+void ash_wbuf_init(AshWBuf* w) {
+    w->data = NULL;
+    w->len = 0;
+    w->cap = 0;
+    w->err = 0;
+}
+
+void ash_wbuf_free(AshWBuf* w) {
+    free(w->data);
+    w->data = NULL;
+    w->len = w->cap = 0;
+}
+
+/* Grows to hold n more bytes, latching err on overflow or a failed grow so a
+ * message half written is never sent. */
+static int wbuf_reserve(AshWBuf* w, size_t n) {
+    if (w->err) return 0;
+    if (n > SIZE_MAX - w->len) {
+        w->err = 1;
+        return 0;
+    }
+    size_t need = w->len + n;
+    if (need > w->cap) {
+        size_t cap = w->cap ? w->cap : 64;
+        while (cap < need) {
+            if (cap > SIZE_MAX / 2) {
+                cap = need;
+                break;
+            }
+            cap *= 2;
+        }
+        uint8_t* grown = (uint8_t*)realloc(w->data, cap);
+        if (!grown) {
+            w->err = 1;
+            return 0;
+        }
+        w->data = grown;
+        w->cap = cap;
+    }
+    return 1;
+}
+
+void ash_wbuf_bytes(AshWBuf* w, const void* p, size_t n) {
+    if (!wbuf_reserve(w, n)) return;
+    if (n) memcpy(w->data + w->len, p, n);
+    w->len += n;
+}
+
+void ash_wbuf_u32(AshWBuf* w, uint32_t v) {
+    if (!wbuf_reserve(w, 4)) return;
+    ash_net_put_u32(w->data + w->len, v);
+    w->len += 4;
+}
+
+void ash_wbuf_u64(AshWBuf* w, uint64_t v) {
+    if (!wbuf_reserve(w, 8)) return;
+    ash_net_put_u64(w->data + w->len, v);
+    w->len += 8;
+}
+
+void ash_wbuf_i64(AshWBuf* w, int64_t v) {
+    ash_wbuf_u64(w, (uint64_t)v);
+}
+
+void ash_wbuf_str(AshWBuf* w, const char* s, size_t n) {
+    ash_wbuf_u32(w, (uint32_t)n);
+    ash_wbuf_bytes(w, s, n);
+}
+
+void ash_wbuf_value(AshWBuf* w, const AshValue* v) {
+    if (w->err) return;
+    /* The sizing pass returns ASH_ERR_OOM with the size in need, since a NULL
+     * buffer can never hold the value; only ASH_ERR_TYPE means the value cannot
+     * be encoded at all. */
+    size_t need = 0;
+    AshStatus st = ash_wire_encode_value(v, NULL, 0, &need);
+    if (st != ASH_OK && st != ASH_ERR_OOM) {
+        w->err = 1;
+        return;
+    }
+    if (!wbuf_reserve(w, need)) return;
+    st = ash_wire_encode_value(v, w->data + w->len, w->cap - w->len, &need);
+    if (st != ASH_OK) {
+        w->err = 1;
+        return;
+    }
+    w->len += need;
+}
+
+/* ---- message payload readers ---- */
+
+void ash_rbuf_init(AshRBuf* r, const uint8_t* p, size_t n) {
+    r->p = p;
+    r->left = n;
+}
+
+int ash_rbuf_u32(AshRBuf* r, uint32_t* out) {
+    if (r->left < 4) return 0;
+    *out = ash_net_get_u32(r->p);
+    r->p += 4;
+    r->left -= 4;
+    return 1;
+}
+
+int ash_rbuf_u64(AshRBuf* r, uint64_t* out) {
+    if (r->left < 8) return 0;
+    *out = ash_net_get_u64(r->p);
+    r->p += 8;
+    r->left -= 8;
+    return 1;
+}
+
+int ash_rbuf_i64(AshRBuf* r, int64_t* out) {
+    uint64_t u;
+    if (!ash_rbuf_u64(r, &u)) return 0;
+    *out = (int64_t)u;
+    return 1;
+}
+
+int ash_rbuf_str(AshRBuf* r, const char** out, uint32_t* len) {
+    uint32_t n;
+    if (!ash_rbuf_u32(r, &n)) return 0;
+    if (n > r->left) return 0;
+    *out = (const char*)r->p;
+    *len = n;
+    r->p += n;
+    r->left -= n;
+    return 1;
+}
+
+size_t ash_rbuf_left(const AshRBuf* r) {
+    return r->left;
+}
+
+int ash_rbuf_skip(AshRBuf* r, size_t n) {
+    if (n > r->left) return 0;
+    r->p += n;
+    r->left -= n;
+    return 1;
+}
