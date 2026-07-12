@@ -1,13 +1,16 @@
 // cgenexpr: lowering one expression to C. Every expression becomes a fresh
 // AshValue temporary built by a few statements, and the lowering returns the
 // temporary's name beside its checked type, so the parent reads fields off a
-// value whose shape it knows. The subset lowered here is the M3 set: the
-// literals, parameter and vow reads, let bound names, the unary and binary
-// operators including String concatenation, and the Option and Result
-// constructors. Anything else is a named build error through cg_unsupported,
-// so no thunk ever ships C the emitter was guessing at. The type questions
-// were all settled by the checker before codegen runs; the types read here
-// pick union fields, never report faults.
+// value whose shape it knows. The lowered set now spans the grammar's
+// expression core: the literals, parameter, vow, and let bound reads, the
+// operators including String concatenation and deep equality, the Option and
+// Result constructors, list, tuple, and record literals, record field reads,
+// list indexing, sum variant construction, the propagation operator, and
+// match, which lives in cgenmatch. What stays out, calls into clauses and
+// contracts, member access on instances, and Map operations, is a named
+// build error through cg_unsupported, so no thunk ever ships C the emitter
+// was guessing at. The type questions were all settled by the checker before
+// codegen runs; the types read here pick union fields, never report faults.
 
 @paradigm procedural
 
@@ -21,21 +24,20 @@
 @import tysigs
 @import tcstate
 @import cgenstate
+@import cgenmatch
 
-export struct CVal { cvar: string, ty: int64 }
-
-func bad_val(g: *Cg) -> CVal {
+export func bad_val(g: *Cg) -> CVal {
     return CVal { cvar: "bad", ty: ty_unknown((*g).ty) }
 }
 
 // Opens a fresh zeroed AshValue temporary and returns its name.
-func new_value(g: *Cg) -> string {
+export func new_value(g: *Cg) -> string {
     v: string = cg_tmp(g)
     cg_line(g, tmsg3("AshValue ", v, " = {0};"))
     return v
 }
 
-func set_ty(g: *Cg, v: string, tag: string) -> void {
+export func set_ty(g: *Cg, v: string, tag: string) -> void {
     cg_line(g, tmsg5(v, ".ty = ", tag, ";", ""))
 }
 
@@ -81,7 +83,50 @@ func gen_str(g: *Cg, e: ExprNode) -> CVal {
     return CVal { cvar: v, ty: ty_str((*g).ty) }
 }
 
-// A parameter, a let binding, or a vow of the enclosing contract.
+// A sum variant constructor, the bare form and the payload carrying call
+// form alike. The value's tag is the variant's declaration index and the
+// payload rides the list arm as an instance owned field array.
+export func gen_variant(g: *Cg, name: int64, args_off: int64, args_len: int64, lo: int64, hi: int64) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    cv: CVariant = cg_variant(g, name)
+    if !cv.found {
+        cg_unsupported(g, lo, hi, tmsg3("the constructor '", ast_name(a, name), "' in a pledge body"))
+        return bad_val(g)
+    }
+    tyid: int64 = ty_named(t, ast_name(a, cv.owner))
+    mut arr: string = ""
+    if cv.len > 0 {
+        arr = cg_tmp(g)
+        n: string = int_to_string(cv.len)
+        cg_line(g, tmsg7("AshValue* ", arr, " = (AshValue*)ash_bytes(cc, ", n, " * sizeof(AshValue));", "", ""))
+        cg_line(g, tmsg3("if (!", arr, ") return ASH_ERR_OOM;"))
+        mut i: int64 = 0
+        while i < args_len {
+            arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, args_off + i))
+            mut fw: int64 = -1
+            if i < cv.len { fw = sig_field((*g).sigs, cv.off, i).ty }
+            pv: CVal = gen_expr(g, arg.expr, fw)
+            if i < cv.len {
+                cg_line(g, tmsg7(arr, "[", int_to_string(i), "] = ", pv.cvar, ";", ""))
+            }
+            i = i + 1
+        }
+    }
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_SUM")
+    cg_line(g, tmsg5(v, ".tag = ", int_to_string(cv.idx), ";", ""))
+    if cv.len > 0 {
+        n2: string = int_to_string(cv.len)
+        cg_line(g, tmsg5(v, ".as.list.data = ", arr, ";", ""))
+        cg_line(g, tmsg5(v, ".as.list.len = ", n2, ";", ""))
+        cg_line(g, tmsg5(v, ".as.list.cap = ", n2, ";", ""))
+    }
+    return CVal { cvar: v, ty: tyid }
+}
+
+// A parameter, a let binding, a vow of the enclosing contract, or a bare sum
+// variant, which the parser leaves as an identifier on purpose.
 func gen_ident(g: *Cg, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
     bind: CBind = cg_lookup(g, e.a)
@@ -100,6 +145,10 @@ func gen_ident(g: *Cg, e: ExprNode) -> CVal {
             cg_line(g, tmsg5("AshValue ", v, " = *", p, ";"))
             return CVal { cvar: v, ty: vs.ty }
         }
+    }
+    ge: GEntry = rs_global((*g).res, e.a)
+    if ge.kind == gk_variant() {
+        return gen_variant(g, e.a, 0, 0, e.lo, e.hi)
     }
     cg_unsupported(g, e.lo, e.hi, tmsg3("the name '", text, "' in a pledge body"))
     return bad_val(g)
@@ -134,15 +183,61 @@ func gen_concat(g: *Cg, l: CVal, r: CVal) -> CVal {
     return CVal { cvar: v, ty: ty_str((*g).ty) }
 }
 
+// Whether a checked type is a composite whose value is more than one union
+// field: the named shapes, records and sums, lists, tuples, Option, and
+// Result. These are the values that carry a data pointer or a box, so a bare
+// struct assignment aliases them and a copy has to walk the whole shape.
+export func cg_is_composite(t: *TyArena, tyid: int64) -> bool {
+    k: int64 = ty_get(t, tyid).kind
+    if k == tyk_named() || k == tyk_list() || k == tyk_tuple() { return true }
+    return k == tyk_option() || k == tyk_result()
+}
+
+// Whether equality on this checked type goes through the structural
+// ash_value_eq helper: exactly the composite shapes, everything whose value
+// is more than one union field.
+func deep_eq_kind(t: *TyArena, tyid: int64) -> bool {
+    return cg_is_composite(t, tyid)
+}
+
+// Gives a value its own instance owned storage so no other binding can see a
+// mutation through it, the value semantics the grammar promises for let,
+// assignment, argument, return, and a composite read out of a field or slot.
+// A scalar or a string rides through untouched, its one union field or its
+// immutable bytes already independent; a composite is deep copied into a
+// fresh temporary. A copy that runs out of memory returns its status straight
+// through the thunk.
+export func cg_copy_out(g: *Cg, v: CVal) -> CVal {
+    if !cg_is_composite((*g).ty, v.ty) { return v }
+    dst: string = new_value(g)
+    st: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, &", v.cvar, ", &", dst, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    return CVal { cvar: dst, ty: v.ty }
+}
+
 func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
     t: *TyArena = (*g).ty
     op: int64 = e.a
     if op == bop_and() || op == bop_or() {
+        // Short circuit: the left operand lowers, then the right lowers inside
+        // a guard so its statements, an out of range index among them, only
+        // run when the left has not already decided the answer. '&&' evaluates
+        // the right when the left is true, '||' when the left is false.
         l: CVal = gen_expr(g, e.b, ty_bool(t))
-        r: CVal = gen_expr(g, e.c, ty_bool(t))
         v: string = new_value(g)
         set_ty(g, v, "ASH_TY_BOOL")
-        cg_line(g, tmsg7(v, ".as.b = (", l.cvar, tmsg3(".as.b ", c_op(op), " "), r.cvar, ".as.b);", ""))
+        cg_line(g, tmsg5(v, ".as.b = ", l.cvar, ".as.b;", ""))
+        if op == bop_and() {
+            cg_line(g, tmsg3("if (", v, ".as.b) {"))
+        } else {
+            cg_line(g, tmsg3("if (!", v, ".as.b) {"))
+        }
+        (*g).indent = (*g).indent + 1
+        r: CVal = gen_expr(g, e.c, ty_bool(t))
+        cg_line(g, tmsg5(v, ".as.b = ", r.cvar, ".as.b;", ""))
+        (*g).indent = (*g).indent - 1
+        cg_line(g, "}")
         return CVal { cvar: v, ty: ty_bool(t) }
     }
     mut aw: int64 = -1
@@ -165,14 +260,18 @@ func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
     if op == bop_eq() || op == bop_ne() {
         v2: string = new_value(g)
         set_ty(g, v2, "ASH_TY_BOOL")
+        mut bang: string = ""
+        if op == bop_ne() { bang = "!" }
         if k == tyk_str() {
-            mut bang: string = ""
-            if op == bop_ne() { bang = "!" }
             cg_line(g, tmsg7(v2, ".as.b = ", bang, "ash_string_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
             return CVal { cvar: v2, ty: ty_bool(t) }
         }
         fld: string = cg_field_of(g, opty)
         if str_len(fld) == 0 {
+            if deep_eq_kind(t, opty) {
+                cg_line(g, tmsg7(v2, ".as.b = ", bang, "ash_value_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
+                return CVal { cvar: v2, ty: ty_bool(t) }
+            }
             cg_unsupported(g, e.lo, e.hi, "'==' on this type")
             return bad_val(g)
         }
@@ -263,6 +362,202 @@ func gen_none(g: *Cg, e: ExprNode, want: int64) -> CVal {
     return CVal { cvar: v, ty: tyid }
 }
 
+// A list literal: the elements lower in source order, then the list is built
+// with the element tag of the checked element type and each value pushed.
+func gen_list(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    mut elem: int64 = -1
+    if want >= 0 {
+        wn: TyNode = ty_get(t, want)
+        if wn.kind == tyk_list() { elem = wn.a }
+    }
+    vals: *Vector<CVal> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < e.b {
+        cvi: CVal = gen_expr(g, vec_get((*a).kids, e.a + i), elem)
+        if elem < 0 { elem = cvi.ty }
+        vec_push(vals, cvi)
+        i = i + 1
+    }
+    if elem < 0 { elem = ty_unknown(t) }
+    mut tag: string = cg_tag_of(g, elem)
+    // An empty literal with no expectation has no element tag to declare;
+    // Unit stands in, and nothing is ever pushed against it.
+    if str_len(tag) == 0 { tag = "ASH_TY_UNIT" }
+    v: string = new_value(g)
+    cg_line(g, tmsg7("if (ash_list_new(cc, ", tag, ", ", int_to_string(e.b), ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    mut j: int64 = 0
+    while j < vec_len(vals) {
+        el: CVal = vec_get(vals, j)
+        cg_line(g, tmsg7("if (ash_list_push(cc, &", v, ", &", el.cvar, ") != ASH_OK) return ASH_ERR_OOM;", "", ""))
+        j = j + 1
+    }
+    return CVal { cvar: v, ty: ty_list(t, elem) }
+}
+
+// A tuple literal: elements in source order, then a fresh tuple whose slots
+// take the values one by one.
+func gen_tuple(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    mut wn: TyNode = TyNode { kind: -1, a: 0, b: 0, off: 0, len: 0 }
+    if want >= 0 { wn = ty_get(t, want) }
+    vals: *Vector<CVal> = alloc(vec_new())
+    tys: *Vector<int64> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < e.b {
+        mut ew: int64 = -1
+        if wn.kind == tyk_tuple() {
+            if wn.len == e.b { ew = vec_get((*t).kids, wn.off + i) }
+        }
+        cvi: CVal = gen_expr(g, vec_get((*a).kids, e.a + i), ew)
+        vec_push(vals, cvi)
+        vec_push(tys, cvi.ty)
+        i = i + 1
+    }
+    v: string = new_value(g)
+    cg_line(g, tmsg5("if (ash_tuple_new(cc, ", int_to_string(e.b), ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    mut j: int64 = 0
+    while j < vec_len(vals) {
+        el: CVal = vec_get(vals, j)
+        cg_line(g, tmsg7("((AshValue*)", v, ".as.list.data)[", int_to_string(j), "] = ", el.cvar, ";"))
+        j = j + 1
+    }
+    return CVal { cvar: v, ty: ty_tuple(t, tys) }
+}
+
+// A record literal. The instance owns the field array; the slots fill in
+// declaration order, each value lowered against its declared field type.
+func gen_record_lit(g: *Cg, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    rs: RecSig = sig_rec((*g).sigs, e.a)
+    if !rs.found {
+        cg_unsupported(g, e.lo, e.hi, tmsg3("the record literal '", ast_name(a, e.a), "' in a pledge body"))
+        return bad_val(g)
+    }
+    tyid: int64 = ty_named(t, ast_name(a, e.a))
+    mut arr: string = ""
+    if rs.len > 0 {
+        arr = cg_tmp(g)
+        n: string = int_to_string(rs.len)
+        cg_line(g, tmsg7("AshValue* ", arr, " = (AshValue*)ash_bytes(cc, ", n, " * sizeof(AshValue));", "", ""))
+        cg_line(g, tmsg3("if (!", arr, ") return ASH_ERR_OOM;"))
+        mut j: int64 = 0
+        while j < rs.len {
+            fld: FieldSig = sig_field((*g).sigs, rs.off, j)
+            mut val_id: int64 = -1
+            mut k: int64 = 0
+            while k < e.c {
+                fname: int64 = vec_get((*a).kids, e.b + k)
+                if fname == fld.name {
+                    val_id = vec_get((*a).kids, e.b + k + 1)
+                }
+                k = k + 2
+            }
+            if val_id >= 0 {
+                pv: CVal = gen_expr(g, val_id, fld.ty)
+                cg_line(g, tmsg7(arr, "[", int_to_string(j), "] = ", pv.cvar, ";", ""))
+            } else {
+                cg_err(g, e.lo, e.hi, tmsg3("codegen: record literal is missing field '", ast_name(a, fld.name), "'"))
+            }
+            j = j + 1
+        }
+    }
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_RECORD")
+    if rs.len > 0 {
+        n2: string = int_to_string(rs.len)
+        cg_line(g, tmsg5(v, ".as.list.data = ", arr, ";", ""))
+        cg_line(g, tmsg5(v, ".as.list.len = ", n2, ";", ""))
+        cg_line(g, tmsg5(v, ".as.list.cap = ", n2, ";", ""))
+    }
+    return CVal { cvar: v, ty: tyid }
+}
+
+// A member read: a record field lifts out of its slot by declaration index.
+// Every other member form still belongs to a later milestone.
+func gen_member(g: *Cg, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    base: CVal = gen_expr(g, e.a, -1)
+    cn: CNamed = cg_named(g, base.ty)
+    if cn.kind == gk_record() {
+        cf: CField = cg_rec_field(g, cn.name, e.b)
+        if cf.found {
+            v: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshValue ", v, " = ((const AshValue*)", base.cvar, ".as.list.data)[", tmsg2(int_to_string(cf.idx), "];"), ""))
+            // The read yields a value, so a composite field lifts out as its
+            // own copy: mutating it never writes back through the record.
+            return cg_copy_out(g, CVal { cvar: v, ty: cf.ty })
+        }
+    }
+    cg_unsupported(g, e.lo, e.hi, tmsg3("member access '.", ast_name(a, e.b), "' in a pledge body"))
+    return bad_val(g)
+}
+
+// A list index read, bounds checked through ash_list_get: an index outside
+// the list, negative included through the unsigned cast, is a clean
+// ASH_ERR_TYPE from the pledge.
+func gen_index(g: *Cg, e: ExprNode) -> CVal {
+    t: *TyArena = (*g).ty
+    base: CVal = gen_expr(g, e.a, -1)
+    idx: CVal = gen_expr(g, e.b, ty_int(t))
+    n: TyNode = ty_get(t, base.ty)
+    if n.kind != tyk_list() {
+        cg_unsupported(g, e.lo, e.hi, "indexing this type in a pledge body")
+        return bad_val(g)
+    }
+    p: string = cg_tmp(g)
+    cg_line(g, tmsg7("const AshValue* ", p, " = ash_list_get(&", base.cvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+    cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_TYPE;"))
+    v: string = cg_tmp(g)
+    cg_line(g, tmsg5("AshValue ", v, " = *", p, ";"))
+    // A read is a value read, so a composite element comes out as its own
+    // copy and a later mutation never reaches back into the list.
+    return cg_copy_out(g, CVal { cvar: v, ty: n.a })
+}
+
+// The propagation operator. On the failure tag, None or Err, the whole value
+// returns through the thunk's out parameter, the same early exit the grammar
+// promises; on success the payload lifts out of the box.
+func gen_question(g: *Cg, e: ExprNode) -> CVal {
+    t: *TyArena = (*g).ty
+    x: CVal = gen_expr(g, e.a, -1)
+    n: TyNode = ty_get(t, x.ty)
+    mut fail: string = "0"
+    mut inner: int64 = n.a
+    if n.kind == tyk_result() {
+        fail = "1"
+    } else if n.kind != tyk_option() {
+        cg_unsupported(g, e.lo, e.hi, "'?' on this type")
+        return bad_val(g)
+    }
+    cg_line(g, tmsg7("if (", x.cvar, ".tag == ", fail, ") { *out = ", x.cvar, "; return ASH_OK; }"))
+    v: string = cg_tmp(g)
+    cg_line(g, tmsg5("AshValue ", v, " = *(const AshValue*)", x.cvar, ".as.box;"))
+    return CVal { cvar: v, ty: inner }
+}
+
+// A call expression. The one callable the lowered subset owns is a sum
+// variant constructor; clause calls and the contract operations stay named
+// build errors until their milestone.
+func gen_call(g: *Cg, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    cn: ExprNode = vec_get((*a).exprs, e.a)
+    if cn.kind == xk_ident() {
+        b: CBind = cg_lookup(g, cn.a)
+        if !b.found {
+            ge: GEntry = rs_global((*g).res, cn.a)
+            if ge.kind == gk_variant() {
+                return gen_variant(g, cn.a, e.b, e.c, e.lo, e.hi)
+            }
+        }
+    }
+    cg_unsupported(g, e.lo, e.hi, "a call in a pledge body")
+    return bad_val(g)
+}
+
 export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
     a: *Ast = (*g).ast
     t: *TyArena = (*g).ty
@@ -297,13 +592,13 @@ export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
     if e.kind == xk_ok() { return gen_ok_err(g, e, want, true) }
     if e.kind == xk_err() { return gen_ok_err(g, e, want, false) }
     if e.kind == xk_mut() { return gen_expr(g, e.a, want) }
-    if e.kind == xk_call() { cg_unsupported(g, e.lo, e.hi, "a call in a pledge body") }
-    if e.kind == xk_member() { cg_unsupported(g, e.lo, e.hi, "member access in a pledge body") }
-    if e.kind == xk_index() { cg_unsupported(g, e.lo, e.hi, "indexing in a pledge body") }
-    if e.kind == xk_question() { cg_unsupported(g, e.lo, e.hi, "'?' in a pledge body") }
-    if e.kind == xk_tuple() { cg_unsupported(g, e.lo, e.hi, "a tuple literal in a pledge body") }
-    if e.kind == xk_list() { cg_unsupported(g, e.lo, e.hi, "a list literal in a pledge body") }
-    if e.kind == xk_record_lit() { cg_unsupported(g, e.lo, e.hi, "a record literal in a pledge body") }
-    if e.kind == xk_match() { cg_unsupported(g, e.lo, e.hi, "match in a pledge body") }
+    if e.kind == xk_call() { return gen_call(g, e) }
+    if e.kind == xk_member() { return gen_member(g, e) }
+    if e.kind == xk_index() { return gen_index(g, e) }
+    if e.kind == xk_question() { return gen_question(g, e) }
+    if e.kind == xk_tuple() { return gen_tuple(g, e, want) }
+    if e.kind == xk_list() { return gen_list(g, e, want) }
+    if e.kind == xk_record_lit() { return gen_record_lit(g, e) }
+    if e.kind == xk_match() { return gen_match(g, e, want) }
     return bad_val(g)
 }

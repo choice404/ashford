@@ -1545,6 +1545,63 @@ const AshValue* ash_list_get(const AshValue* v, uint64_t idx) {
     return (const AshValue*)v->as.list.data + idx;
 }
 
+/* Overwrites one live slot in place. No allocation happens here, so no
+ * contract rides the call; the element must already be instance owned, the
+ * same rule ash_list_push states. Out of range is ASH_ERR_TYPE, the status a
+ * compiled index assignment returns from its pledge on a bad index. */
+AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem) {
+    if (!list || !elem) return ASH_ERR_TYPE;
+    if (list->ty != ASH_TY_LIST) return ASH_ERR_TYPE;
+    if (elem->ty != list->as.list.elem_ty) return ASH_ERR_TYPE;
+    if (idx >= list->as.list.len) return ASH_ERR_TYPE;
+    ((AshValue*)list->as.list.data)[idx] = *elem;
+    return ASH_OK;
+}
+
+/* Structural equality, the recursion mirroring ash_value_deep_copy: what the
+ * copy can reach, the compare can test. A tag mismatch reads unequal, and so
+ * does an arm with no settled repr, Map today, rather than guessing. */
+int ash_value_eq(const AshValue* a, const AshValue* b) {
+    if (!a || !b) return 0;
+    if (a->ty != b->ty) return 0;
+    switch ((AshTypeTag)a->ty) {
+    case ASH_TY_UNIT:  return 1;
+    case ASH_TY_INT:   return a->as.i == b->as.i;
+    case ASH_TY_UINT:  return a->as.u == b->as.u;
+    case ASH_TY_FLOAT: return a->as.f == b->as.f;
+    case ASH_TY_BOOL:
+    case ASH_TY_BYTE:  return a->as.b == b->as.b;
+    case ASH_TY_CHAR:  return a->as.ch == b->as.ch;
+    case ASH_TY_STRING:
+        return ash_string_eq(a, b);
+    case ASH_TY_LIST:
+    case ASH_TY_TUPLE:
+    case ASH_TY_RECORD:
+    case ASH_TY_SUM: {
+        if (a->tag != b->tag) return 0;
+        if (a->as.list.len != b->as.list.len) return 0;
+        const AshValue* xa = (const AshValue*)a->as.list.data;
+        const AshValue* xb = (const AshValue*)b->as.list.data;
+        for (uint64_t i = 0; i < a->as.list.len; i++) {
+            if (!ash_value_eq(&xa[i], &xb[i])) return 0;
+        }
+        return 1;
+    }
+    case ASH_TY_OPTION:
+    case ASH_TY_RESULT: {
+        if (a->tag != b->tag) return 0;
+        if (!a->as.box && !b->as.box) return 1;
+        if (!a->as.box || !b->as.box) return 0;
+        return ash_value_eq((const AshValue*)a->as.box,
+                            (const AshValue*)b->as.box);
+    }
+    case ASH_TY_MAP:
+    case ASH_TY_PLEDGE_REF:
+    default:
+        return 0;
+    }
+}
+
 AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out) {
     if (!c || !out) return ASH_ERR_TYPE;
     memset(out, 0, sizeof(*out));
@@ -1560,9 +1617,10 @@ AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out) {
 }
 
 /* The recursive workhorse behind copy-in. Scalars are the struct copy, a
- * string copies its bytes, list and tuple copy element by element, Option
- * and Result rebox their payload. Map and record wait for a settled repr;
- * copying them today would freeze one by accident. */
+ * string copies its bytes, list, tuple, record, and sum payloads copy element
+ * by element on the shared list arm, Option and Result rebox their payload.
+ * Map waits for a settled repr; copying it today would freeze one by
+ * accident. */
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
                               AshValue* dst) {
     if (!c || !src || !dst) return ASH_ERR_TYPE;
@@ -1582,10 +1640,13 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
         if (src->as.s.len && !dst->as.s.ptr) return ASH_ERR_OOM;
         return ASH_OK;
     case ASH_TY_LIST:
-    case ASH_TY_TUPLE: {
+    case ASH_TY_TUPLE:
+    case ASH_TY_RECORD:
+    case ASH_TY_SUM: {
         uint64_t n = src->as.list.len;
         memset(dst, 0, sizeof(*dst));
         dst->ty = src->ty;
+        dst->tag = src->tag;
         dst->as.list.elem_ty = src->as.list.elem_ty;
         dst->as.list.len = n;
         dst->as.list.cap = n;
@@ -1615,7 +1676,6 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
         return ASH_OK;
     }
     case ASH_TY_MAP:
-    case ASH_TY_RECORD:
     default:
         return ASH_ERR_TYPE;
     }

@@ -1,0 +1,250 @@
+// cgenmatch: lowering the match expression to C. The scrutinee lowers once
+// into a temporary, the result rides an out temporary the arms assign, and
+// the arms become a nested if else chain, first arm outermost, so tests run
+// lazily in source order. Each refutable arm's test is a do while zero
+// block: the pattern walks top down, every failing check breaks out, and
+// only a walk that reaches the end raises the arm's hit flag. Pattern code
+// contains no user statements, literal subexpressions aside, so that break
+// can never capture a loop break written in an arm body; the bodies
+// themselves sit in plain if blocks where break and continue still mean the
+// enclosing loop. Payload bindings hoist as zeroed AshValue locals above the
+// test so the body reads them in scope. The checker proved exhaustiveness
+// and arm type agreement already; a match nothing catches leaves the zeroed
+// Unit result, a case a checked program cannot reach.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import cgenstate
+
+// One hoisted pattern binding: the source name, the C local that carries the
+// matched value, and its checked type.
+struct PBind { name: int64, cvar: string, ty: int64 }
+
+// Whether a bind pattern names a payloadless variant of the scrutinee's sum,
+// the one case where a bare identifier pattern tests instead of binding.
+func bind_is_variant(g: *Cg, name: int64, sty: int64) -> bool {
+    a: *Ast = (*g).ast
+    cn: CNamed = cg_named(g, sty)
+    if cn.kind != gk_sum() { return false }
+    cv: CVariant = cg_variant(g, name)
+    if !cv.found { return false }
+    return cv.owner == ast_intern(a, ty_name_of((*g).ty, sty))
+}
+
+// Whether the pattern matches every value of its type, which lets the arm
+// skip the test machinery entirely.
+func pat_irrefutable(g: *Cg, pid: int64, sty: int64) -> bool {
+    a: *Ast = (*g).ast
+    p: PatternNode = vec_get((*a).patterns, pid)
+    if p.kind == pk_wildcard() { return true }
+    if p.kind == pk_bind() {
+        return !bind_is_variant(g, p.a, sty)
+    }
+    return false
+}
+
+// Collects the bindings a pattern introduces, in the same top down left to
+// right order gen_pat_test consumes them, each given a fresh C local.
+func collect_binds(g: *Cg, pid: int64, sty: int64, binds: *Vector<PBind>) -> void {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    p: PatternNode = vec_get((*a).patterns, pid)
+    if p.kind == pk_bind() {
+        if !bind_is_variant(g, p.a, sty) {
+            vec_push(binds, PBind { name: p.a, cvar: cg_tmp(g), ty: sty })
+        }
+        return
+    }
+    n: TyNode = ty_get(t, sty)
+    if p.kind == pk_some() {
+        mut inner: int64 = ty_unknown(t)
+        if n.kind == tyk_option() { inner = n.a }
+        collect_binds(g, p.a, inner, binds)
+        return
+    }
+    if p.kind == pk_ok() || p.kind == pk_err() {
+        mut inner2: int64 = ty_unknown(t)
+        if n.kind == tyk_result() {
+            inner2 = n.a
+            if p.kind == pk_err() { inner2 = n.b }
+        }
+        collect_binds(g, p.a, inner2, binds)
+        return
+    }
+    if p.kind == pk_variant() {
+        cv: CVariant = cg_variant(g, p.a)
+        mut i: int64 = 0
+        while i < p.c {
+            mut ft: int64 = ty_unknown(t)
+            if cv.found {
+                if i < cv.len { ft = sig_field((*g).sigs, cv.off, i).ty }
+            }
+            collect_binds(g, vec_get((*a).kids, p.b + i), ft, binds)
+            i = i + 1
+        }
+    }
+}
+
+// Emits the checks of one pattern against the value expression sval inside
+// the arm's do while block: a failed check breaks out, a passed one falls
+// through, and bindings assign into their hoisted locals on the way down.
+// cur is the cursor into binds; the walk returns where it left it.
+func gen_pat_test(g: *Cg, pid: int64, sval: string, sty: int64, binds: *Vector<PBind>, cur: int64) -> int64 {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    p: PatternNode = vec_get((*a).patterns, pid)
+    if p.kind == pk_wildcard() { return cur }
+    if p.kind == pk_bind() {
+        if bind_is_variant(g, p.a, sty) {
+            cv: CVariant = cg_variant(g, p.a)
+            cg_line(g, tmsg7("if (", sval, ".tag != ", int_to_string(cv.idx), ") break;", "", ""))
+            return cur
+        }
+        b: PBind = vec_get(binds, cur)
+        cg_line(g, tmsg5(b.cvar, " = ", sval, ";", ""))
+        return cur + 1
+    }
+    if p.kind == pk_lit() {
+        lv: CVal = gen_expr(g, p.a, sty)
+        fld: string = cg_field_of(g, sty)
+        if str_len(fld) > 0 {
+            cg_line(g, tmsg7("if (!(", sval, tmsg3(".as.", fld, " == "), lv.cvar, tmsg3(".as.", fld, ")) break;"), "", ""))
+        } else if ty_get(t, sty).kind == tyk_str() {
+            cg_line(g, tmsg7("if (!ash_string_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
+        } else {
+            cg_line(g, tmsg7("if (!ash_value_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
+        }
+        return cur
+    }
+    if p.kind == pk_none() {
+        cg_line(g, tmsg3("if (", sval, ".tag != 0) break;"))
+        return cur
+    }
+    if p.kind == pk_some() || p.kind == pk_ok() || p.kind == pk_err() {
+        mut want_tag: string = "1"
+        if p.kind == pk_ok() { want_tag = "0" }
+        cg_line(g, tmsg7("if (", sval, ".tag != ", want_tag, ") break;", "", ""))
+        n: TyNode = ty_get(t, sty)
+        mut inner: int64 = ty_unknown(t)
+        if p.kind == pk_some() {
+            if n.kind == tyk_option() { inner = n.a }
+        } else if n.kind == tyk_result() {
+            inner = n.a
+            if p.kind == pk_err() { inner = n.b }
+        }
+        pv: string = cg_tmp(g)
+        cg_line(g, tmsg5("AshValue ", pv, " = *(const AshValue*)", sval, ".as.box;"))
+        return gen_pat_test(g, p.a, pv, inner, binds, cur)
+    }
+    // A variant pattern with a payload list.
+    cv2: CVariant = cg_variant(g, p.a)
+    if !cv2.found {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, tmsg3("the pattern '", ast_name(a, p.a), "' in a pledge body"))
+        return cur
+    }
+    cg_line(g, tmsg7("if (", sval, ".tag != ", int_to_string(cv2.idx), ") break;", "", ""))
+    mut c: int64 = cur
+    mut i: int64 = 0
+    while i < p.c {
+        mut ft: int64 = ty_unknown(t)
+        if i < cv2.len { ft = sig_field((*g).sigs, cv2.off, i).ty }
+        pv2: string = cg_tmp(g)
+        cg_line(g, tmsg7("AshValue ", pv2, " = ((const AshValue*)", sval, ".as.list.data)[", tmsg2(int_to_string(i), "];"), ""))
+        c = gen_pat_test(g, vec_get((*a).kids, p.b + i), pv2, ft, binds, c)
+        i = i + 1
+    }
+    return c
+}
+
+// Lowers one arm body with its bindings in scope, assigning the arm's value
+// into the match's result temporary. Returns the body's checked value type,
+// or -1 when a block body ends in anything but an expression.
+func gen_arm_body(g: *Cg, arm: ArmNode, binds: *Vector<PBind>, rvar: string, want: int64) -> int64 {
+    cg_push_scope(g)
+    mut i: int64 = 0
+    while i < vec_len(binds) {
+        b: PBind = vec_get(binds, i)
+        cg_declare(g, b.name, b.cvar, b.ty)
+        i = i + 1
+    }
+    mut out: int64 = -1
+    if arm.is_block {
+        out = gen_block_into(g, arm.body, want, rvar)
+    } else {
+        cv: CVal = gen_expr(g, arm.body, want)
+        cg_line(g, tmsg5(rvar, " = ", cv.cvar, ";", ""))
+        out = cv.ty
+    }
+    cg_pop_scope(g)
+    return out
+}
+
+// Lowers the arms from index i on as a nested if else chain and returns the
+// value type of the first arm it lowered, the type later arms are held to
+// when the match position asked for nothing.
+func gen_arms(g: *Cg, e: ExprNode, s: CVal, rvar: string, i: int64, want: int64) -> int64 {
+    a: *Ast = (*g).ast
+    if i >= e.c { return -1 }
+    arm: ArmNode = vec_get((*a).arms, vec_get((*a).kids, e.b + i))
+    if pat_irrefutable(g, arm.pat, s.ty) {
+        p: PatternNode = vec_get((*a).patterns, arm.pat)
+        binds: *Vector<PBind> = alloc(vec_new())
+        if p.kind == pk_bind() {
+            vec_push(binds, PBind { name: p.a, cvar: s.cvar, ty: s.ty })
+        }
+        return gen_arm_body(g, arm, binds, rvar, want)
+    }
+    binds2: *Vector<PBind> = alloc(vec_new())
+    collect_binds(g, arm.pat, s.ty, binds2)
+    mut j: int64 = 0
+    while j < vec_len(binds2) {
+        b: PBind = vec_get(binds2, j)
+        cg_line(g, tmsg3("AshValue ", b.cvar, " = {0};"))
+        j = j + 1
+    }
+    hit: string = cg_tmp(g)
+    cg_line(g, tmsg3("int ", hit, " = 0;"))
+    cg_line(g, "do {")
+    (*g).indent = (*g).indent + 1
+    gen_pat_test(g, arm.pat, s.cvar, s.ty, binds2, 0)
+    cg_line(g, tmsg2(hit, " = 1;"))
+    (*g).indent = (*g).indent - 1
+    cg_line(g, "} while (0);")
+    cg_line(g, tmsg3("if (", hit, ") {"))
+    (*g).indent = (*g).indent + 1
+    first: int64 = gen_arm_body(g, arm, binds2, rvar, want)
+    (*g).indent = (*g).indent - 1
+    if i + 1 < e.c {
+        cg_line(g, "} else {")
+        (*g).indent = (*g).indent + 1
+        mut aw: int64 = want
+        if aw < 0 { aw = first }
+        gen_arms(g, e, s, rvar, i + 1, aw)
+        (*g).indent = (*g).indent - 1
+    }
+    cg_line(g, "}")
+    return first
+}
+
+// The match expression. The result temporary starts zeroed, Unit, which is
+// also what a statement position match leaves behind when its arms end in
+// statements rather than values.
+export func gen_match(g: *Cg, e: ExprNode, want: int64) -> CVal {
+    t: *TyArena = (*g).ty
+    s: CVal = gen_expr(g, e.a, -1)
+    r: string = new_value(g)
+    first: int64 = gen_arms(g, e, s, r, 0, want)
+    mut rty: int64 = want
+    if rty < 0 { rty = first }
+    if rty < 0 { rty = ty_unknown(t) }
+    return CVal { cvar: r, ty: rty }
+}

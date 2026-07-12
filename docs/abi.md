@@ -34,11 +34,17 @@ Strings are a fat value: a pointer and a byte length, UTF-8, no terminator. The 
 | Option | None | Some |
 | Result | Ok | Err |
 
+A declared sum is `ASH_TY_SUM` and its `tag` is the variant's declaration index, 0 for the first variant the source names, counting up in source order.
+
 An Option or Result payload rides in `as.box` as a pointer to a single `AshValue` the instance owns. `None` carries a null box.
 
-A list carries its elements as a contiguous `AshValue` array behind `as.list.data`, `len` of them live, `cap` allocated, `elem_ty` the declared element tag. A tuple rides the same union arm: the data pointer is the `AshValue` array, `len` is the arity, `cap` equals `len`, and `elem_ty` is 0 because a tuple's elements need not agree. Maps and records have no settled runtime representation yet; a deep copy that meets one reports `ASH_ERR_TYPE` rather than freeze a representation by accident.
+A list carries its elements as a contiguous `AshValue` array behind `as.list.data`, `len` of them live, `cap` allocated, `elem_ty` the declared element tag. A tuple rides the same union arm: the data pointer is the `AshValue` array, `len` is the arity, `cap` equals `len`, and `elem_ty` is 0 because a tuple's elements need not agree.
 
-The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_tuple_new`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list and tuple elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own.
+A record rides the list arm too: `ASH_TY_RECORD`, the data pointer an `AshValue` array holding the fields in declaration order, `len` the field count, `cap` equal to `len`, `elem_ty` 0. A sum variant's payload is the same shape, `ASH_TY_SUM` with the variant's fields in declaration order behind the data pointer; a variant with no payload carries an empty arm, data NULL and `len` 0. Field access in compiled code is a slot read by declaration index, so the order is normative. Maps have no settled runtime representation yet; a deep copy that meets one reports `ASH_ERR_TYPE` rather than freeze a representation by accident.
+
+The runtime exposes deep value helpers to hosts and thunks alike: `ash_list_new`, `ash_list_push`, `ash_list_get`, `ash_list_set`, `ash_tuple_new`, `ash_value_eq`, and `ash_value_deep_copy`, which recursively copies any supported value into instance owned memory, string bytes, list, tuple, record, and sum elements, and boxed payloads included. After a deep copy, nothing in the destination aliases memory the instance does not own. `ash_value_eq` is the structural equality the language's `==` lowers onto for the deep shapes: type tags first, the sum shaped `tag` next, then elements recursively, with a Map or any other unsettled arm reading unequal.
+
+**Indexing out of bounds.** Compiled code bounds checks every list element read and write, reads through `ash_list_get` and writes through `ash_list_set`. An index outside the list, a negative one included through the unsigned cast, makes the pledge return `ASH_ERR_TYPE` from its thunk: the status reports the fulfillment never produced a value, no latch moves, and host memory is never touched. This rule is normative for every compiled module.
 
 ## The thunk frame
 

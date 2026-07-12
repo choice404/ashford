@@ -21,11 +21,12 @@ ASHC       := target/dusk-out/ashc
 MODULE     := $(OUT)/libhello.ash.so
 MODULE_V2  := $(OUT)/libhello_v2.ash.so
 MODULE_PAY := $(OUT)/libpayment.ash.so
+MODULE_LANG := $(OUT)/liblang.ash.so
 HOST       := $(OUT)/host
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-lang test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-partial test-determinism tsan
+all: smoke test-runtime test-thread test-iname test-partial test-lang test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -48,6 +49,9 @@ $(MODULE_V2): $(ASHC) skeleton/hello_v2.ash runtime/include/ash/ash_abi.h
 
 $(MODULE_PAY): $(ASHC) skeleton/payment.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/payment.ash
+
+$(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/lang.ash
 
 host: $(HOST)
 
@@ -97,6 +101,16 @@ test-partial: $(MODULE_PAY)
 	    tests/runtime/test_partial.c runtime/src/runtime.c -ldl -o $(OUT)/test_partial
 	./$(OUT)/test_partial
 
+# The language lowering gate under ASan: the compiled gauntlet module walks
+# every construct the code generator lowers, loops, assignment in all three
+# lvalue forms, match with payload bindings, propagation, deep equality, and
+# the out of bounds index rule.
+test-lang: $(MODULE_LANG)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
+	    tests/runtime/test_lang.c runtime/src/runtime.c -ldl -o $(OUT)/test_lang
+	./$(OUT)/test_lang
+
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
 # in the iname story reproducible.
@@ -114,7 +128,11 @@ test-determinism: $(ASHC)
 	mv $(OUT)/payment.c $(OUT)/payment.c.first
 	$(ASHC) build skeleton/payment.ash
 	diff $(OUT)/payment.c.first $(OUT)/payment.c
-	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first
+	$(ASHC) build skeleton/lang.ash
+	mv $(OUT)/lang.c $(OUT)/lang.c.first
+	$(ASHC) build skeleton/lang.ash
+	diff $(OUT)/lang.c.first $(OUT)/lang.c
+	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first $(OUT)/lang.c.first
 	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the

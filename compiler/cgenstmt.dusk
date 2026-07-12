@@ -1,9 +1,11 @@
 // cgenstmt: lowering statements and blocks to C. A block opens a scope on
 // both sides of the fence at once, a brace pair in the C and a scope frame in
 // the emitter, so an ashford binding lives exactly as long as the C variable
-// that carries it. The M3 statement set is let, if with else, return, and a
-// bare expression statement; assignment and the loops arrive with a later
-// milestone and are named build errors until then. return writes the pledge's
+// that carries it. The statement set is the whole grammar now: let with a
+// fresh copy per binding so a later assignment never writes through an
+// aliased name, assignment to a mut local, a record field slot, or a bounds
+// checked list slot, if with else, while and for lowered onto real C loops so
+// break and continue map one to one, and return, which writes the pledge's
 // value through the thunk's out parameter and reports ASH_OK, the one exit
 // convention every thunk shares.
 
@@ -28,9 +30,16 @@ func gen_let(g: *Cg, s: StmtNode) -> void {
         ann = lower_type((*g).sigs, s.b, ve.lo, ve.hi)
     }
     v: CVal = gen_expr(g, s.c, ann)
-    mut bound: int64 = v.ty
+    // Value semantics: a composite initializer is deep copied so the binding
+    // owns memory no other binding aliases.
+    cv: CVal = cg_copy_out(g, v)
+    mut bound: int64 = cv.ty
     if ann >= 0 { bound = ann }
-    cg_declare(g, s.a, v.cvar, bound)
+    // The binding gets its own C variable, never the initializer's, so that
+    // 'let mut x = y' followed by an assignment to x leaves y alone.
+    nv: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshValue ", nv, " = ", cv.cvar, ";", "", ""))
+    cg_declare(g, s.a, nv, bound)
 }
 
 func gen_return(g: *Cg, s: StmtNode) -> void {
@@ -59,6 +68,97 @@ func gen_if(g: *Cg, s: StmtNode) -> void {
     cg_line(g, "}")
 }
 
+// Assignment. The target is a mut local, a record field of one, or a list
+// element of one, the exact lvalue set the checker admitted. A field write
+// lands in the record's slot array in place; a list write goes through
+// ash_list_set, whose bounds check turns a bad index into ASH_ERR_TYPE from
+// the pledge.
+func gen_assign(g: *Cg, s: StmtNode) -> void {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    lv: ExprNode = vec_get((*a).exprs, s.a)
+    if lv.kind == xk_ident() {
+        bind: CBind = cg_lookup(g, lv.a)
+        if bind.found {
+            v: CVal = gen_expr(g, s.b, bind.ty)
+            cv: CVal = cg_copy_out(g, v)
+            cg_line(g, tmsg5(bind.cvar, " = ", cv.cvar, ";", ""))
+            return
+        }
+        cg_unsupported(g, lv.lo, lv.hi, tmsg3("assignment to '", ast_name(a, lv.a), "' in a pledge body"))
+        return
+    }
+    if lv.kind == xk_member() {
+        base: CVal = gen_expr(g, lv.a, -1)
+        cn: CNamed = cg_named(g, base.ty)
+        if cn.kind == gk_record() {
+            cf: CField = cg_rec_field(g, cn.name, lv.b)
+            if cf.found {
+                v2: CVal = gen_expr(g, s.b, cf.ty)
+                cv2: CVal = cg_copy_out(g, v2)
+                cg_line(g, tmsg7("((AshValue*)", base.cvar, ".as.list.data)[", int_to_string(cf.idx), "] = ", tmsg2(cv2.cvar, ";"), ""))
+                return
+            }
+        }
+        cg_unsupported(g, lv.lo, lv.hi, "assignment to this field in a pledge body")
+        return
+    }
+    if lv.kind == xk_index() {
+        base2: CVal = gen_expr(g, lv.a, -1)
+        idx: CVal = gen_expr(g, lv.b, ty_int(t))
+        n: TyNode = ty_get(t, base2.ty)
+        if n.kind == tyk_list() {
+            v3: CVal = gen_expr(g, s.b, n.a)
+            cv3: CVal = cg_copy_out(g, v3)
+            st: string = cg_tmp(g)
+            cg_line(g, tmsg7("AshStatus ", st, " = ash_list_set(&", base2.cvar, ", (uint64_t)", idx.cvar, tmsg3(".as.i, &", cv3.cvar, ");")))
+            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            return
+        }
+        cg_unsupported(g, lv.lo, lv.hi, "assignment through this index in a pledge body")
+        return
+    }
+    cg_unsupported(g, lv.lo, lv.hi, "assignment to this expression in a pledge body")
+}
+
+// while lowers onto an unconditional C loop with the condition re-evaluated
+// at the top of every pass, since the condition may take several statements
+// to compute. A source break or continue in the body maps straight onto the
+// C keyword against this same loop.
+func gen_while(g: *Cg, s: StmtNode) -> void {
+    cg_line(g, "for (;;) {")
+    (*g).indent = (*g).indent + 1
+    c: CVal = gen_expr(g, s.a, ty_bool((*g).ty))
+    cg_line(g, tmsg3("if (!", c.cvar, ".as.b) break;"))
+    gen_block(g, s.b)
+    (*g).indent = (*g).indent - 1
+    cg_line(g, "}")
+}
+
+// for over a List: a counted C for loop over the element array, the loop
+// variable a struct copy of the slot, so continue lands on the increment and
+// an empty list runs the body zero times.
+func gen_for(g: *Cg, s: StmtNode) -> void {
+    t: *TyArena = (*g).ty
+    it: CVal = gen_expr(g, s.b, -1)
+    n: TyNode = ty_get(t, it.ty)
+    if n.kind != tyk_list() {
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "for over this type in a pledge body")
+        return
+    }
+    iv: string = cg_tmp(g)
+    cg_line(g, tmsg7("for (uint64_t ", iv, " = 0; ", iv, tmsg3(" < ", it.cvar, ".as.list.len; "), tmsg2(iv, "++) {"), ""))
+    (*g).indent = (*g).indent + 1
+    ev: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshValue ", ev, " = ((const AshValue*)", it.cvar, ".as.list.data)[", tmsg2(iv, "];"), ""))
+    cg_push_scope(g)
+    cg_declare(g, s.a, ev, n.a)
+    gen_block(g, s.c)
+    cg_pop_scope(g)
+    (*g).indent = (*g).indent - 1
+    cg_line(g, "}")
+}
+
 export func gen_stmt(g: *Cg, sid: int64) -> void {
     a: *Ast = (*g).ast
     s: StmtNode = vec_get((*a).stmts, sid)
@@ -71,13 +171,17 @@ export func gen_stmt(g: *Cg, sid: int64) -> void {
     } else if s.kind == sk_expr() {
         gen_expr(g, s.a, -1)
     } else if s.kind == sk_assign() {
-        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "assignment in a pledge body")
+        gen_assign(g, s)
     } else if s.kind == sk_while() {
-        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "while in a pledge body")
+        gen_while(g, s)
     } else if s.kind == sk_for() {
-        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "for in a pledge body")
+        gen_for(g, s)
+    } else if s.kind == sk_break() {
+        cg_line(g, "break;")
+    } else if s.kind == sk_continue() {
+        cg_line(g, "continue;")
     } else {
-        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "loop control in a pledge body")
+        cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "this statement in a pledge body")
     }
 }
 
@@ -91,4 +195,36 @@ export func gen_block(g: *Cg, bid: int64) -> void {
         i = i + 1
     }
     cg_pop_scope(g)
+}
+
+// A block in value position, a match arm written as a block: the statements
+// run in order and a final expression statement's value lands in dest, the
+// checker's block value rule. Returns that value's checked type, or -1 when
+// the block ends any other way and dest keeps what it held, the zeroed Unit
+// of a statement position match.
+export func gen_block_into(g: *Cg, bid: int64, want: int64, dest: string) -> int64 {
+    a: *Ast = (*g).ast
+    b: BlockNode = vec_get((*a).blocks, bid)
+    cg_push_scope(g)
+    mut out: int64 = -1
+    mut i: int64 = 0
+    while i < b.len {
+        sid: int64 = vec_get((*a).kids, b.off + i)
+        mut plain: bool = true
+        if i == b.len - 1 {
+            s: StmtNode = vec_get((*a).stmts, sid)
+            if s.kind == sk_expr() {
+                cv: CVal = gen_expr(g, s.a, want)
+                cg_line(g, tmsg5(dest, " = ", cv.cvar, ";", ""))
+                out = cv.ty
+                plain = false
+            }
+        }
+        if plain {
+            gen_stmt(g, sid)
+        }
+        i = i + 1
+    }
+    cg_pop_scope(g)
+    return out
 }

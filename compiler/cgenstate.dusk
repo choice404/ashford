@@ -24,6 +24,23 @@
 // type. found stands in for a miss on lookup.
 export struct CBind { cvar: string, ty: int64, found: bool }
 
+// One lowered expression: the C temporary that carries the value and its
+// checked type. Every lowering path returns one of these.
+export struct CVal { cvar: string, ty: int64 }
+
+// A named type's global entry, the AST interner id of its name beside the
+// resolver's verdict. kind is -1 when the type is not a named one.
+export struct CNamed { kind: int64, name: int64, id: int64 }
+
+// A record field resolved by name: its declaration index, the slot the ABI
+// stores it in, and its checked type.
+export struct CField { idx: int64, ty: int64, found: bool }
+
+// A variant resolved by name: its declaration index within the owning sum,
+// which is the ABI tag a sum value carries, the owner's name id, and the
+// payload field slice in the sig tables.
+export struct CVariant { idx: int64, owner: int64, off: int64, len: int64, found: bool }
+
 export struct Cg {
     ast: *Ast,
     res: *Resolved,
@@ -125,6 +142,8 @@ export func cg_lookup(g: *Cg, name: int64) -> CBind {
 
 // The AshTypeTag spelling of a checked type, or "" for a shape the ABI does
 // not tag one to one, which the callers treat as no check or a build fault.
+// A named type resolves through the file's declarations: a record is
+// ASH_TY_RECORD, a sum is ASH_TY_SUM, anything else stays untagged.
 export func cg_tag_of(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
     if k == tyk_int() { return "ASH_TY_INT" }
@@ -140,7 +159,62 @@ export func cg_tag_of(g: *Cg, tyid: int64) -> string {
     if k == tyk_tuple() { return "ASH_TY_TUPLE" }
     if k == tyk_option() { return "ASH_TY_OPTION" }
     if k == tyk_result() { return "ASH_TY_RESULT" }
+    if k == tyk_named() {
+        cn: CNamed = cg_named(g, tyid)
+        if cn.kind == gk_record() { return "ASH_TY_RECORD" }
+        if cn.kind == gk_sum() { return "ASH_TY_SUM" }
+    }
     return ""
+}
+
+// Resolves a named checked type against the file's global declarations.
+export func cg_named(g: *Cg, tyid: int64) -> CNamed {
+    t: *TyArena = (*g).ty
+    if ty_get(t, tyid).kind != tyk_named() {
+        return CNamed { kind: -1, name: -1, id: -1 }
+    }
+    nid: int64 = ast_intern((*g).ast, ty_name_of(t, tyid))
+    e: GEntry = rs_global((*g).res, nid)
+    return CNamed { kind: e.kind, name: nid, id: e.id }
+}
+
+// A record field by name, under the record's declared name id.
+export func cg_rec_field(g: *Cg, rec_name: int64, fname: int64) -> CField {
+    rs: RecSig = sig_rec((*g).sigs, rec_name)
+    if rs.found {
+        mut i: int64 = 0
+        while i < rs.len {
+            f: FieldSig = sig_field((*g).sigs, rs.off, i)
+            if f.name == fname {
+                return CField { idx: i, ty: f.ty, found: true }
+            }
+            i = i + 1
+        }
+    }
+    return CField { idx: -1, ty: -1, found: false }
+}
+
+// A variant by name: its declaration index within the owning sum, found by
+// walking the sum's variant list in declaration order, which is exactly the
+// tag space the ABI's sum values carry.
+export func cg_variant(g: *Cg, name: int64) -> CVariant {
+    a: *Ast = (*g).ast
+    vs: VariantSig = sig_variant((*g).sigs, name)
+    if vs.found {
+        ge: GEntry = rs_global((*g).res, vs.owner)
+        if ge.kind == gk_sum() {
+            sum: SumNode = vec_get((*a).sums, ge.id)
+            mut i: int64 = 0
+            while i < sum.variants_len {
+                v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + i))
+                if v.name == name {
+                    return CVariant { idx: i, owner: vs.owner, off: vs.off, len: vs.len, found: true }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return CVariant { idx: -1, owner: -1, off: 0, len: 0, found: false }
 }
 
 // The AshValue union field a scalar of this type lives in, or "".

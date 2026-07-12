@@ -279,14 +279,27 @@ AshStatus ash_list_push(AshContract* c, AshValue* list, const AshValue* elem);
  * value is neither. The pointer is into instance owned storage. */
 const AshValue* ash_list_get(const AshValue* v, uint64_t idx);
 
+/* Overwrites the element at idx of a live list slot. ASH_ERR_TYPE when list
+ * is not a list, when the element's tag disagrees with elem_ty, or when idx
+ * is out of range; compiled index assignment rides this, so an out of bounds
+ * write is a clean ASH_ERR_TYPE from the pledge rather than a fault. The
+ * element struct is copied as is, the same ownership rule as ash_list_push. */
+AshStatus ash_list_set(AshValue* list, uint64_t idx, const AshValue* elem);
+
+/* Structural equality over two values; 1 or 0. Scalars compare by value,
+ * strings by bytes, list, tuple, record, and sum element by element with the
+ * sum shaped tags compared first, Option and Result through their boxes. A
+ * type tag mismatch or an unsupported arm, Map today, reads unequal. */
+int ash_value_eq(const AshValue* a, const AshValue* b);
+
 /* An instance owned tuple of count zeroed slots, filled in place through
  * ash_list_get or the data pointer. */
 AshStatus ash_tuple_new(AshContract* c, uint64_t count, AshValue* out);
 
 /* Recursively copies src into instance owned memory: scalars by value,
- * string bytes copied, list and tuple elements copied element by element,
- * Option and Result payloads reboxed. After it returns, nothing in dst
- * aliases memory the instance does not own. Map and record values are not
+ * string bytes copied, list, tuple, record, and sum payloads copied element
+ * by element, Option and Result payloads reboxed. After it returns, nothing
+ * in dst aliases memory the instance does not own. Map values are not
  * supported in v1 and report ASH_ERR_TYPE. */
 AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
                               AshValue* dst);

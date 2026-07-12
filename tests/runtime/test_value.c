@@ -54,10 +54,14 @@ static int value_eq(const AshValue* a, const AshValue* b) {
     case ASH_TY_CHAR:   return a->as.ch == b->as.ch;
     case ASH_TY_STRING: return ash_string_eq(a, b);
     case ASH_TY_LIST:
-    case ASH_TY_TUPLE: {
+    case ASH_TY_TUPLE:
+    case ASH_TY_RECORD:
+    case ASH_TY_SUM: {
         if (a->as.list.len != b->as.list.len) return 0;
+        const AshValue* xa = (const AshValue*)a->as.list.data;
+        const AshValue* xb = (const AshValue*)b->as.list.data;
         for (uint64_t i = 0; i < a->as.list.len; i++) {
-            if (!value_eq(ash_list_get(a, i), ash_list_get(b, i))) return 0;
+            if (!value_eq(&xa[i], &xb[i])) return 0;
         }
         return 1;
     }
@@ -195,6 +199,70 @@ static void test_option_result_nesting(AshContract* arena,
           "deep copy of a map reports ASH_ERR_TYPE");
 }
 
+static void test_record_copy(AshContract* arena, AshContract* dst_arena) {
+    /* A two field record: a String field and an Int field, fields in
+     * declaration order on the shared list arm. */
+    AshValue* fields = (AshValue*)ash_bytes(arena, 2 * sizeof(AshValue));
+    CHECK(fields != NULL, "record field array");
+    if (!fields) return;
+    fields[0] = ash_string_copy(arena, (const uint8_t*)"card", 4);
+    fields[1] = int_val(42);
+
+    AshValue rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ty = ASH_TY_RECORD;
+    rec.as.list.data = fields;
+    rec.as.list.len = 2;
+    rec.as.list.cap = 2;
+
+    AshValue copy;
+    CHECK(ash_value_deep_copy(dst_arena, &rec, &copy) == ASH_OK,
+          "deep copy of a record");
+    CHECK(value_eq(&rec, &copy), "record copy is structurally equal");
+    CHECK(copy.as.list.data != rec.as.list.data,
+          "record copy owns its own field array");
+    const AshValue* cf = (const AshValue*)copy.as.list.data;
+    CHECK(cf[0].as.s.ptr != fields[0].as.s.ptr,
+          "record copy owns its own string bytes");
+}
+
+static void test_sum_copy(AshContract* arena, AshContract* dst_arena) {
+    /* A payload carrying variant: tag 1 with one String field. */
+    AshValue* payload = (AshValue*)ash_bytes(arena, sizeof(AshValue));
+    CHECK(payload != NULL, "sum payload array");
+    if (!payload) return;
+    payload[0] = ash_string_copy(arena, (const uint8_t*)"overflow", 8);
+
+    AshValue sum;
+    memset(&sum, 0, sizeof(sum));
+    sum.ty = ASH_TY_SUM;
+    sum.tag = 1;
+    sum.as.list.data = payload;
+    sum.as.list.len = 1;
+    sum.as.list.cap = 1;
+
+    AshValue copy;
+    CHECK(ash_value_deep_copy(dst_arena, &sum, &copy) == ASH_OK,
+          "deep copy of a payload variant");
+    CHECK(copy.ty == ASH_TY_SUM && copy.tag == 1,
+          "sum copy keeps its variant tag");
+    CHECK(value_eq(&sum, &copy), "sum copy is structurally equal");
+    CHECK(copy.as.list.data != sum.as.list.data,
+          "sum copy owns its own payload array");
+
+    /* A bare variant: tag alone, an empty payload arm. */
+    AshValue bare;
+    memset(&bare, 0, sizeof(bare));
+    bare.ty = ASH_TY_SUM;
+    bare.tag = 2;
+    CHECK(ash_value_deep_copy(dst_arena, &bare, &copy) == ASH_OK,
+          "deep copy of a bare variant");
+    CHECK(copy.ty == ASH_TY_SUM && copy.tag == 2 && copy.as.list.len == 0,
+          "bare variant copies to a bare variant");
+    CHECK(!ash_value_eq(&bare, &sum), "different variants read unequal");
+    CHECK(ash_value_eq(&bare, &copy), "same variant reads equal");
+}
+
 static void test_copy_in_isolation(AshContract* cap) {
     /* The host's mutable bytes. The fulfill deep copies them onto the
      * instance; scribbling over them afterwards must not reach the thunk's
@@ -242,6 +310,8 @@ int main(void) {
     if (src && dst && cap) {
         test_list_of_tuples(src, dst);
         test_option_result_nesting(src, dst);
+        test_record_copy(src, dst);
+        test_sum_copy(src, dst);
         test_copy_in_isolation(cap);
     }
 

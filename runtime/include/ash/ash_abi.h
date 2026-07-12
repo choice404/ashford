@@ -33,7 +33,8 @@ typedef enum AshTypeTag {
     ASH_TY_OPTION,
     ASH_TY_RESULT,
     ASH_TY_RECORD,
-    ASH_TY_PLEDGE_REF
+    ASH_TY_PLEDGE_REF,
+    ASH_TY_SUM
 } AshTypeTag;
 
 /* UTF-8 bytes, length counted in bytes, no NUL terminator. When the runtime
@@ -53,12 +54,19 @@ typedef struct AshList {
 /* Lists carry their elements as a contiguous AshValue array behind data, len
  * of them live, cap allocated, elem_ty the declared element tag. A tuple
  * rides the same arm: data is the AshValue array, len is the arity, cap
- * equals len, and elem_ty is 0 because a tuple's elements need not agree. */
+ * equals len, and elem_ty is 0 because a tuple's elements need not agree.
+ *
+ * A record rides the list arm too: data is the AshValue array of its fields
+ * in declaration order, len is the field count, cap equals len, elem_ty is 0.
+ * A declared sum is ASH_TY_SUM: tag is the variant's declaration index, and
+ * the list arm carries the variant's payload fields in declaration order, an
+ * empty arm, data NULL and len 0, for a variant with no payload. */
 
 /* The one value shape. ty picks the union arm. tag carries the variant for
- * the sum shaped types: Option 0 None 1 Some, Result 0 Ok 1 Err, and it is 0
- * for everything else. Option and Result payloads ride in box as a pointer to
- * a single AshValue the runtime owns. */
+ * the sum shaped types: Option 0 None 1 Some, Result 0 Ok 1 Err, the
+ * declaration index of the variant for a declared sum, and 0 for everything
+ * else. Option and Result payloads ride in box as a pointer to a single
+ * AshValue the runtime owns. */
 typedef struct AshValue {
     uint32_t ty;
     uint32_t tag;

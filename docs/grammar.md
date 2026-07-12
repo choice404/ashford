@@ -231,6 +231,10 @@ A block used as a value takes the type of its final expression statement, and `U
 
 `+` on two `String` values concatenates into a new `String`. That is the one operator with a non numeric arm; a `String` never meets a numeric operand.
 
+`&&` and `||` short circuit: the right operand is not evaluated when the left already decides the answer, so a bounds guard like `i < n && xs[i] == 0` never touches `xs[i]` out of range.
+
+Every value has value semantics. A `let`, an assignment, an argument, and a return each carry an independent copy, composites included; mutating a record or list through one binding is never visible through another. The copy is cheap by assumption, the same assumption the boundary makes.
+
 Vows are never assignable. `mut(expr)` is the builtin that produces a mutable copy of a vow value; the original never changes.
 
 ## Expressions
