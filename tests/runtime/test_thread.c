@@ -79,12 +79,15 @@ static AshStatus scale_fn(void* ctx, const AshValue* args, size_t nargs,
 }
 
 static const AshPledgeDesc k_calc_pledges[] = {
-    { "add",   "__ash_test_add",   2, add_fn },
-    { "scale", "__ash_test_scale", 2, NULL   }, /* abstract, host binds */
+    { "add",   "__ash_test_add",   2, add_fn, -1 },
+    { "scale", "__ash_test_scale", 2, NULL,   -1 }, /* abstract, host binds */
 };
 
+/* No requirements data: the runtime applies the structural default policy
+ * over the descriptor shape, all loose pledges here. */
 static const AshContractDesc k_calc = {
-    "Calc", 0x5ULL, 1, 2, k_calc_pledges, 0, NULL,
+    .name = "Calc", .shape_hash = 0x5ULL, .version = 1,
+    .npledges = 2, .pledges = k_calc_pledges,
 };
 
 static AshValue int_val(int64_t i) {

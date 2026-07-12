@@ -58,7 +58,7 @@ static int is_ok_string(const AshValue* out, const char* want) {
 
 /* A handwritten contract to throw at register after the freeze. */
 static const AshContractDesc k_late = {
-    "LateComer", 0x1234, 1, 0, NULL, 0, NULL,
+    .name = "LateComer", .shape_hash = 0x1234, .version = 1,
 };
 
 static AshStatus never_fn(void* ctx, const AshValue* args, size_t nargs,

@@ -1,0 +1,315 @@
+// cgenreq: emitting the requirements surface of one contract. The descriptor
+// grows three pieces here: the subs table naming every subcontract in
+// declaration order, the atom table, and one postfix program per policy
+// line. A contract that wrote a requirements block gets its lines serialized
+// from the same AST the reqsolve satisfiability check walked, atoms in the
+// same first appearance order reqsolve enumerates, so the compiler proved
+// exactly what the runtime evaluates. A contract without a block gets the
+// grammar's defaults synthesized as trees: fulfill when every subcontract
+// and every loose pledge is fulfilled, partial when at least one subcontract
+// is, break when everything is broken, the broken half spelled through
+// ASH_ATOM_BROKEN atoms since a source atom can only test fulfilled-ness.
+// A line the source did not write emits no array; length zero is the
+// runtime's constant false. Everything here is deterministic in declaration
+// order, so two builds of one source stay byte identical.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import reqsolve
+@import ty
+@import tysigs
+@import tcstate
+@import cgenstate
+
+// What the contract descriptor needs to reference the emitted arrays.
+export struct ReqEmit {
+    nsubs: int64,
+    natoms: int64,
+    has_reqs: bool,
+    nfulfill: int64,
+    npartial: int64,
+    nbreak: int64,
+}
+
+func op_name(op: int64) -> string {
+    if op == 0 { return "ASH_REQ_ATOM" }
+    if op == 1 { return "ASH_REQ_NOT" }
+    if op == 2 { return "ASH_REQ_AND" }
+    return "ASH_REQ_OR"
+}
+
+func kind_name(kind: int64) -> string {
+    if kind == 1 { return "ASH_ATOM_BROKEN" }
+    return "ASH_ATOM_FULFILLED"
+}
+
+// One emitted atom row: the item's name spelled as a C literal or NULL for
+// an anonymous subcontract, the latch the atom tests, and the indices.
+func emit_atom_row(g: *Cg, name: string, is_null: bool, kind: int64, sub: int64, pledge: int64) -> void {
+    mut spelled: string = "NULL"
+    if !is_null { spelled = tmsg3("\"", name, "\"") }
+    head: string = tmsg7("    { ", spelled, ", ", kind_name(kind), ", ", int_to_string(sub), ", ")
+    cg_top(g, tmsg3(head, int_to_string(pledge), " },"))
+}
+
+// One emitted postfix program, k_{cname}_{tag}, from a flat op vector of
+// (op, atom) pairs. Nothing is emitted for an empty program.
+func emit_ops(g: *Cg, cname: string, tag: string, ops: *Vector<int64>) -> void {
+    if vec_len(ops) == 0 { return }
+    cg_top(g, tmsg7("static const AshReqOp k_", cname, "_", tag, "[] = {", "", ""))
+    mut i: int64 = 0
+    while i < vec_len(ops) {
+        op: int64 = vec_get(ops, i)
+        at: int64 = vec_get(ops, i + 1)
+        cg_top(g, tmsg7("    { ", op_name(op), ", ", int_to_string(at), " },", "", ""))
+        i = i + 2
+    }
+    cg_top(g, "};")
+    cg_top(g, "")
+}
+
+// The postfix program of one source line, a post order walk of the ReqNode
+// tree. Atom indices come from the shared reqsolve enumeration, so the
+// program references the same atom table the satisfiability check saw.
+func build_postfix(a: *Ast, id: int64, idx: *Map<int64>, ops: *Vector<int64>) -> void {
+    q: ReqNode = vec_get((*a).reqs, id)
+    if q.kind == rk_atom() {
+        i: int64 = unwrap_or(map_get(idx, rs_gkey(q.a)), 0)
+        vec_push(ops, 0)
+        vec_push(ops, i)
+    } else if q.kind == rk_not() {
+        build_postfix(a, q.a, idx, ops)
+        vec_push(ops, 1)
+        vec_push(ops, 0)
+    } else {
+        build_postfix(a, q.a, idx, ops)
+        build_postfix(a, q.b, idx, ops)
+        if q.kind == rk_and() {
+            vec_push(ops, 2)
+        } else {
+            vec_push(ops, 3)
+        }
+        vec_push(ops, 0)
+    }
+}
+
+// Resolves one source atom name to its descriptor indices: the sub ordinal
+// for a named subcontract, the flattened pledge index for a loose pledge.
+// resolve validated every atom before codegen runs, so a miss here is a
+// compiler fault worth a build error, never silently wrong indices.
+func atom_indices(g: *Cg, cid: int64, name: int64, sub_ids: *Vector<int64>, pl_pids: *Vector<int64>) -> (int64, int64) {
+    m: MEntry = rs_member((*g).res, cid, name)
+    if m.kind == mk_subcontract() {
+        mut j: int64 = 0
+        while j < vec_len(sub_ids) {
+            if vec_get(sub_ids, j) == m.id {
+                return (j, -1)
+            }
+            j = j + 1
+        }
+    }
+    if m.kind == mk_pledge() {
+        if m.sub < 0 {
+            mut k: int64 = 0
+            while k < vec_len(pl_pids) {
+                if vec_get(pl_pids, k) == m.id {
+                    return (-1, k)
+                }
+                k = k + 1
+            }
+        }
+    }
+    cg_err(g, m.lo, m.hi, tmsg3("codegen: requirements atom '", ast_name((*g).ast, name), "' did not resolve to an item"))
+    return (-1, -1)
+}
+
+// The first requirements block of the contract, or -1. The resolver already
+// reported a duplicate; codegen serializes the one it accepted.
+func find_reqblock(a: *Ast, cid: int64) -> int64 {
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_requirements() {
+            return vec_get((*a).kids, c.members_off + i + 1)
+        }
+        i = i + 2
+    }
+    return -1
+}
+
+// A chain program over a run of atom indices: AND or OR folded left, the
+// postfix spelling atom0 atom1 op atom2 op and so on.
+func push_chain(ops: *Vector<int64>, atoms: *Vector<int64>, op: int64) -> void {
+    mut i: int64 = 0
+    while i < vec_len(atoms) {
+        vec_push(ops, 0)
+        vec_push(ops, vec_get(atoms, i))
+        if i > 0 {
+            vec_push(ops, op)
+            vec_push(ops, 0)
+        }
+        i = i + 1
+    }
+}
+
+// The explicit path: the source block serialized. Emits the atom table and
+// up to three programs, and fills the counts.
+func emit_source_block(g: *Cg, cid: int64, cname: string, rbid: int64, sub_ids: *Vector<int64>, pl_pids: *Vector<int64>) -> ReqEmit {
+    a: *Ast = (*g).ast
+    rb: ReqBlockNode = vec_get((*a).reqblocks, rbid)
+    names: *Vector<int64> = alloc(vec_new())
+    idx: *Map<int64> = alloc(map_new())
+    if rb.fulfill >= 0 { req_collect_atoms(a, rb.fulfill, names, idx) }
+    if rb.partial >= 0 { req_collect_atoms(a, rb.partial, names, idx) }
+    if rb.brk >= 0 { req_collect_atoms(a, rb.brk, names, idx) }
+
+    natoms: int64 = vec_len(names)
+    if natoms > 0 {
+        cg_top(g, tmsg3("static const AshReqAtom k_", cname, "_atoms[] = {"))
+        mut i: int64 = 0
+        while i < natoms {
+            nm: int64 = vec_get(names, i)
+            sub, pledge := atom_indices(g, cid, nm, sub_ids, pl_pids)
+            emit_atom_row(g, ast_name(a, nm), false, 0, sub, pledge)
+            i = i + 1
+        }
+        cg_top(g, "};")
+        cg_top(g, "")
+    }
+
+    f_ops: *Vector<int64> = alloc(vec_new())
+    p_ops: *Vector<int64> = alloc(vec_new())
+    b_ops: *Vector<int64> = alloc(vec_new())
+    if rb.fulfill >= 0 { build_postfix(a, rb.fulfill, idx, f_ops) }
+    if rb.partial >= 0 { build_postfix(a, rb.partial, idx, p_ops) }
+    if rb.brk >= 0 { build_postfix(a, rb.brk, idx, b_ops) }
+    emit_ops(g, cname, "rf", f_ops)
+    emit_ops(g, cname, "rp", p_ops)
+    emit_ops(g, cname, "rb", b_ops)
+
+    return ReqEmit {
+        nsubs: vec_len(sub_ids),
+        natoms: natoms,
+        has_reqs: true,
+        nfulfill: vec_len(f_ops) / 2,
+        npartial: vec_len(p_ops) / 2,
+        nbreak: vec_len(b_ops) / 2,
+    }
+}
+
+// The default path: the grammar's policy synthesized when the source wrote
+// no block. The atom table holds one fulfilled atom per item, subcontracts
+// then loose pledges in declaration order, then the same items again as
+// broken atoms. fulfill is the AND chain over the fulfilled atoms, partial
+// the OR chain over the fulfilled subcontract atoms, break the AND chain
+// over the broken atoms; a contract with no items emits no arrays and every
+// line stays constant false.
+func emit_default_block(g: *Cg, cname: string, sub_ids: *Vector<int64>, sub_names: *Vector<int64>, pl_pids: *Vector<int64>, pl_subs: *Vector<int64>) -> ReqEmit {
+    a: *Ast = (*g).ast
+    ns: int64 = vec_len(sub_ids)
+
+    // The loose pledge indices, declaration order.
+    loose: *Vector<int64> = alloc(vec_new())
+    mut k: int64 = 0
+    while k < vec_len(pl_pids) {
+        if vec_get(pl_subs, k) < 0 {
+            vec_push(loose, k)
+        }
+        k = k + 1
+    }
+    nitems: int64 = ns + vec_len(loose)
+    if nitems == 0 {
+        return ReqEmit { nsubs: ns, natoms: 0, has_reqs: false, nfulfill: 0, npartial: 0, nbreak: 0 }
+    }
+
+    cg_top(g, tmsg3("static const AshReqAtom k_", cname, "_atoms[] = {"))
+    mut pass: int64 = 0
+    while pass < 2 {
+        mut s: int64 = 0
+        while s < ns {
+            nm: int64 = vec_get(sub_names, s)
+            mut text: string = ""
+            mut anon: bool = true
+            if nm >= 0 {
+                text = ast_name(a, nm)
+                anon = false
+            }
+            emit_atom_row(g, text, anon, pass, s, -1)
+            s = s + 1
+        }
+        mut l: int64 = 0
+        while l < vec_len(loose) {
+            pidx: int64 = vec_get(loose, l)
+            pl: PledgeNode = vec_get((*a).pledges, vec_get(pl_pids, pidx))
+            emit_atom_row(g, ast_name(a, pl.name), false, pass, -1, pidx)
+            l = l + 1
+        }
+        pass = pass + 1
+    }
+    cg_top(g, "};")
+    cg_top(g, "")
+
+    // Atom indices: fulfilled items at 0..nitems-1, broken at nitems..2n-1.
+    f_atoms: *Vector<int64> = alloc(vec_new())
+    p_atoms: *Vector<int64> = alloc(vec_new())
+    b_atoms: *Vector<int64> = alloc(vec_new())
+    mut i: int64 = 0
+    while i < nitems {
+        vec_push(f_atoms, i)
+        vec_push(b_atoms, nitems + i)
+        if i < ns { vec_push(p_atoms, i) }
+        i = i + 1
+    }
+    f_ops: *Vector<int64> = alloc(vec_new())
+    p_ops: *Vector<int64> = alloc(vec_new())
+    b_ops: *Vector<int64> = alloc(vec_new())
+    push_chain(f_ops, f_atoms, 2)
+    push_chain(p_ops, p_atoms, 3)
+    push_chain(b_ops, b_atoms, 2)
+    emit_ops(g, cname, "rf", f_ops)
+    emit_ops(g, cname, "rp", p_ops)
+    emit_ops(g, cname, "rb", b_ops)
+
+    return ReqEmit {
+        nsubs: ns,
+        natoms: nitems * 2,
+        has_reqs: false,
+        nfulfill: vec_len(f_ops) / 2,
+        npartial: vec_len(p_ops) / 2,
+        nbreak: vec_len(b_ops) / 2,
+    }
+}
+
+// The whole requirements surface of one contract: the subs table, then the
+// source block serialized or the defaults synthesized.
+export func emit_reqs(g: *Cg, cid: int64, cname: string, sub_ids: *Vector<int64>, sub_names: *Vector<int64>, pl_pids: *Vector<int64>, pl_subs: *Vector<int64>) -> ReqEmit {
+    a: *Ast = (*g).ast
+    if vec_len(sub_ids) > 0 {
+        cg_top(g, tmsg3("static const char* const k_", cname, "_subs[] = {"))
+        mut i: int64 = 0
+        while i < vec_len(sub_ids) {
+            nm: int64 = vec_get(sub_names, i)
+            if nm >= 0 {
+                cg_top(g, tmsg3("    \"", ast_name(a, nm), "\","))
+            } else {
+                cg_top(g, "    NULL,")
+            }
+            i = i + 1
+        }
+        cg_top(g, "};")
+        cg_top(g, "")
+    }
+    rbid: int64 = find_reqblock(a, cid)
+    if rbid >= 0 {
+        return emit_source_block(g, cid, cname, rbid, sub_ids, pl_pids)
+    }
+    return emit_default_block(g, cname, sub_ids, sub_names, pl_pids, pl_subs)
+}

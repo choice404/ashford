@@ -31,15 +31,20 @@
 @import cgenstate
 @import cgenexpr
 @import cgenstmt
+@import cgenreq
 
 // One pledge of a contract, flattened: loose pledges and subcontract pledges
-// alike, in declaration order, with the sig table key they were filed under.
-struct PlInfo { pid: int64, key: string }
+// alike, in declaration order, with the sig table key they were filed under
+// and the ordinal of the owning subcontract, -1 for a loose pledge.
+struct PlInfo { pid: int64, key: string, sub: int64 }
 
 struct VowInfo { vid: int64 }
 
-// Collects the contract's vows and pledges in declaration order.
-func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -> void {
+// Collects the contract's vows, pledges, and subcontracts in declaration
+// order. sub_ids holds the arena id of every subcontract, named or not, and
+// sub_names its name id or -1, so a pledge's sub field and a requirements
+// atom index against one table.
+func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>, sub_ids: *Vector<int64>, sub_names: *Vector<int64>) -> void {
     a: *Ast = (*g).ast
     c: ContractNode = vec_get((*a).contracts, cid)
     mut i: int64 = 0
@@ -50,17 +55,20 @@ func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlInfo>) -
             vec_push(vows, VowInfo { vid: mid })
         } else if mkind == mk_pledge() {
             pl: PledgeNode = vec_get((*a).pledges, mid)
-            vec_push(pls, PlInfo { pid: mid, key: rs_mkey(cid, pl.name) })
+            vec_push(pls, PlInfo { pid: mid, key: rs_mkey(cid, pl.name), sub: -1 })
         } else if mkind == mk_subcontract() {
             sub: SubNode = vec_get((*a).subs, mid)
+            ordinal: int64 = vec_len(sub_ids)
+            vec_push(sub_ids, mid)
+            vec_push(sub_names, sub.name)
             mut j: int64 = 0
             while j < sub.pledges_len {
                 pid: int64 = vec_get((*a).kids, sub.pledges_off + j)
                 pl2: PledgeNode = vec_get((*a).pledges, pid)
                 if sub.name >= 0 {
-                    vec_push(pls, PlInfo { pid: pid, key: rs_skey(mid, pl2.name) })
+                    vec_push(pls, PlInfo { pid: pid, key: rs_skey(mid, pl2.name), sub: ordinal })
                 } else {
-                    vec_push(pls, PlInfo { pid: pid, key: rs_mkey(cid, pl2.name) })
+                    vec_push(pls, PlInfo { pid: pid, key: rs_mkey(cid, pl2.name), sub: ordinal })
                 }
                 j = j + 1
             }
@@ -276,7 +284,9 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     cname: string = ast_name(a, c.name)
     vows: *Vector<VowInfo> = alloc(vec_new())
     pls: *Vector<PlInfo> = alloc(vec_new())
-    collect(g, cid, vows, pls)
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
 
     version: int64 = contract_version(g, c)
     shape: string = shape_string(g, cid, vows, pls)
@@ -312,23 +322,52 @@ func emit_contract(g: *Cg, cid: int64) -> void {
             mut fn_text: string = m2
             if pl2.body < 0 { fn_text = "NULL" }
             head: string = tmsg7("    { \"", ast_name(a, pl2.name), "\", \"", m2, "\", ", int_to_string(pl2.params_len), ", ")
-            cg_top(g, tmsg3(head, fn_text, " },"))
+            cg_top(g, tmsg7(head, fn_text, ", ", int_to_string(info2.sub), " },", "", ""))
             j = j + 1
         }
         cg_top(g, "};")
         cg_top(g, "")
     }
 
+    // The requirements surface: the flattened pledge order above is the
+    // index space its atoms and the runtime latch share.
+    pl_pids: *Vector<int64> = alloc(vec_new())
+    pl_subs: *Vector<int64> = alloc(vec_new())
+    mut q: int64 = 0
+    while q < vec_len(pls) {
+        infoq: PlInfo = vec_get(pls, q)
+        vec_push(pl_pids, infoq.pid)
+        vec_push(pl_subs, infoq.sub)
+        q = q + 1
+    }
+    re: ReqEmit = emit_reqs(g, cid, cname, sub_ids, sub_names, pl_pids, pl_subs)
+
     hex: string = hash_hex16(shash)
     mut pl_ref: string = "NULL"
     if vec_len(pls) > 0 { pl_ref = tmsg3("k_", cname, "_pledges") }
     mut vow_ref: string = "NULL"
     if vec_len(vows) > 0 { vow_ref = tmsg3("k_", cname, "_vows") }
+    mut subs_ref: string = "NULL"
+    if re.nsubs > 0 { subs_ref = tmsg3("k_", cname, "_subs") }
+    mut atoms_ref: string = "NULL"
+    if re.natoms > 0 { atoms_ref = tmsg3("k_", cname, "_atoms") }
+    mut rf_ref: string = "NULL"
+    if re.nfulfill > 0 { rf_ref = tmsg3("k_", cname, "_rf") }
+    mut rp_ref: string = "NULL"
+    if re.npartial > 0 { rp_ref = tmsg3("k_", cname, "_rp") }
+    mut rb_ref: string = "NULL"
+    if re.nbreak > 0 { rb_ref = tmsg3("k_", cname, "_rb") }
+    mut has_reqs_text: string = "0"
+    if re.has_reqs { has_reqs_text = "1" }
     cg_top(g, tmsg3("static const AshContractDesc k_", cname, " = {"))
     cg_top(g, tmsg5("    \"", cname, "\", 0x", hex, "ULL,"))
     free(hex)
     cg_top(g, tmsg7("    ", int_to_string(version), ", ", int_to_string(vec_len(pls)), ", ", pl_ref, ","))
     cg_top(g, tmsg5("    ", int_to_string(vec_len(vows)), ", ", vow_ref, ","))
+    cg_top(g, tmsg7("    ", int_to_string(re.nsubs), ", ", subs_ref, ", ", int_to_string(re.natoms), ","))
+    cg_top(g, tmsg7("    ", atoms_ref, ", ", has_reqs_text, ",", "", ""))
+    cg_top(g, tmsg7("    ", int_to_string(re.nfulfill), ", ", int_to_string(re.npartial), ", ", int_to_string(re.nbreak), ","))
+    cg_top(g, tmsg7("    ", rf_ref, ", ", rp_ref, ", ", rb_ref, ","))
     cg_top(g, "};")
     cg_top(g, "")
 }

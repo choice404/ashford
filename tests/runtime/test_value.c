@@ -91,15 +91,16 @@ static AshStatus capture_fn(void* ctx, const AshValue* args, size_t nargs,
 }
 
 static const AshPledgeDesc k_capture_pledges[] = {
-    { "capture", "__ash_test_capture", 1, capture_fn },
+    { "capture", "__ash_test_capture", 1, capture_fn, -1 },
 };
 
 static const AshContractDesc k_arena = {
-    "Arena", 0x1ULL, 1, 0, NULL, 0, NULL,
+    .name = "Arena", .shape_hash = 0x1ULL, .version = 1,
 };
 
 static const AshContractDesc k_capture = {
-    "Capture", 0x2ULL, 1, 1, k_capture_pledges, 0, NULL,
+    .name = "Capture", .shape_hash = 0x2ULL, .version = 1,
+    .npledges = 1, .pledges = k_capture_pledges,
 };
 
 /* ---- the tests ---- */

@@ -16,15 +16,16 @@ CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -fPIC
 OUT     := target/ashc-out
 
-RT_SO     := $(OUT)/libashrt.so
-ASHC      := target/dusk-out/ashc
-MODULE    := $(OUT)/libhello.ash.so
-MODULE_V2 := $(OUT)/libhello_v2.ash.so
-HOST      := $(OUT)/host
+RT_SO      := $(OUT)/libashrt.so
+ASHC       := target/dusk-out/ashc
+MODULE     := $(OUT)/libhello.ash.so
+MODULE_V2  := $(OUT)/libhello_v2.ash.so
+MODULE_PAY := $(OUT)/libpayment.ash.so
+HOST       := $(OUT)/host
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-determinism tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-partial test-determinism tsan clean
 
-all: smoke test-runtime test-thread test-iname test-determinism tsan
+all: smoke test-runtime test-thread test-iname test-partial test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -44,6 +45,9 @@ $(MODULE): $(ASHC) skeleton/hello.ash runtime/include/ash/ash_abi.h
 
 $(MODULE_V2): $(ASHC) skeleton/hello_v2.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/hello_v2.ash
+
+$(MODULE_PAY): $(ASHC) skeleton/payment.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/payment.ash
 
 host: $(HOST)
 
@@ -83,6 +87,16 @@ test-iname: $(MODULE) $(MODULE_V2)
 	    tests/runtime/test_iname.c runtime/src/runtime.c -ldl -o $(OUT)/test_iname
 	./$(OUT)/test_iname
 
+# The requirements gate under ASan: the compiled payment module's policy
+# trees drive the per-pledge latch, the evaluator's priority order, the
+# partial result surface, and the automatic break that keeps its heap for
+# the errors it reports.
+test-partial: $(MODULE_PAY)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
+	    tests/runtime/test_partial.c runtime/src/runtime.c -ldl -o $(OUT)/test_partial
+	./$(OUT)/test_partial
+
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
 # in the iname story reproducible.
@@ -96,7 +110,11 @@ test-determinism: $(ASHC)
 	mv $(OUT)/hello_v2.c $(OUT)/hello_v2.c.first
 	$(ASHC) build skeleton/hello_v2.ash
 	diff $(OUT)/hello_v2.c.first $(OUT)/hello_v2.c
-	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first
+	$(ASHC) build skeleton/payment.ash
+	mv $(OUT)/payment.c $(OUT)/payment.c.first
+	$(ASHC) build skeleton/payment.ash
+	diff $(OUT)/payment.c.first $(OUT)/payment.c
+	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first
 	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the

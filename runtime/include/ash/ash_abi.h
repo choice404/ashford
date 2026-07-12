@@ -118,7 +118,46 @@ typedef struct AshPledgeDesc {
     const char* mangled;
     uint32_t    nargs;
     AshPledgeFn fn;        /* NULL marks an abstract pledge awaiting a bind */
+    int32_t     sub;       /* index into the contract's subs table, or -1 for
+                            * a pledge declared outside any subcontract. An
+                            * index outside [0, nsubs) reads as loose, which
+                            * is what a zero-filled handwritten desc gets. */
 } AshPledgeDesc;
+
+/* One atom of a requirements policy line. An atom tests one item's latched
+ * state: a subcontract (sub >= 0, every pledge inside it latched) or a loose
+ * pledge (pledge >= 0, that pledge's own latch). kind picks which latch the
+ * atom tests; source atoms are always ASH_ATOM_FULFILLED, the grammar's
+ * "bare name means fulfilled", and ASH_ATOM_BROKEN exists so the synthesized
+ * default break line, "when everything is broken", is expressible in the
+ * same table. name is the item's declared name, NULL for an anonymous
+ * subcontract, and is informational; evaluation reads the indices. */
+enum {
+    ASH_ATOM_FULFILLED = 0,
+    ASH_ATOM_BROKEN    = 1
+};
+
+typedef struct AshReqAtom {
+    const char* name;
+    uint32_t    kind;    /* ASH_ATOM_FULFILLED or ASH_ATOM_BROKEN */
+    int32_t     sub;     /* subs table index, -1 when the atom is a pledge */
+    int32_t     pledge;  /* pledges table index, -1 when the atom is a sub */
+} AshReqAtom;
+
+/* One op of a policy line's postfix program. ATOM pushes atom's truth, NOT
+ * negates the top, AND and OR combine the top two. A line of length 0 is a
+ * line the source did not write and never fires, constant false. */
+enum {
+    ASH_REQ_ATOM = 0,
+    ASH_REQ_NOT  = 1,
+    ASH_REQ_AND  = 2,
+    ASH_REQ_OR   = 3
+};
+
+typedef struct AshReqOp {
+    uint8_t op;    /* ASH_REQ_* */
+    uint8_t atom;  /* atoms table index, meaningful for ASH_REQ_ATOM only */
+} AshReqOp;
 
 /* One vow of a contract: its name, its value's type tag, and its default
  * when the declaration carried an initializer. A default that is a string
@@ -159,6 +198,15 @@ typedef struct AshRef {
     void*          user;        /* passed through to write_back untouched */
 } AshRef;
 
+/* The requirements surface rides at the tail of the contract descriptor so a
+ * zero-filled handwritten descriptor stays valid: no atoms and no lines means
+ * the runtime applies the structural default policy over subs and loose
+ * pledges. ashc always emits the three lines, serializing the source block
+ * when one was written and synthesizing the grammar's defaults when not, so
+ * the compiler's static satisfiability check and the runtime evaluate the
+ * same trees. subs lists every subcontract in declaration order, anonymous
+ * ones as NULL entries, so a pledge's sub index and a sub atom resolve
+ * against one table. */
 typedef struct AshContractDesc {
     const char*          name;
     uint64_t             shape_hash;
@@ -167,6 +215,17 @@ typedef struct AshContractDesc {
     const AshPledgeDesc* pledges;
     uint32_t             nvows;
     const AshVowDesc*    vows;
+    uint32_t             nsubs;
+    const char* const*   subs;         /* NULL entry = anonymous subcontract */
+    uint32_t             natoms;
+    const AshReqAtom*    atoms;
+    uint32_t             has_reqs;     /* 1 when the source wrote the block */
+    uint32_t             nfulfill;
+    uint32_t             npartial;
+    uint32_t             nbreak;
+    const AshReqOp*      req_fulfill;
+    const AshReqOp*      req_partial;
+    const AshReqOp*      req_break;
 } AshContractDesc;
 
 /* A vow override a host supplies at sign. The value is copied onto the

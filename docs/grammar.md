@@ -205,7 +205,7 @@ A `ReqAtom` names a subcontract or a pledge declared outside any subcontract. A 
 
 A pledge latches. It becomes fulfilled on its first `Ok` and broken on an `Err` that lands before any `Ok`. Later calls still run and still return their results to the caller, but the latched state never changes, so contract state never regresses. A subcontract is fulfilled when every pledge inside it is, and broken when every pledge inside it is.
 
-The policy is evaluated after every fulfillment, in priority order `break`, then `fulfill`, then `partial`, and the first line that matches sets the contract state. A state that satisfies both `fulfill` and `partial` is therefore fine, `fulfill` wins. The one static rejection is a `fulfill` and a `break` that can be true at the same time, checked by enumerating the atom assignments.
+The policy is evaluated after every fulfillment, in priority order `break`, then `fulfill`, then `partial`, and the first line that matches sets the contract state. The `break` line arms only once at least one pledge has latched broken; before that it never matches, whatever its expression says. Without this rule a policy like `break: !Validation && !Processing` would tear the contract down after its very first successful fulfillment, when nothing has broken and nothing is yet fulfilled. A state that satisfies both `fulfill` and `partial` is therefore fine, `fulfill` wins. The one static rejection is a `fulfill` and a `break` that can be true at the same time, checked by enumerating the atom assignments.
 
 When the block is absent the defaults apply: `fulfill` when every subcontract and every loose pledge is fulfilled, `partial` when at least one subcontract is, `break` when everything is broken.
 

@@ -138,6 +138,47 @@ int64_t  ash_contract_signed_at(const AshContract* c);
  * reports ASH_ERR_STATE instead of touching freed memory. */
 AshStatus ash_contract_break(AshContract* c);
 
+/* ---- the partial result ---- */
+
+/* The PartialResult surface: which items landed, which are pending, which
+ * broke, and the errors attached to the broken pledges. An item is a named
+ * subcontract or a pledge declared outside any subcontract, the same names a
+ * requirements atom can test. A named subcontract reads FULFILLED when every
+ * pledge inside it latched Ok, BROKEN when every pledge inside it latched
+ * Err, and PENDING otherwise; a loose pledge reads its own latch.
+ *
+ * Every call takes the instance lock and reads the latches as they stand at
+ * that moment, so two calls bracket a snapshot only if no fulfillment can
+ * land between them; a host that wants a coherent picture reads it after its
+ * waits complete. */
+typedef enum AshItemState {
+    ASH_ITEM_PENDING   = 0,
+    ASH_ITEM_FULFILLED = 1,
+    ASH_ITEM_BROKEN    = 2
+} AshItemState;
+
+/* How many items currently read as k. */
+size_t ash_partial_count(AshContract* c, AshItemState k);
+
+/* The name of the i-th item reading as k, in descriptor order: named
+ * subcontracts in declaration order first, then loose pledges in declaration
+ * order, which is deterministic across runs of the same module. NULL when i
+ * is out of range or c is NULL. The string points at descriptor memory and
+ * lives as long as the module. */
+const char* ash_partial_name(AshContract* c, AshItemState k, size_t i);
+
+/* How many pledges, subcontract members included, have latched Broken. */
+size_t ash_partial_nerrors(AshContract* c);
+
+/* The i-th broken pledge in declaration order: its name through pledge_name
+ * and the Err payload its first Err carried through err. Both out params are
+ * optional. The payload is instance owned and survives an automatic break,
+ * whose whole point is handing the errors over; an explicit
+ * ash_contract_break reclaims the heap, after which the payload reads as a
+ * zeroed Unit value. ASH_ERR_NAME when i is out of range. */
+AshStatus ash_partial_error(AshContract* c, size_t i,
+                            const char** pledge_name, const AshValue** err);
+
 /* ---- pledges ---- */
 
 /* Binds a host implementation to a pledge, the way an abstract pledge gets a

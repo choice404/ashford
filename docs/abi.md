@@ -65,6 +65,7 @@ typedef struct AshPledgeDesc {
     const char* mangled;   /* the mangled symbol, see below */
     uint32_t    nargs;
     AshPledgeFn fn;        /* NULL marks an abstract pledge awaiting a bind */
+    int32_t     sub;       /* subs table index, or -1 for a loose pledge */
 } AshPledgeDesc;
 
 typedef struct AshVowDesc {
@@ -82,10 +83,23 @@ typedef struct AshContractDesc {
     const AshPledgeDesc* pledges;
     uint32_t             nvows;
     const AshVowDesc*    vows;
+    uint32_t             nsubs;
+    const char* const*   subs;         /* NULL entry = anonymous subcontract */
+    uint32_t             natoms;
+    const AshReqAtom*    atoms;
+    uint32_t             has_reqs;     /* 1 when the source wrote the block */
+    uint32_t             nfulfill;
+    uint32_t             npartial;
+    uint32_t             nbreak;
+    const AshReqOp*      req_fulfill;
+    const AshReqOp*      req_partial;
+    const AshReqOp*      req_break;
 } AshContractDesc;
 ```
 
 Pledges and vows appear in declaration order. A vow whose declaration carried an initializer has `has_default` set and the literal encoded in `default_value`; a string default points at bytes inside the module. Signing copies every vow value onto the instance, so nothing an instance reads aliases the descriptor after sign.
+
+`subs` names every subcontract in declaration order, an anonymous one as a NULL entry, and each pledge's `sub` indexes it, -1 for a pledge declared outside any subcontract. A `sub` outside `[0, nsubs)` reads as loose, which is what a zero-filled handwritten descriptor gets. The atom table, the `has_reqs` flag, and the three postfix policy programs are the requirements surface, described in their own section below; a handwritten descriptor that carries none of them gets the structural default policy.
 
 ## The registrar
 
@@ -155,6 +169,66 @@ The protocol has exactly two moments, both on a thread the host is blocked in an
 2. Write back, at delivery, inside the `ash_future_wait` that collects the outcome or before `ash_pledge_fulfill_sync` returns, on the waiting thread. Each slot's final value goes back to host memory: through `write_back` when the host supplied one, `user` passed through untouched, or by the default otherwise.
 
 The default write back writes scalars in place and writes a whole `AshString` struct for strings. The string bytes it points at are instance owned and die at break; a host that wants the shouted bytes to outlive the instance supplies a `write_back` that copies them out, which is also where a capacity declared in `cap` gets honored. Write back happens only when the fulfillment itself reported `ASH_OK`; a thunk error leaves host memory untouched. Every slot's type is checked against its ref before anything is written, so a pledge that swapped a slot's type writes nothing and the wait reports `ASH_ERR_TYPE`.
+
+## Requirements and the contract state
+
+Every pledge carries a latch: pending until its first outcome, fulfilled on its first Ok, broken on an Err that lands before any Ok, and immutable after either. Later fulfillments still run and still return their results to the caller; the latch never moves, so the contract state never regresses from a pledge's point of view. A pledge that returns Option or Unit latches fulfilled on any delivered outcome; only a Result with the Err tag latches broken, and its payload, the boxed value behind the Err, is kept beside the latch for the partial surface.
+
+A subcontract is fulfilled when every pledge inside it has latched fulfilled and broken when every pledge inside it has latched broken. An empty subcontract holds no latch to test and reads neither, constant false on both sides.
+
+The policy rides in the descriptor as an atom table and three postfix programs:
+
+```c
+enum { ASH_ATOM_FULFILLED = 0, ASH_ATOM_BROKEN = 1 };
+
+typedef struct AshReqAtom {
+    const char* name;    /* informational; NULL for an anonymous sub */
+    uint32_t    kind;    /* which latch the atom tests */
+    int32_t     sub;     /* subs table index, -1 when the atom is a pledge */
+    int32_t     pledge;  /* pledges table index, -1 when the atom is a sub */
+} AshReqAtom;
+
+enum { ASH_REQ_ATOM = 0, ASH_REQ_NOT = 1, ASH_REQ_AND = 2, ASH_REQ_OR = 3 };
+
+typedef struct AshReqOp {
+    uint8_t op;
+    uint8_t atom;        /* atoms index, meaningful for ASH_REQ_ATOM only */
+} AshReqOp;
+```
+
+A source atom is always the fulfilled test, the grammar's rule that a bare name means the item is fulfilled and `!` negates it, so a false atom covers pending and broken alike. `ASH_ATOM_BROKEN` exists for the synthesized default break line, everything broken, which a fulfilled atom cannot spell. A program of length 0 is a line the source did not write and never fires. Evaluation is a small stack machine under the instance lock; a malformed program that would over- or underflow reads false rather than anything worse.
+
+The compiler serializes the source block's lines from the same AST its satisfiability check walked, atoms in the same first appearance order, so what `ashc check` proved about fulfill and break never co-holding is exactly what the runtime evaluates. When the source wrote no block the compiler synthesizes the grammar's defaults as trees: fulfill when every subcontract and every loose pledge is fulfilled, partial when at least one subcontract is, break when everything is broken. `has_reqs` records which case it was, informational either way. A descriptor with no requirements data at all, the handwritten case, gets the same structural default computed from the descriptor shape.
+
+**Evaluation.** After every fulfillment outcome, under the same instance lock the thunk ran in, the runtime latches the pledge and recomputes the state in priority order: break, then fulfill, then partial, the first line that matches setting the state, and Signed when none does. A state satisfying both fulfill and partial is therefore Fulfilled.
+
+**The arming rule.** The break line matches only once at least one pledge has latched broken. A break line written over negated atoms, the README's `!Validation && !Processing && !notify_user` shape, is true the moment the contract signs, since nothing is fulfilled yet; firing it on the contract's first Ok would tear down a contract nothing broke. Arming it on the first broken pledge keeps a written break line and the synthesized default, which already implies a broken pledge, reading the same way.
+
+**Automatic break.** A break line that fires latches the contract Broken exactly as `ash_contract_break` does, every later fulfillment reporting `ASH_ERR_STATE`, with one deliberate difference: the instance heap is kept alive, because the Err payloads the partial surface hands out live there. Only an explicit `ash_contract_break` reclaims the heap, and the runtime shutdown reclaims it regardless.
+
+## The partial result
+
+The PartialResult surface reports which items landed, which are pending, which broke, and the errors attached, the language's `instance.partial()` seen from C:
+
+```c
+typedef enum AshItemState {
+    ASH_ITEM_PENDING   = 0,
+    ASH_ITEM_FULFILLED = 1,
+    ASH_ITEM_BROKEN    = 2
+} AshItemState;
+
+size_t      ash_partial_count(AshContract* c, AshItemState k);
+const char* ash_partial_name(AshContract* c, AshItemState k, size_t i);
+size_t      ash_partial_nerrors(AshContract* c);
+AshStatus   ash_partial_error(AshContract* c, size_t i,
+                              const char** pledge_name, const AshValue** err);
+```
+
+An item is a named subcontract or a loose pledge, the same names a requirements atom can test; an anonymous subcontract groups its pledges for the policy but has no name a result could report. Enumeration order is descriptor order, named subcontracts in declaration order first, then loose pledges in declaration order, deterministic across runs of the same module. A named subcontract reads fulfilled when every pledge inside it latched Ok, broken when every one latched Err, and pending otherwise; a loose pledge reads its own latch.
+
+The errors walk every pledge, subcontract members included, in declaration order: `ash_partial_nerrors` counts the pledges latched broken, and `ash_partial_error` hands out the i-th one's declared name and a pointer to the payload its first Err carried. The payload pointer is runtime owned and stays valid until shutdown, but what it points into follows the instance heap: it survives an automatic break, whose whole point is handing the errors over, and reads as a zeroed Unit value after an explicit break reclaimed the heap.
+
+Every call takes the instance lock and reads the latches as they stand at that moment, so two calls bracket a snapshot only when no fulfillment can land between them; a host that wants a coherent picture reads it after its waits complete.
 
 ## Threading
 

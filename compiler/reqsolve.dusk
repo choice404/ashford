@@ -37,8 +37,11 @@ func rmsg3(s1: string, s2: string, s3: string) -> string {
 
 // Collects the distinct atoms of one line in first appearance order. The
 // order is what the witness rendering follows, so the diagnostic reads the
-// way the block was written.
-func collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<int64>) -> void {
+// way the block was written. Exported because the code generator serializes
+// the descriptor atom table in exactly this enumeration order, which is what
+// keeps the static satisfiability check and the runtime evaluator reading
+// one atom list.
+export func req_collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<int64>) -> void {
     q: ReqNode = vec_get((*a).reqs, id)
     if q.kind == rk_atom() {
         key: string = rs_gkey(q.a)
@@ -47,10 +50,10 @@ func collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<int64>) 
             vec_push(names, q.a)
         }
     } else if q.kind == rk_not() {
-        collect_atoms(a, q.a, names, idx)
+        req_collect_atoms(a, q.a, names, idx)
     } else {
-        collect_atoms(a, q.a, names, idx)
-        collect_atoms(a, q.b, names, idx)
+        req_collect_atoms(a, q.a, names, idx)
+        req_collect_atoms(a, q.b, names, idx)
     }
 }
 
@@ -92,9 +95,9 @@ func witness(a: *Ast, names: *Vector<int64>, pows: *Vector<int64>, mask: int64) 
 func solve_block(a: *Ast, cname: string, rb: ReqBlockNode, errors: *Vector<Located>) -> void {
     names: *Vector<int64> = alloc(vec_new())
     idx: *Map<int64> = alloc(map_new())
-    if rb.fulfill >= 0 { collect_atoms(a, rb.fulfill, names, idx) }
-    if rb.partial >= 0 { collect_atoms(a, rb.partial, names, idx) }
-    if rb.brk >= 0 { collect_atoms(a, rb.brk, names, idx) }
+    if rb.fulfill >= 0 { req_collect_atoms(a, rb.fulfill, names, idx) }
+    if rb.partial >= 0 { req_collect_atoms(a, rb.partial, names, idx) }
+    if rb.brk >= 0 { req_collect_atoms(a, rb.brk, names, idx) }
     n: int64 = vec_len(names)
     if n > 16 { return }
     pows: *Vector<int64> = alloc(vec_new())

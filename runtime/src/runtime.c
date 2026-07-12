@@ -1,4 +1,4 @@
-/* runtime.c: the M6 intermediary runtime. One translation unit on purpose;
+/* runtime.c: the M7 intermediary runtime. One translation unit on purpose;
  * the split into contract.c, iname.c, and friends happens when there is more
  * than one contract's worth of machinery to split. What exists today is the
  * whole path a compiled module and a foreign host share: load a module,
@@ -6,6 +6,14 @@
  * compiled pledges, sign a contract with vow overrides over the declared
  * defaults, dispatch fulfillments through the uniform thunk frame on a real
  * thread pool, latch the pledge outcome, and reclaim everything at break.
+ *
+ * M7 adds the requirements evaluator and the partial result. Every pledge
+ * carries its own latch now, fulfilled on the first Ok, broken on an Err
+ * before any Ok, immutable after either, and the contract state is
+ * recomputed after every fulfillment by evaluating the descriptor's policy
+ * lines in priority order break, fulfill, partial over those latches. The
+ * partial surface reports the item states and the first Err payload of every
+ * broken pledge under the same instance lock.
  *
  * M6 adds the iname table and the freeze. Registration fills a sorted
  * registry of contract types keyed by mangled name, one entry per contract
@@ -61,6 +69,15 @@ typedef struct AshBlock {
     struct AshBlock* next;
 } AshBlock;
 
+/* The per-pledge latch values. A pledge latches on its first Ok or first
+ * Err and never moves again; the contract state is recomputed from these
+ * latches after every fulfillment. */
+enum {
+    PLEDGE_PENDING   = 0,
+    PLEDGE_FULFILLED = 1,
+    PLEDGE_BROKEN    = 2
+};
+
 struct AshContract {
     AshRuntime*            rt;
     const AshContractDesc* desc;
@@ -71,8 +88,15 @@ struct AshContract {
     struct AshFuture*      futures;   /* every future this instance issued */
     uint64_t               shape_hash;
     int64_t                signed_at;
-    uint32_t               fulfilled; /* pledges latched Fulfilled, by count */
-    uint32_t               broken;    /* pledges latched Broken, by count */
+
+    /* The latches, one slot per descriptor pledge, and the first Err payload
+     * each broken pledge carried. Both arrays are plain heap freed at
+     * shutdown, not instance blocks, so the partial surface stays readable
+     * after a break; the payload structs point into the instance heap, so an
+     * explicit break zeroes them when it frees that heap, while an automatic
+     * break leaves both alone on purpose, the errors are what it reports. */
+    uint8_t*               pledge_state; /* PLEDGE_*, one per pledge */
+    AshValue*              pledge_err;   /* first Err payload per pledge */
     pthread_mutex_t        mu;        /* recursive; the instance lock */
 };
 
@@ -88,6 +112,7 @@ struct AshFuture {
     struct AshFuture* qnext;   /* pool queue link */
     AshContract*      c;
     AshPledgeFn       fn;
+    uint32_t          pidx;    /* descriptor index of the pledge, for latch */
     AshValue*         frame;   /* instance owned, one slot per parameter */
     size_t            frame_nargs;
     AshStatus         status;
@@ -143,6 +168,11 @@ struct AshRuntime {
 };
 
 typedef AshStatus (*AshRegisterFn)(AshRuntime*);
+
+/* The latch readers the partial surface shares with the requirements
+ * evaluator further down; both run under the instance lock. */
+static int pledge_is_loose(const AshContractDesc* d, uint32_t i);
+static int sub_all(const AshContract* c, uint32_t s, uint8_t want);
 
 /* ---- locking primitives ---- */
 
@@ -489,6 +519,8 @@ void ash_runtime_shutdown(AshRuntime* rt) {
             f = next;
         }
         contract_free_owned(c);
+        free(c->pledge_state);
+        free(c->pledge_err);
         pthread_mutex_destroy(&c->mu);
         free(c);
     }
@@ -772,8 +804,15 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
     c->desc = desc;
     AshStatus st = resolve_dispatch(rt, c);
     if (st == ASH_OK) st = bind_vows(c, vows, nvows);
+    if (st == ASH_OK && desc->npledges > 0) {
+        c->pledge_state = calloc(desc->npledges, sizeof(uint8_t));
+        c->pledge_err = calloc(desc->npledges, sizeof(AshValue));
+        if (!c->pledge_state || !c->pledge_err) st = ASH_ERR_OOM;
+    }
     if (st != ASH_OK) {
         contract_free_owned(c);
+        free(c->pledge_state);
+        free(c->pledge_err);
         pthread_mutex_destroy(&c->mu);
         free(c);
         pthread_mutex_unlock(&rt->lock);
@@ -822,10 +861,111 @@ AshStatus ash_contract_break(AshContract* c) {
     for (struct AshFuture* f = c->futures; f; f = f->next) {
         future_forfeit(f);
     }
+    /* The stored Err payloads point into the heap about to be freed, so an
+     * explicit break zeroes them; the latches themselves survive so the
+     * partial surface still reports which pledges landed and which broke. */
+    if (c->pledge_err && c->desc->npledges > 0) {
+        memset(c->pledge_err, 0, c->desc->npledges * sizeof(AshValue));
+    }
     contract_free_owned(c);
     c->state = ASH_BROKEN;
     pthread_mutex_unlock(&c->mu);
     return ASH_OK;
+}
+
+/* ---- the partial result ---- */
+
+/* A named subcontract item's state: fulfilled when every pledge inside it
+ * latched Ok, broken when every pledge inside it latched Err, pending
+ * otherwise. Called under the instance lock. */
+static AshItemState sub_item_state(const AshContract* c, uint32_t s) {
+    if (sub_all(c, s, PLEDGE_FULFILLED)) return ASH_ITEM_FULFILLED;
+    if (sub_all(c, s, PLEDGE_BROKEN)) return ASH_ITEM_BROKEN;
+    return ASH_ITEM_PENDING;
+}
+
+static AshItemState loose_item_state(const AshContract* c, uint32_t i) {
+    if (!c->pledge_state) return ASH_ITEM_PENDING;
+    if (c->pledge_state[i] == PLEDGE_FULFILLED) return ASH_ITEM_FULFILLED;
+    if (c->pledge_state[i] == PLEDGE_BROKEN) return ASH_ITEM_BROKEN;
+    return ASH_ITEM_PENDING;
+}
+
+/* The one walk both partial item calls share: items in descriptor order,
+ * named subcontracts first then loose pledges, counting the ones whose state
+ * reads k, and capturing the want-th match's name when the caller asked for
+ * one. Anonymous subcontracts group their pledges for the policy but have no
+ * name a PartialResult could report, so they are not items. Called under the
+ * instance lock. */
+static size_t partial_scan(const AshContract* c, AshItemState k, size_t want,
+                           const char** name_out) {
+    const AshContractDesc* d = c->desc;
+    size_t n = 0;
+    for (uint32_t s = 0; s < d->nsubs; s++) {
+        if (!d->subs || !d->subs[s]) continue;
+        if (sub_item_state(c, s) != k) continue;
+        if (name_out && n == want) *name_out = d->subs[s];
+        n++;
+    }
+    for (uint32_t i = 0; i < d->npledges; i++) {
+        if (!pledge_is_loose(d, i)) continue;
+        if (loose_item_state(c, i) != k) continue;
+        if (name_out && n == want) *name_out = d->pledges[i].name;
+        n++;
+    }
+    return n;
+}
+
+size_t ash_partial_count(AshContract* c, AshItemState k) {
+    if (!c) return 0;
+    pthread_mutex_lock(&c->mu);
+    size_t n = partial_scan(c, k, 0, NULL);
+    pthread_mutex_unlock(&c->mu);
+    return n;
+}
+
+const char* ash_partial_name(AshContract* c, AshItemState k, size_t i) {
+    if (!c) return NULL;
+    const char* name = NULL;
+    pthread_mutex_lock(&c->mu);
+    partial_scan(c, k, i, &name);
+    pthread_mutex_unlock(&c->mu);
+    return name;
+}
+
+size_t ash_partial_nerrors(AshContract* c) {
+    if (!c) return 0;
+    size_t n = 0;
+    pthread_mutex_lock(&c->mu);
+    if (c->pledge_state) {
+        for (uint32_t i = 0; i < c->desc->npledges; i++) {
+            if (c->pledge_state[i] == PLEDGE_BROKEN) n++;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return n;
+}
+
+AshStatus ash_partial_error(AshContract* c, size_t i,
+                            const char** pledge_name, const AshValue** err) {
+    if (!c) return ASH_ERR_TYPE;
+    AshStatus st = ASH_ERR_NAME;
+    pthread_mutex_lock(&c->mu);
+    if (c->pledge_state) {
+        size_t n = 0;
+        for (uint32_t p = 0; p < c->desc->npledges; p++) {
+            if (c->pledge_state[p] != PLEDGE_BROKEN) continue;
+            if (n == i) {
+                if (pledge_name) *pledge_name = c->desc->pledges[p].name;
+                if (err) *err = &c->pledge_err[p];
+                st = ASH_OK;
+                break;
+            }
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
 }
 
 /* ---- vows ---- */
@@ -999,21 +1139,174 @@ static AshStatus prepare_frame(AshContract* c, const AshValue* args,
     return ASH_OK;
 }
 
-/* The M0 state rule, one contract wide until subcontracts land: a pledge
- * outcome latches, an Ok result counts toward Fulfilled and an Err toward
- * Broken. The contract reads Fulfilled once every pledge has latched Ok and
- * Broken once every pledge has latched Err, the spec's default policy over a
- * subcontract free contract. An automatic Broken keeps the owned heap alive,
- * since the Err payload just handed to the host lives there; only an explicit
- * break() reclaims. The full requirements evaluator replaces this in M7.
- * Called under the instance lock. */
-static void latch(AshContract* c, const AshValue* out) {
-    if (out->ty == ASH_TY_RESULT && out->tag == 1) {
-        c->broken += 1;
-        if (c->broken >= c->desc->npledges) c->state = ASH_BROKEN;
+/* ---- the requirements evaluator ---- */
+
+/* Whether a pledge sits outside every subcontract. A sub index outside the
+ * subs table reads as loose, which is what a zero-filled handwritten
+ * descriptor gets. */
+static int pledge_is_loose(const AshContractDesc* d, uint32_t i) {
+    int32_t s = d->pledges[i].sub;
+    return s < 0 || (uint32_t)s >= d->nsubs;
+}
+
+/* Whether every pledge of subcontract s has latched want. An empty
+ * subcontract holds no latch to test and reads false for both fulfilled and
+ * broken. Called under the instance lock. */
+static int sub_all(const AshContract* c, uint32_t s, uint8_t want) {
+    const AshContractDesc* d = c->desc;
+    int seen = 0;
+    if (!c->pledge_state) return 0;
+    for (uint32_t i = 0; i < d->npledges; i++) {
+        if (d->pledges[i].sub != (int32_t)s || (uint32_t)d->pledges[i].sub >= d->nsubs)
+            continue;
+        seen = 1;
+        if (c->pledge_state[i] != want) return 0;
+    }
+    return seen;
+}
+
+/* One atom's truth. A sub atom tests every pledge of the subcontract, a
+ * pledge atom tests that pledge's own latch; kind picks fulfilled or broken,
+ * and a bare grammar atom is always the fulfilled test, so "false" covers
+ * pending and broken alike, the grammar's "!x means not fulfilled". */
+static int atom_true(const AshContract* c, const AshReqAtom* a) {
+    uint8_t want = (a->kind == ASH_ATOM_BROKEN) ? PLEDGE_BROKEN
+                                                : PLEDGE_FULFILLED;
+    if (a->sub >= 0) return sub_all(c, (uint32_t)a->sub, want);
+    if (a->pledge >= 0 && (uint32_t)a->pledge < c->desc->npledges &&
+        c->pledge_state) {
+        return c->pledge_state[a->pledge] == want;
+    }
+    return 0;
+}
+
+/* Evaluates one postfix policy line. An empty line is a line the source did
+ * not write and never fires. The stack bound is generous, the source caps a
+ * contract at 16 distinct atoms; a malformed program that would overflow or
+ * underflow reads false rather than anything worse. */
+#define REQ_STACK_MAX 128
+
+static int eval_line(const AshContract* c, const AshReqOp* ops, uint32_t n) {
+    uint8_t st[REQ_STACK_MAX];
+    int sp = 0;
+    if (n == 0 || !ops) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        switch (ops[i].op) {
+        case ASH_REQ_ATOM:
+            if (sp >= REQ_STACK_MAX) return 0;
+            if (ops[i].atom >= c->desc->natoms) return 0;
+            st[sp++] = (uint8_t)atom_true(c, &c->desc->atoms[ops[i].atom]);
+            break;
+        case ASH_REQ_NOT:
+            if (sp < 1) return 0;
+            st[sp - 1] = !st[sp - 1];
+            break;
+        case ASH_REQ_AND:
+            if (sp < 2) return 0;
+            st[sp - 2] = st[sp - 2] && st[sp - 1];
+            sp--;
+            break;
+        case ASH_REQ_OR:
+            if (sp < 2) return 0;
+            st[sp - 2] = st[sp - 2] || st[sp - 1];
+            sp--;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return sp == 1 ? st[0] : 0;
+}
+
+/* The structural default policy for a descriptor that carries no
+ * requirements data at all, the handwritten descriptor case: fulfill when
+ * every subcontract and every loose pledge is fulfilled, partial when at
+ * least one subcontract is, break when everything is broken. ashc compiled
+ * modules never land here, the compiler serializes the source block or
+ * synthesizes these same defaults as trees. Called under the instance
+ * lock. */
+static int default_line(const AshContract* c, uint8_t want) {
+    const AshContractDesc* d = c->desc;
+    int seen = 0;
+    if (!c->pledge_state) return 0;
+    for (uint32_t s = 0; s < d->nsubs; s++) {
+        seen = 1;
+        if (!sub_all(c, s, want)) return 0;
+    }
+    for (uint32_t i = 0; i < d->npledges; i++) {
+        if (!pledge_is_loose(d, i)) continue;
+        seen = 1;
+        if (c->pledge_state[i] != want) return 0;
+    }
+    return seen;
+}
+
+static int default_partial(const AshContract* c) {
+    for (uint32_t s = 0; s < c->desc->nsubs; s++) {
+        if (sub_all(c, s, PLEDGE_FULFILLED)) return 1;
+    }
+    return 0;
+}
+
+/* Recomputes the contract state from the latches, in the grammar's priority
+ * order: break, then fulfill, then partial, the first line that matches
+ * setting the state, and Signed when none does. Broken is terminal, every
+ * later fulfillment is refused with ASH_ERR_STATE before a thunk runs.
+ *
+ * The break line is armed by the first broken pledge. A break line written
+ * over negated atoms, the README's !Validation && !Processing shape, is true
+ * the moment the contract signs, since nothing is fulfilled yet; firing it
+ * on the first Ok would tear down a contract nothing broke. A contract
+ * cannot break before something broke, which is also what the synthesized
+ * default, everything broken, already implies, so the arming rule makes the
+ * written and the defaulted policy read the same way.
+ *
+ * An automatic Broken keeps the owned heap alive, the Err payloads the
+ * partial surface reports live there; only an explicit break() reclaims.
+ * Called under the instance lock, after every fulfillment outcome. */
+static void eval_policy(AshContract* c) {
+    const AshContractDesc* d = c->desc;
+    if (c->state == ASH_BROKEN) return;
+    int armed = 0;
+    if (c->pledge_state) {
+        for (uint32_t i = 0; i < d->npledges; i++) {
+            if (c->pledge_state[i] == PLEDGE_BROKEN) {
+                armed = 1;
+                break;
+            }
+        }
+    }
+    int has_trees = d->has_reqs || d->natoms > 0 || d->nfulfill > 0 ||
+                    d->npartial > 0 || d->nbreak > 0;
+    int brk, ful, par;
+    if (has_trees) {
+        brk = armed && eval_line(c, d->req_break, d->nbreak);
+        ful = eval_line(c, d->req_fulfill, d->nfulfill);
+        par = eval_line(c, d->req_partial, d->npartial);
     } else {
-        c->fulfilled += 1;
-        if (c->fulfilled >= c->desc->npledges) c->state = ASH_FULFILLED;
+        brk = armed && default_line(c, PLEDGE_BROKEN);
+        ful = default_line(c, PLEDGE_FULFILLED);
+        par = default_partial(c);
+    }
+    if (brk) c->state = ASH_BROKEN;
+    else if (ful) c->state = ASH_FULFILLED;
+    else if (par) c->state = ASH_PARTIAL;
+    else c->state = ASH_SIGNED;
+}
+
+/* The per-pledge latch, the grammar's law: fulfilled on the first Ok, broken
+ * on an Err that lands before any Ok, and never a change after either. The
+ * first Err's payload is kept beside the latch; the box it may point into is
+ * instance owned, so the struct copy stays valid exactly as long as the
+ * instance heap does. Called under the instance lock. */
+static void latch_pledge(AshContract* c, uint32_t pidx, const AshValue* out) {
+    if (!c->pledge_state || pidx >= c->desc->npledges) return;
+    if (c->pledge_state[pidx] != PLEDGE_PENDING) return;
+    if (out->ty == ASH_TY_RESULT && out->tag == 1) {
+        c->pledge_state[pidx] = PLEDGE_BROKEN;
+        if (out->as.box) c->pledge_err[pidx] = *(const AshValue*)out->as.box;
+    } else {
+        c->pledge_state[pidx] = PLEDGE_FULFILLED;
     }
 }
 
@@ -1033,7 +1326,10 @@ static void run_task(struct AshFuture* f) {
         AshValue out;
         memset(&out, 0, sizeof(out));
         AshStatus st = f->fn((void*)c, f->frame, f->frame_nargs, &out);
-        if (st == ASH_OK) latch(c, &out);
+        if (st == ASH_OK) {
+            latch_pledge(c, f->pidx, &out);
+            eval_policy(c);
+        }
         future_finish(f, st, &out);
     }
     pthread_mutex_unlock(&c->mu);
@@ -1084,6 +1380,7 @@ AshFuture* ash_pledge_fulfill(AshContract* c, const char* pledge_name,
         st = prepare_frame(c, args, nargs, refs, nrefs, &frame);
         if (st != ASH_OK) break;
         f->fn = c->fns[p - c->desc->pledges];
+        f->pidx = (uint32_t)(p - c->desc->pledges);
         f->frame = frame;
         f->frame_nargs = p->nargs;
         f->ref_slots = (nrefs > 0 && frame) ? frame + nargs : NULL;
