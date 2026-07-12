@@ -42,12 +42,75 @@ AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out);
 void      ash_runtime_shutdown(AshRuntime* rt);
 
 /* dlopens a compiled module and calls its ash_module_register. The module
- * stays mapped until shutdown. */
+ * stays mapped until shutdown. ASH_ERR_STATE once the runtime is frozen. */
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
 
 /* Called by a module's registrar. The runtime keeps the descriptor pointer,
- * it does not copy the tables. */
+ * it does not copy the tables. Registering also fills the iname table: one
+ * entry for the contract itself and one per pledge, each keyed by its
+ * mangled name. ASH_ERR_STATE once the runtime is frozen. */
 AshStatus ash_register_contract(AshRuntime* rt, const AshContractDesc* desc);
+
+/* ---- the iname table ---- */
+
+/* The iname table is the runtime's registry of contract types, one entry per
+ * registered contract and one per pledge, keyed by mangled name and held in
+ * strict mangled name order. It fills at register time and never changes
+ * after ash_runtime_freeze, which is what makes it a stable discovery
+ * surface: a foreign host resolves a mangled name to the owning contract and
+ * its shape hash, then signs under that hash. */
+
+typedef enum AshInameKind {
+    ASH_INAME_CONTRACT = 0,
+    ASH_INAME_PLEDGE   = 1
+} AshInameKind;
+
+/* One row of the table. Strings are borrowed: contract and symbol point at
+ * descriptor memory inside the module image, mangled likewise for a pledge
+ * entry, while a contract entry's mangled name is runtime owned; all of them
+ * live until shutdown, so a host may hold them across calls but not past it.
+ * shape_hash is the owning contract's shape hash for both kinds, the value
+ * ash_contract_sign checks; version is the contract's version attribute. */
+typedef struct AshInameEntry {
+    const char* mangled;
+    uint32_t    kind;        /* AshInameKind */
+    const char* contract;    /* owning contract name */
+    const char* symbol;      /* pledge name, NULL for a contract entry */
+    uint64_t    shape_hash;
+    uint32_t    version;
+    uint32_t    nargs;       /* pledge only, 0 for a contract entry */
+} AshInameEntry;
+
+/* Freezes the runtime's registration surface. Every later ash_module_load,
+ * ash_register_contract, and ash_pledge_bind reports ASH_ERR_STATE; signing
+ * and fulfillment continue unchanged. Idempotent, and safe to call from any
+ * thread. */
+AshStatus ash_runtime_freeze(AshRuntime* rt);
+
+/* Looks one mangled name up exactly. The entry is copied to out;
+ * ASH_ERR_NAME when nothing is registered under the name. */
+AshStatus ash_iname_lookup(AshRuntime* rt, const char* mangled,
+                           AshInameEntry* out);
+
+/* The number of entries, and the entry at index i in mangled name order,
+ * which is deterministic across runs of the same modules. An index out of
+ * range is ASH_ERR_NAME. */
+size_t    ash_iname_count(AshRuntime* rt);
+AshStatus ash_iname_at(AshRuntime* rt, size_t i, AshInameEntry* out);
+
+/* Renders the whole table in its canonical text form, one entry per line in
+ * mangled name order:
+ *
+ *   {mangled} {kind} {shape_hash as 16 lowercase hex digits} v{version}\n
+ *
+ * kind spelled "contract" or "pledge". The text is byte stable for a given
+ * set of registered contracts, which makes it a discovery payload and a
+ * golden test surface. *need receives the full size including the
+ * terminating NUL; when cap is at least that the text and its NUL are
+ * written to buf and the call returns ASH_OK, otherwise nothing is written
+ * and the call returns ASH_ERR_OOM, so a NULL buf with cap 0 sizes the
+ * buffer. */
+AshStatus ash_iname_dump(AshRuntime* rt, char* buf, size_t cap, size_t* need);
 
 /* ---- contracts ---- */
 
@@ -86,7 +149,7 @@ AshStatus ash_contract_break(AshContract* c);
  * through its own globals for now. Rebinding replaces. Bindings resolve at
  * sign: an instance signed before the bind keeps dispatching what it was
  * signed with, and a binding beats the compiled body for instances signed
- * after it. */
+ * after it. ASH_ERR_STATE once the runtime is frozen. */
 AshStatus ash_pledge_bind(AshRuntime* rt, const char* pledge_name,
                           AshPledgeFn fn);
 

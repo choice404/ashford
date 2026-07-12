@@ -12,14 +12,24 @@
  * lifecycle errors on both sides of break. M5 adds the concurrency half:
  * two host threads hammering one instance, two instances running in
  * parallel, and a break racing an in-flight fulfillment whose wait must
- * land on Ok or ASH_ERR_STATE and nothing else. It exits zero only when
+ * land on Ok or ASH_ERR_STATE and nothing else. M6 makes the first sign a
+ * real discovery: the host resolves greet's mangled name through the iname
+ * table, signs under the contract name and shape hash the entry carries,
+ * and at the end freezes the runtime and proves that binding is refused
+ * while signing and fulfilling still work, and that the canonical dump is
+ * non-empty and names the pledge it resolved. It exits zero only when
  * every check held. valgrind runs this and expects silence. */
 
 #include <ash/ash.h>
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* The mangled name of Greeter.greet, hardcoded the way a foreign host ships
+ * it today; the generated header that spells it for the host is M9 work. */
+#define GREET_MANGLED "__ash_ash_Greeter_greet_17cef80f14421b9b_v1"
 
 static int fail(const char* what) {
     fprintf(stderr, "[host] FAIL: %s\n", what);
@@ -152,12 +162,36 @@ int main(void) {
         return fail("bind Greeter.shout");
     }
 
+    /* ---- discovery: resolve the pledge's mangled name first ---- */
+
+    /* The iname table turns the mangled name the host shipped with into the
+     * owning contract and the shape hash to sign under, so the first sign is
+     * a checked handshake instead of a bare string. */
+    AshInameEntry ent;
+    if (ash_iname_lookup(rt, GREET_MANGLED, &ent) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("iname lookup of the greet mangled name");
+    }
+    if (ent.kind != ASH_INAME_PLEDGE || strcmp(ent.contract, "Greeter") != 0 ||
+        !ent.symbol || strcmp(ent.symbol, "greet") != 0 || ent.nargs != 1 ||
+        ent.version != 1 || ent.shape_hash == 0) {
+        ash_runtime_shutdown(rt);
+        return fail("iname entry for greet carries the wrong facts");
+    }
+    AshInameEntry miss;
+    if (ash_iname_lookup(rt, "__ash_ash_Greeter_greet_0000000000000000_v1",
+                         &miss) != ASH_ERR_NAME) {
+        ash_runtime_shutdown(rt);
+        return fail("a wrong mangled name did not report ASH_ERR_NAME");
+    }
+
     /* ---- the default path: sign on the declared vow defaults ---- */
 
     AshContract* c = NULL;
-    if (ash_contract_sign(rt, "Greeter", NULL, 0, 0, &c) != ASH_OK) {
+    if (ash_contract_sign(rt, ent.contract, NULL, 0, ent.shape_hash, &c) !=
+        ASH_OK) {
         ash_runtime_shutdown(rt);
-        return fail("sign");
+        return fail("sign under the discovered contract and hash");
     }
     if (ash_contract_state(c) != ASH_SIGNED) {
         ash_runtime_shutdown(rt);
@@ -456,6 +490,56 @@ int main(void) {
         ash_runtime_shutdown(rt);
         return fail("break race produced a status outside {Ok, ERR_STATE}");
     }
+
+    /* ---- freeze: the registration surface shuts, the rest lives on ---- */
+
+    if (ash_runtime_freeze(rt) != ASH_OK || ash_runtime_freeze(rt) != ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("freeze is not idempotent");
+    }
+    if (ash_pledge_bind(rt, "Greeter.shout", host_shout) != ASH_ERR_STATE) {
+        ash_runtime_shutdown(rt);
+        return fail("bind after freeze did not report ASH_ERR_STATE");
+    }
+    if (ash_module_load(rt, "target/ashc-out/libhello.ash.so") !=
+        ASH_ERR_STATE) {
+        ash_runtime_shutdown(rt);
+        return fail("module load after freeze did not report ASH_ERR_STATE");
+    }
+
+    /* Signing and fulfilling stay open after the freeze. */
+    AshContract* fc = NULL;
+    if (ash_contract_sign(rt, ent.contract, NULL, 0, ent.shape_hash, &fc) !=
+        ASH_OK) {
+        ash_runtime_shutdown(rt);
+        return fail("sign after freeze");
+    }
+    if (ash_pledge_fulfill_sync(fc, "greet", &name, 1, NULL, 0, &out) !=
+            ASH_OK ||
+        !check_ok_string(&out, "hello, world")) {
+        ash_runtime_shutdown(rt);
+        return fail("fulfill after freeze");
+    }
+
+    /* The canonical dump: non-empty, and it names the pledge the host
+     * resolved through the table. */
+    size_t dneed = 0;
+    if (ash_iname_dump(rt, NULL, 0, &dneed) != ASH_ERR_OOM || dneed <= 1) {
+        ash_runtime_shutdown(rt);
+        return fail("dump size query");
+    }
+    char* dump = malloc(dneed);
+    if (!dump) {
+        ash_runtime_shutdown(rt);
+        return fail("allocating the dump buffer");
+    }
+    if (ash_iname_dump(rt, dump, dneed, &dneed) != ASH_OK ||
+        strlen(dump) + 1 != dneed || !strstr(dump, GREET_MANGLED)) {
+        free(dump);
+        ash_runtime_shutdown(rt);
+        return fail("dump content");
+    }
+    free(dump);
 
     ash_runtime_shutdown(rt);
     fprintf(stderr, "[host] ok\n");

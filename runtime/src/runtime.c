@@ -1,4 +1,4 @@
-/* runtime.c: the M5 intermediary runtime. One translation unit on purpose;
+/* runtime.c: the M6 intermediary runtime. One translation unit on purpose;
  * the split into contract.c, iname.c, and friends happens when there is more
  * than one contract's worth of machinery to split. What exists today is the
  * whole path a compiled module and a foreign host share: load a module,
@@ -6,6 +6,13 @@
  * compiled pledges, sign a contract with vow overrides over the declared
  * defaults, dispatch fulfillments through the uniform thunk frame on a real
  * thread pool, latch the pledge outcome, and reclaim everything at break.
+ *
+ * M6 adds the iname table and the freeze. Registration fills a sorted
+ * registry of contract types keyed by mangled name, one entry per contract
+ * and one per pledge; ash_runtime_freeze latches the registration surface
+ * shut, after which load, register, and bind report ASH_ERR_STATE while
+ * sign and fulfill continue unchanged. Every iname read takes the runtime
+ * lock, the simple discipline TSan can vouch for.
  *
  * Memory follows one rule. Every allocation a pledge makes goes through the
  * instance's block list, vow values and frames included, so
@@ -35,6 +42,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -111,7 +119,17 @@ struct AshRuntime {
     size_t                 ninstances;
     AshBinding             bindings[ASH_MAX_BINDINGS];
     size_t                 nbindings;
-    pthread_mutex_t        lock;      /* guards the four tables above */
+
+    /* The iname table: one entry per registered contract and one per pledge,
+     * kept sorted by mangled name so lookup is a binary search and the dump
+     * is byte stable. A contract entry's mangled string is runtime owned
+     * heap; a pledge entry borrows its descriptor's string. frozen latches
+     * the registration surface shut; sign and fulfill never read it. */
+    AshInameEntry*         inames;
+    size_t                 ninames;
+    size_t                 iname_cap;
+    int                    frozen;
+    pthread_mutex_t        lock;      /* guards the tables above */
 
     /* The pool: nworkers threads draining one unbounded intrusive queue of
      * futures. qmu and qcv are a leaf lock pair, never held with another. */
@@ -271,6 +289,117 @@ static void* pool_worker(void* arg) {
     }
 }
 
+/* ---- the iname table ---- */
+
+/* Binary search over the sorted table. Returns 1 with *pos the index on a
+ * hit, 0 with *pos the insertion point on a miss. Called under rt->lock. */
+static int iname_find(const AshRuntime* rt, const char* mangled, size_t* pos) {
+    size_t lo = 0;
+    size_t hi = rt->ninames;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(rt->inames[mid].mangled, mangled);
+        if (cmp == 0) {
+            *pos = mid;
+            return 1;
+        }
+        if (cmp < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    *pos = lo;
+    return 0;
+}
+
+/* Inserts one entry at its sorted position. A mangled name already in the
+ * table is ASH_ERR_NAME; growth failure is ASH_ERR_OOM. Under rt->lock. */
+static AshStatus iname_insert(AshRuntime* rt, const AshInameEntry* e) {
+    size_t pos;
+    if (iname_find(rt, e->mangled, &pos)) return ASH_ERR_NAME;
+    if (rt->ninames == rt->iname_cap) {
+        size_t cap = rt->iname_cap ? rt->iname_cap * 2 : 16;
+        AshInameEntry* grown = realloc(rt->inames, cap * sizeof(*grown));
+        if (!grown) return ASH_ERR_OOM;
+        rt->inames = grown;
+        rt->iname_cap = cap;
+    }
+    memmove(rt->inames + pos + 1, rt->inames + pos,
+            (rt->ninames - pos) * sizeof(AshInameEntry));
+    rt->inames[pos] = *e;
+    rt->ninames++;
+    return ASH_OK;
+}
+
+/* The contract level mangled name the runtime synthesizes, since the
+ * compiler mangles pledges only: __ash_ash_{contract}__{shapehash16}_v{ver},
+ * the pledge format with an empty symbol slot and the shape hash where a
+ * pledge carries its signature hash. Heap the runtime owns until shutdown. */
+static char* iname_contract_mangled(const AshContractDesc* desc) {
+    int n = snprintf(NULL, 0, "__ash_ash_%s__%016llx_v%u", desc->name,
+                     (unsigned long long)desc->shape_hash, desc->version);
+    if (n < 0) return NULL;
+    char* s = malloc((size_t)n + 1);
+    if (!s) return NULL;
+    snprintf(s, (size_t)n + 1, "__ash_ash_%s__%016llx_v%u", desc->name,
+             (unsigned long long)desc->shape_hash, desc->version);
+    return s;
+}
+
+/* Removes every entry one contract contributed, the rollback when a later
+ * insert of the same registration fails. Under rt->lock. */
+static void iname_remove_contract(AshRuntime* rt, const char* contract) {
+    size_t w = 0;
+    for (size_t r = 0; r < rt->ninames; r++) {
+        AshInameEntry* e = &rt->inames[r];
+        if (strcmp(e->contract, contract) == 0) {
+            if (e->kind == ASH_INAME_CONTRACT) free((char*)e->mangled);
+            continue;
+        }
+        rt->inames[w++] = *e;
+    }
+    rt->ninames = w;
+}
+
+/* Fills the table for one registration: the contract entry first, then one
+ * entry per pledge that carries a mangled name; a handwritten descriptor
+ * whose pledges carry none contributes only its contract entry. All or
+ * nothing: any failure removes what this call added. Under rt->lock. */
+static AshStatus iname_register(AshRuntime* rt, const AshContractDesc* desc) {
+    char* cm = iname_contract_mangled(desc);
+    if (!cm) return ASH_ERR_OOM;
+    AshInameEntry ce;
+    memset(&ce, 0, sizeof(ce));
+    ce.mangled = cm;
+    ce.kind = ASH_INAME_CONTRACT;
+    ce.contract = desc->name;
+    ce.symbol = NULL;
+    ce.shape_hash = desc->shape_hash;
+    ce.version = desc->version;
+    AshStatus st = iname_insert(rt, &ce);
+    if (st != ASH_OK) {
+        free(cm);
+        return st;
+    }
+    for (uint32_t i = 0; i < desc->npledges; i++) {
+        const AshPledgeDesc* pd = &desc->pledges[i];
+        if (!pd->mangled) continue;
+        AshInameEntry pe;
+        memset(&pe, 0, sizeof(pe));
+        pe.mangled = pd->mangled;
+        pe.kind = ASH_INAME_PLEDGE;
+        pe.contract = desc->name;
+        pe.symbol = pd->name;
+        pe.shape_hash = desc->shape_hash;
+        pe.version = desc->version;
+        pe.nargs = pd->nargs;
+        st = iname_insert(rt, &pe);
+        if (st != ASH_OK) {
+            iname_remove_contract(rt, desc->name);
+            return st;
+        }
+    }
+    return ASH_OK;
+}
+
 /* ---- runtime lifecycle ---- */
 
 AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out) {
@@ -363,6 +492,12 @@ void ash_runtime_shutdown(AshRuntime* rt) {
         pthread_mutex_destroy(&c->mu);
         free(c);
     }
+    for (size_t i = 0; i < rt->ninames; i++) {
+        if (rt->inames[i].kind == ASH_INAME_CONTRACT) {
+            free((char*)rt->inames[i].mangled);
+        }
+    }
+    free(rt->inames);
     for (size_t i = 0; i < rt->nmodules; i++) {
         dlclose(rt->modules[i]);
     }
@@ -374,6 +509,10 @@ void ash_runtime_shutdown(AshRuntime* rt) {
 
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path) {
     if (!rt || !so_path) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&rt->lock);
+    int frozen = rt->frozen;
+    pthread_mutex_unlock(&rt->lock);
+    if (frozen) return ASH_ERR_STATE;
     void* handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) return ASH_ERR_LOAD;
     AshRegisterFn reg = (AshRegisterFn)dlsym(handle, "ash_module_register");
@@ -400,6 +539,10 @@ AshStatus ash_module_load(AshRuntime* rt, const char* so_path) {
 AshStatus ash_register_contract(AshRuntime* rt, const AshContractDesc* desc) {
     if (!rt || !desc || !desc->name) return ASH_ERR_TYPE;
     pthread_mutex_lock(&rt->lock);
+    if (rt->frozen) {
+        pthread_mutex_unlock(&rt->lock);
+        return ASH_ERR_STATE;
+    }
     if (rt->ndescs == ASH_MAX_CONTRACT_TYPES) {
         pthread_mutex_unlock(&rt->lock);
         return ASH_ERR_OOM;
@@ -410,7 +553,96 @@ AshStatus ash_register_contract(AshRuntime* rt, const AshContractDesc* desc) {
             return ASH_ERR_NAME;
         }
     }
+    /* The iname entries go in before the descriptor commits, so a mangled
+     * name collision or an allocation failure leaves the runtime exactly as
+     * it was and the registration reports the failure whole. */
+    AshStatus st = iname_register(rt, desc);
+    if (st != ASH_OK) {
+        pthread_mutex_unlock(&rt->lock);
+        return st;
+    }
     rt->descs[rt->ndescs++] = desc;
+    pthread_mutex_unlock(&rt->lock);
+    return ASH_OK;
+}
+
+/* ---- the iname surface ---- */
+
+AshStatus ash_runtime_freeze(AshRuntime* rt) {
+    if (!rt) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&rt->lock);
+    rt->frozen = 1;
+    pthread_mutex_unlock(&rt->lock);
+    return ASH_OK;
+}
+
+AshStatus ash_iname_lookup(AshRuntime* rt, const char* mangled,
+                           AshInameEntry* out) {
+    if (!rt || !mangled || !out) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&rt->lock);
+    size_t pos;
+    int hit = iname_find(rt, mangled, &pos);
+    if (hit) *out = rt->inames[pos];
+    pthread_mutex_unlock(&rt->lock);
+    return hit ? ASH_OK : ASH_ERR_NAME;
+}
+
+size_t ash_iname_count(AshRuntime* rt) {
+    if (!rt) return 0;
+    pthread_mutex_lock(&rt->lock);
+    size_t n = rt->ninames;
+    pthread_mutex_unlock(&rt->lock);
+    return n;
+}
+
+AshStatus ash_iname_at(AshRuntime* rt, size_t i, AshInameEntry* out) {
+    if (!rt || !out) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&rt->lock);
+    if (i >= rt->ninames) {
+        pthread_mutex_unlock(&rt->lock);
+        return ASH_ERR_NAME;
+    }
+    *out = rt->inames[i];
+    pthread_mutex_unlock(&rt->lock);
+    return ASH_OK;
+}
+
+/* One canonical line per entry. The format is pinned by docs/abi.md; a
+ * change here is a wire change. */
+static int iname_line(const AshInameEntry* e, char* buf, size_t cap) {
+    return snprintf(buf, cap, "%s %s %016llx v%u\n", e->mangled,
+                    e->kind == ASH_INAME_CONTRACT ? "contract" : "pledge",
+                    (unsigned long long)e->shape_hash, e->version);
+}
+
+AshStatus ash_iname_dump(AshRuntime* rt, char* buf, size_t cap, size_t* need) {
+    if (!rt || !need) return ASH_ERR_TYPE;
+    if (!buf) cap = 0;
+    pthread_mutex_lock(&rt->lock);
+    size_t total = 1; /* the terminating NUL */
+    for (size_t i = 0; i < rt->ninames; i++) {
+        int n = iname_line(&rt->inames[i], NULL, 0);
+        if (n < 0) {
+            pthread_mutex_unlock(&rt->lock);
+            return ASH_ERR_OOM;
+        }
+        total += (size_t)n;
+    }
+    *need = total;
+    if (cap < total) {
+        pthread_mutex_unlock(&rt->lock);
+        return ASH_ERR_OOM;
+    }
+    size_t off = 0;
+    for (size_t i = 0; i < rt->ninames; i++) {
+        int n = iname_line(&rt->inames[i], buf + off, cap - off);
+        if (n < 0 || (size_t)n >= cap - off) {
+            pthread_mutex_unlock(&rt->lock);
+            return ASH_ERR_OOM;
+        }
+        off += (size_t)n;
+    }
+    buf[off] = '\0';
     pthread_mutex_unlock(&rt->lock);
     return ASH_OK;
 }
@@ -654,6 +886,10 @@ AshStatus ash_pledge_bind(AshRuntime* rt, const char* pledge_name,
                           AshPledgeFn fn) {
     if (!rt || !pledge_name || !fn) return ASH_ERR_TYPE;
     pthread_mutex_lock(&rt->lock);
+    if (rt->frozen) {
+        pthread_mutex_unlock(&rt->lock);
+        return ASH_ERR_STATE;
+    }
     const AshPledgeDesc* pd = resolve_pledge_name(rt, pledge_name);
     if (!pd) {
         pthread_mutex_unlock(&rt->lock);

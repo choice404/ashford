@@ -188,6 +188,68 @@ __ash_ash_{contract}_{pledge}_{sighash}_v{version}
 
 The mangled name appears twice on purpose: as the thunk's C identifier inside the module and as the `mangled` string in the pledge descriptor, so a debugger and the runtime agree about what they are looking at.
 
+The contract type itself has a mangled name too, in the same grammar with an empty symbol slot and the shape hash where a pledge carries its signature hash:
+
+```text
+__ash_ash_{contract}__{shapehash}_v{version}
+```
+
+The compiler does not emit this one; the runtime synthesizes it from the contract descriptor at registration, which it can do byte for byte because every piece is already in the descriptor. It exists so the iname table has one keyspace: every discoverable thing, contract type or pledge, is one mangled string.
+
+## The iname table
+
+The iname table is the runtime's registry of contract types, the discovery surface a foreign host resolves mangled names against. `ash_register_contract` fills it, one entry for the contract and one per pledge that carries a mangled name, each keyed by that mangled string; a handwritten descriptor whose pledges carry no mangled names contributes only its contract entry. The table is a type registry, not an instance registry: signing adds nothing to it, and after `ash_runtime_freeze` it never changes again.
+
+```c
+typedef enum AshInameKind {
+    ASH_INAME_CONTRACT = 0,
+    ASH_INAME_PLEDGE   = 1
+} AshInameKind;
+
+typedef struct AshInameEntry {
+    const char* mangled;
+    uint32_t    kind;        /* AshInameKind */
+    const char* contract;    /* owning contract name */
+    const char* symbol;      /* pledge name, NULL for a contract entry */
+    uint64_t    shape_hash;
+    uint32_t    version;
+    uint32_t    nargs;       /* pledge only, 0 for a contract entry */
+} AshInameEntry;
+```
+
+`shape_hash` is the owning contract's shape hash for both kinds, so a pledge entry hands a host exactly the pair it signs under: `contract` names the contract and `shape_hash` is what `ash_contract_sign` checks. `version` is the contract's version attribute. The strings live until shutdown: `contract`, `symbol`, and a pledge entry's `mangled` point into the module image, a contract entry's `mangled` is runtime owned heap.
+
+The surface is four calls, every one taking the runtime lock, so the table is safe from any thread by the same discipline as registration itself:
+
+```c
+AshStatus ash_iname_lookup(AshRuntime* rt, const char* mangled, AshInameEntry* out);
+size_t    ash_iname_count(AshRuntime* rt);
+AshStatus ash_iname_at(AshRuntime* rt, size_t i, AshInameEntry* out);
+AshStatus ash_iname_dump(AshRuntime* rt, char* buf, size_t cap, size_t* need);
+```
+
+Lookup is exact: the whole mangled name or `ASH_ERR_NAME`. A host holding yesterday's header therefore misses today's module instead of resolving to the wrong shape; the version mismatch is a clean name error before any hash comparison happens. Enumeration through `ash_iname_count` and `ash_iname_at` walks in strict mangled name order, deterministic for a given set of registered contracts; an index out of range is `ASH_ERR_NAME`.
+
+`ash_iname_dump` renders the whole table in its canonical text form, the Layer 2 discovery payload. One entry per line in mangled name order, and this format is normative, a change to it is a wire change:
+
+```text
+{mangled} {kind} {shape_hash} v{version}\n
+```
+
+`{kind}` is spelled `contract` or `pledge`, `{shape_hash}` is 16 lowercase hex digits. The text is byte stable for a given set of registered contracts. `*need` receives the full size including the terminating NUL; when `cap` is at least that, the text and its NUL are written to `buf` and the call returns `ASH_OK`, otherwise nothing is written and the call returns `ASH_ERR_OOM`, so a NULL `buf` with `cap` 0 sizes the buffer. Loading the two skeleton modules dumps:
+
+```text
+__ash_ash_Greeter2__26a068304bf801f2_v2 contract 26a068304bf801f2 v2
+__ash_ash_Greeter2_greet_8d9bbc95f1afbbec_v2 pledge 26a068304bf801f2 v2
+__ash_ash_Greeter__80464bf23398ab38_v1 contract 80464bf23398ab38 v1
+__ash_ash_Greeter_greet_17cef80f14421b9b_v1 pledge 80464bf23398ab38 v1
+__ash_ash_Greeter_shout_17cef80f14421b9b_v1 pledge 80464bf23398ab38 v1
+```
+
+## The freeze
+
+`ash_runtime_freeze` latches the registration surface shut. After it returns, `ash_module_load`, `ash_register_contract`, and `ash_pledge_bind` report `ASH_ERR_STATE`; `ash_contract_sign`, fulfillment, waits, vow reads, breaks, and every iname read continue unchanged. The call is idempotent and safe from any thread. The point is the discovery contract: once a host has frozen the runtime, the iname table it enumerates is the table every later sign resolves against, byte for byte, and no module loaded behind its back can move a name.
+
 ## The shape hash
 
 A contract's shape hash is FNV-1a 64, offset basis `0xcbf29ce484222325` and prime `0x100000001b3`, over the contract's canonical signature string:
@@ -205,11 +267,11 @@ A host that passes the expected hash to `ash_contract_sign` gets `ASH_ERR_VERSIO
 | status | meaning |
 |---|---|
 | `ASH_OK` | the operation ran; a pledge's Err is still `ASH_OK` |
-| `ASH_ERR_STATE` | illegal in the contract's current state, a second wait, or a future a break forfeited |
+| `ASH_ERR_STATE` | illegal in the contract's current state, a second wait, a future a break forfeited, or load, register, and bind after the freeze |
 | `ASH_ERR_TYPE` | argument count or type mismatch, at a thunk, at sign, at a ref, or an oversized pool request |
 | `ASH_ERR_VERSION` | shape hash disagreed at sign |
 | `ASH_ERR_UNBOUND` | an abstract pledge or an unsupplied vow at sign |
-| `ASH_ERR_NAME` | no contract, pledge, or vow under that name |
+| `ASH_ERR_NAME` | no contract, pledge, vow, or iname entry under that name |
 | `ASH_ERR_DEADLOCK` | reserved; v1 constructs no lock cycles and ships no detector |
 | `ASH_ERR_OOM` | allocation failed |
 | `ASH_ERR_LOAD` | dlopen or registrar failure on a module |

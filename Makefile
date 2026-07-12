@@ -1,9 +1,11 @@
-# The M5 build. Four artifacts: the ashc binary built by the dusk toolchain,
-# the runtime shared library, the compiled hello module, and the C host that
-# drives them. make smoke runs the whole pipeline and is the walking skeleton
-# gate every later milestone keeps green. The runtime is threaded now, so
-# every gate builds with -pthread and the tsan gate reruns the concurrency
-# surface under ThreadSanitizer.
+# The M6 build. Five artifacts: the ashc binary built by the dusk toolchain,
+# the runtime shared library, the compiled hello and hello_v2 modules, and
+# the C host that drives them. make smoke runs the whole pipeline and is the
+# walking skeleton gate every later milestone keeps green. The runtime is
+# threaded, so every gate builds with -pthread and the tsan gate reruns the
+# concurrency surface under ThreadSanitizer; test-iname gates the discovery
+# table and the freeze, and test-determinism proves two builds of one source
+# emit byte identical module C.
 #
 # DUSK points at the dusk compiler. The PATH binary can lag the toolchain
 # repo; override with DUSK="cargo run --quiet --bin dusk --" run from the
@@ -14,14 +16,15 @@ CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -fPIC
 OUT     := target/ashc-out
 
-RT_SO   := $(OUT)/libashrt.so
-ASHC    := target/dusk-out/ashc
-MODULE  := $(OUT)/libhello.ash.so
-HOST    := $(OUT)/host
+RT_SO     := $(OUT)/libashrt.so
+ASHC      := target/dusk-out/ashc
+MODULE    := $(OUT)/libhello.ash.so
+MODULE_V2 := $(OUT)/libhello_v2.ash.so
+HOST      := $(OUT)/host
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-thread test-iname test-determinism tsan clean
 
-all: smoke test-runtime test-thread tsan
+all: smoke test-runtime test-thread test-iname test-determinism tsan
 
 runtime: $(RT_SO)
 
@@ -38,6 +41,9 @@ module: $(MODULE)
 
 $(MODULE): $(ASHC) skeleton/hello.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/hello.ash
+
+$(MODULE_V2): $(ASHC) skeleton/hello_v2.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/hello_v2.ash
 
 host: $(HOST)
 
@@ -67,6 +73,31 @@ test-thread:
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
 	    tests/runtime/test_thread.c runtime/src/runtime.c -ldl -o $(OUT)/test_thread
 	./$(OUT)/test_thread
+
+# The iname gate under ASan: two compiled generations loaded side by side,
+# exact name discovery, the version mismatch miss, the freeze, and the
+# canonical dump against its golden, tests/runtime/iname.expect.
+test-iname: $(MODULE) $(MODULE_V2)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
+	    tests/runtime/test_iname.c runtime/src/runtime.c -ldl -o $(OUT)/test_iname
+	./$(OUT)/test_iname
+
+# The determinism gate: two builds of the same source must emit byte
+# identical module C, which is what keeps every mangled name and shape hash
+# in the iname story reproducible.
+test-determinism: $(ASHC)
+	@mkdir -p $(OUT)
+	$(ASHC) build skeleton/hello.ash
+	mv $(OUT)/hello.c $(OUT)/hello.c.first
+	$(ASHC) build skeleton/hello.ash
+	diff $(OUT)/hello.c.first $(OUT)/hello.c
+	$(ASHC) build skeleton/hello_v2.ash
+	mv $(OUT)/hello_v2.c $(OUT)/hello_v2.c.first
+	$(ASHC) build skeleton/hello_v2.ash
+	diff $(OUT)/hello_v2.c.first $(OUT)/hello_v2.c
+	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first
+	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
 # full host walk, runtime compiled into each binary so TSan sees every lock.
