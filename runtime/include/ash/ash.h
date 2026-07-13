@@ -64,9 +64,11 @@ AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
  * address, or a connection that dies during the handshake is ASH_ERR_NET. The
  * handshake timeout is AshRuntimeConfig.handshake_ms, ten seconds by default.
  *
- * v1 fills the table only: signing and fulfilling a remote contract arrive in
- * a later layer, and until then a remote-only contract name has no local
- * descriptor to sign against. */
+ * From a successful connect a remote contract signs, fulfills, reads its
+ * partial surface, and breaks through the same calls a local one does; the
+ * origin routes the work across the wire and the host code does not change. A
+ * connection that later dies latches every proxy it signed Broken and delivers
+ * ASH_ERR_NET to every future still waiting on it. */
 AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
                               const char* token);
 

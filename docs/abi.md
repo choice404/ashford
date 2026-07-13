@@ -513,7 +513,7 @@ One `ASH_HASH_{Contract}` per public contract, the shape hash `ash_contract_sign
 
 ## Status codes
 
-The numbers are part of the wire: `ASH_OK` is 0 and the rest count up in the order of this table, `ASH_ERR_STATE` 1 through `ASH_ERR_NET` 9.
+The numbers are part of the wire: `ASH_OK` is 0 and the rest count up in the order of this table, `ASH_ERR_STATE` 1 through `ASH_ERR_STORE` 10.
 
 | status | meaning |
 |---|---|
@@ -527,3 +527,4 @@ The numbers are part of the wire: `ASH_OK` is 0 and the rest count up in the ord
 | `ASH_ERR_OOM` | allocation failed |
 | `ASH_ERR_LOAD` | dlopen or registrar failure on a module |
 | `ASH_ERR_NET` | the connection carrying this operation failed |
+| `ASH_ERR_STORE` | the backend could not complete a store operation |

@@ -66,6 +66,8 @@ The runtime is a shared C library. A compiled `.ash` module carries its contract
 
 ## How to use
 
+New to Ashford, start with [docs/tutorial.md](docs/tutorial.md): it walks the whole language and then drives one contract from C and from Python with no generated bindings. [CHANGELOG.md](CHANGELOG.md) carries the full history, version by version.
+
 The toolchain is early, but the whole pipeline already runs: `ashc` compiles a module, the runtime loads it, and a C host signs and fulfills a contract end to end.
 
 ```sh
@@ -112,11 +114,23 @@ The runtime binds from anything that can load a C library, and the repository pr
 make test-python
 ```
 
+The same contracts run across a network. `ashd` is a small daemon over the runtime that loads modules, freezes so its table is immutable, and serves their contracts on a TCP address. A client links the same `libashrt` and calls `ash_runtime_connect`, and every contract the daemon serves lands in the client's iname table beside the local ones. Signing and fulfilling a remote contract is the same code as a local one, so a host changes by a single line, a module load turned into a connect, when the contract moves across the wire. A shared token read from a file guards the daemon and the client presents it at the handshake; [docs/network.md](docs/network.md) is the normative wire.
+
+```sh
+# a C client drives a remote Greeter over loopback, token and refusal paths
+make test-net
+
+# the Python payment walk, run in process and over the wire side by side
+make test-net-python
+```
+
+`make test-net-python` stands up two daemons on loopback, one under a token and one without, and runs `interop/python/demo_remote.py`, the remote twin of the local payment demo. It drives the same sign, fulfill, partial, and break sequence once from a module loaded in process and once over a connection, proves the two agree outcome for outcome, then walks the token matrix and kills the daemon mid fulfillment to watch the network's one new failure reach an in flight wait.
+
 ## Status
 
-The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. A golden and compile fail suite, sanitizer gates, a determinism gate, and a thread sanitizer gate hold the line on every build.
+The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. An `ashd` daemon serves those same contracts over TCP, and a client, C or Python, connects with `ash_runtime_connect` and signs, fulfills, and breaks across the wire with its host code unchanged, a shared token guarding the connection and a dropped connection surfacing as one new status through the wait a host already reads. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over both the pool and the socket, and network gates that stand up a real daemon hold the line on every build.
 
-Not there yet: map operations, calling one contract from another inside a pledge body, and the network runtime the interop story ultimately wants.
+Layer 1 is complete, from the language surface through the memory model, threading, discovery, and a second language over the boundary, and Layer 2, the network runtime, runs. What remains is the layer beyond it: contracts backed by a database, schemas as vows and transactions as subcontracts.
 
 ## Requirements
 

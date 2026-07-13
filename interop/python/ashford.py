@@ -157,7 +157,13 @@ class AshInameEntry(C.Structure):
 
 
 class AshRuntimeConfig(C.Structure):
-    _fields_ = [("max_threads", C.c_uint32)]
+    """Pool sizing and the handshake clock. max_threads of 0 selects the
+    default of four workers; handshake_ms is the timeout ash_runtime_connect
+    gives a daemon to finish a handshake, 0 selecting ten seconds. Two uint32
+    fields in declaration order with nothing packed between them, so a foreign
+    host that rebuilds this struct writes exactly these eight bytes."""
+
+    _fields_ = [("max_threads", C.c_uint32), ("handshake_ms", C.c_uint32)]
 
 
 # The uniform thunk frame. Every pledge, compiled or Python-bound, crosses in
@@ -188,6 +194,7 @@ assert C.sizeof(AshList) == 32
 assert C.sizeof(AshValue) == 40
 assert C.sizeof(AshRef) == 40
 assert C.sizeof(AshInameEntry) == 48
+assert C.sizeof(AshRuntimeConfig) == 8
 
 # ---------------------------------------------------------------------------
 # The sum shaped values, seen from Python. Ok and Err wrap a Result's payload,
@@ -388,7 +395,7 @@ class Runtime:
     Loading the runtime dynamically.
     """
 
-    def __init__(self, lib_path, max_threads=0):
+    def __init__(self, lib_path, max_threads=0, handshake_ms=0):
         self._lib = C.CDLL(str(lib_path), mode=C.RTLD_GLOBAL)
         self._declare(self._lib)
         # Python-made pledge trampolines the runtime holds raw pointers to.
@@ -396,7 +403,7 @@ class Runtime:
         # binding lifetime rule the ABI states for FFI hosts.
         self._thunks = []
         rt = C.c_void_p()
-        cfg = AshRuntimeConfig(max_threads)
+        cfg = AshRuntimeConfig(max_threads, handshake_ms)
         _check(self._lib.ash_runtime_init(C.byref(cfg), C.byref(rt)),
                "ash_runtime_init")
         self._rt = rt
@@ -413,6 +420,8 @@ class Runtime:
         lib.ash_runtime_shutdown.restype = None
         lib.ash_module_load.argtypes = [v, s]
         lib.ash_module_load.restype = i
+        lib.ash_runtime_connect.argtypes = [v, s, s]
+        lib.ash_runtime_connect.restype = i
         lib.ash_runtime_freeze.argtypes = [v]
         lib.ash_runtime_freeze.restype = i
         lib.ash_pledge_bind.argtypes = [v, s, AshPledgeFn]
@@ -467,6 +476,30 @@ class Runtime:
     def load(self, so_path):
         _check(self._lib.ash_module_load(self._rt, str(so_path).encode()),
                f"ash_module_load {so_path}")
+
+    def connect(self, addr, token=None):
+        """Connects this runtime to an ashd daemon at addr, a host:port string,
+        and merges the daemon's whole iname table into this one beside the local
+        names. token is the shared secret the daemon expects, None when the
+        daemon runs without one; it crosses as bytes and is never logged here.
+
+        After a successful connect a remote contract signs, fulfills, reads its
+        partial surface, and breaks through the same calls a local one does, the
+        origin alone deciding which side of the wire the work lands on. This is
+        the one line a host adds to run against a daemon instead of a module.
+
+        Connect counts as registration and obeys the freeze law, so it raises an
+        AshError carrying ASH_ERR_STATE once the runtime is frozen. A remote name
+        that collides with one already in the table is ASH_ERR_NAME, a refused
+        token or an unreachable address is ASH_ERR_NET, and a version the daemon
+        does not speak is ASH_ERR_VERSION, each surfacing as the status a caller
+        already knows how to handle."""
+        tok = None
+        if token is not None:
+            tok = token if isinstance(token, bytes) else str(token).encode("utf-8")
+        _check(self._lib.ash_runtime_connect(self._rt,
+                                             str(addr).encode("utf-8"), tok),
+               f"ash_runtime_connect {addr}")
 
     def freeze(self):
         _check(self._lib.ash_runtime_freeze(self._rt), "ash_runtime_freeze")

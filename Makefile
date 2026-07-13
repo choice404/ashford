@@ -22,6 +22,17 @@ OUT     := target/ashc-out
 # gate that links the runtime in gets net.c and wire.c with it.
 RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c
 
+# The SQLite amalgamation, compiled once into its own object and linked into
+# the runtime and the store gate. It builds with warnings off and no sanitizer:
+# it is a vendored library, not runtime code under review, and ASan tolerates
+# an uninstrumented object linked beside instrumented ones the same way it
+# tolerates a dlopened module. DQS=0 refuses double quoted string literals,
+# OMIT_LOAD_EXTENSION shuts the extension door, and MEMSTATUS=0 drops the
+# allocation bookkeeping the store never reads.
+SQLITE_OBJ := $(OUT)/sqlite3.o
+SQLITE_FLAGS := -fPIC -w -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION \
+    -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0
+
 RT_SO      := $(OUT)/libashrt.so
 ASHC       := target/dusk-out/ashc
 ASHD       := $(OUT)/ashd
@@ -34,15 +45,19 @@ MODULE_STD := $(OUT)/libstd_user.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
 
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
 runtime: $(RT_SO)
 
-$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/ash_net.h runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h
+$(SQLITE_OBJ): runtime/third_party/sqlite3.c runtime/third_party/sqlite3.h
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c -ldl -o $(RT_SO)
+	$(CC) $(SQLITE_FLAGS) -I runtime/third_party -c runtime/third_party/sqlite3.c -o $(SQLITE_OBJ)
+
+$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c runtime/src/ash_net.h runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h runtime/include/ash/ash_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
 
 compiler: $(ASHC)
 
@@ -113,6 +128,23 @@ test-wire:
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
 	    tests/runtime/test_wire.c $(RT_UNITS) -ldl -o $(OUT)/test_wire
 	./$(OUT)/test_wire tests/wire
+
+# The store driver gate under ASan and LSan: the SQLite backend against a real
+# temp file database, the golden row dump in tests/store, the write-then-read
+# round trip for every scalar type, the commit and rollback of a transaction,
+# and a negative corpus of a dead dsn, broken SQL, a wrong parameter count, and
+# a non scalar parameter, every refusal watched for leaks. The sqlite object is
+# uninstrumented for speed, which ASan tolerates, while store.c and the test are
+# under the sanitizer. RT_UNITS comes along for ash_value_eq; store.c is not in
+# it. Regenerate the golden with ./$(OUT)/test_store --emit tests/store after a
+# deliberate format change. Not folded into all yet; it is verified on its own.
+test-store-unit:
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
+	    -I runtime/third_party \
+	    tests/runtime/test_store.c runtime/src/store.c $(SQLITE_OBJ) $(RT_UNITS) \
+	    -ldl -o $(OUT)/test_store
+	./$(OUT)/test_store tests/store
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.
@@ -304,6 +336,22 @@ test-net2-tsan: $(MODULE_NETPAY)
 	    tests/net/test_remote.c runtime/src/runtime.c runtime/src/wire.c \
 	    runtime/src/net.c -ldl -o $(OUT)/test_remote_tsan
 	tests/net/run_net2.sh $(OUT)/ashd_net2_tsan $(OUT)/test_remote_tsan $(MODULE_NETPAY)
+
+# The Python network gate: two ashd daemons serve the payment module on
+# loopback, one under a token and one without, and the ctypes binding drives the
+# same payment sequence locally and over the wire, proving a Python host changes
+# by one line, a load turned into a connect, when the contract moves across the
+# network. It walks the token matrix, the tokenless connect, and a kill of the
+# tokened daemon mid fulfillment for the ASH_ERR_NET path. Skips cleanly where
+# python3 is absent, and has no TSan variant on purpose: the TSan runtime cannot
+# be mixed into an uninstrumented python3 process, so the socket concurrency
+# stays covered by the C test-net2 and stress tsan gates.
+test-net-python: $(RT_SO) $(MODULE_NETPAY) $(ASHD)
+	@if command -v python3 >/dev/null 2>&1; then \
+	    tests/net/run_net_python.sh $(ASHD) $(MODULE_NETPAY); \
+	else \
+	    echo "[test-net-python] python3 not found, skipping"; \
+	fi
 
 # The N3 resilience gate: ashd serves the payment module on loopback and one
 # client hammers it from many connections at once, then tears the world down the

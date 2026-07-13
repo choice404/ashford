@@ -1,0 +1,13 @@
+rows 3
+row 0
+  id=i64:1
+  amt=f64:4004000000000000
+  owner=str:616c706861
+row 1
+  id=i64:2
+  amt=f64:c00c000000000000
+  owner=str:626f62
+row 2
+  id=i64:3
+  amt=f64:0000000000000000
+  owner=str:e4b896e7958c
