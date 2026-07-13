@@ -2,7 +2,7 @@
 
 This is the design for Layer 2, the network runtime: contracts served over a socket, discovered remotely, and fulfilled transparently. A daemon, `ashd`, loads compiled modules and serves their contracts. A client links the same `libashrt` it always linked, calls `ash_runtime_connect`, and every contract the daemon serves appears in the client's iname table beside the local ones. Signing and fulfilling a remote contract is the same code as signing and fulfilling a local one; the host does not change when the contract moves across the network. That is the product claim of this layer, and the argument for it is spelled out at the end.
 
-This document will be normative once the wire ships. It builds on [docs/abi.md](abi.md) and changes none of it except one appended status code; the value representation, the thunk frame, the future semantics, and the iname dump format are all load bearing here, on purpose. Everything below the frame header is little endian, the same choice the in memory ABI already made.
+This document is normative. It builds on [docs/abi.md](abi.md) and changes none of it except one appended status code; the value representation, the thunk frame, the future semantics, and the iname dump format are all load bearing here, on purpose. Everything below the frame header is little endian, the same choice the in memory ABI already made.
 
 ## The model
 

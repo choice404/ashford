@@ -133,15 +133,20 @@ The frame is validated on the way in, not on the way out. The runtime checks the
 
 ```c
 typedef struct AshRuntimeConfig {
-    uint32_t max_threads;   /* 0 selects the default pool of 4 workers */
+    uint32_t max_threads;    /* 0 selects the default pool of 4 workers */
+    uint32_t handshake_ms;   /* 0 selects the ten second handshake timeout */
 } AshRuntimeConfig;
 
 AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out);
 void      ash_runtime_shutdown(AshRuntime* rt);
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
+AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
+                              const char* token);
 ```
 
 A NULL `cfg` means all defaults. `ash_module_load` hands `so_path` to dlopen as it stands, so a relative path resolves by the loader's rules from the process working directory; shutdown is described under Threading and frees everything the runtime tracked.
+
+`handshake_ms` is the one field Layer 2 adds: the timeout `ash_runtime_connect` gives a daemon to finish a handshake, 0 selecting ten seconds, and it is inert on a runtime that never connects. `ash_runtime_connect` dials an `ashd` daemon at `addr`, a `host:port` string, performs the handshake, and merges the daemon's whole iname table into this runtime's beside the local names, each remote entry marked with an origin naming the connection. `token` is the shared secret the daemon expects, NULL when the daemon runs without one. From a successful connect a remote contract signs, fulfills, reads its partial surface, and breaks through the same calls a local one does, the origin alone routing the work across the wire; the wire itself is [docs/network.md](network.md)'s subject and none of it shows through this API. Connect counts as registration and obeys the freeze law, `ASH_ERR_STATE` once the runtime is frozen, exactly like `ash_module_load`. A remote name that collides with one already in the table fails the connect with `ASH_ERR_NAME` and merges nothing; a version the daemon does not speak is `ASH_ERR_VERSION`; and a refused token, an unreachable address, or a connection that dies inside the handshake is `ASH_ERR_NET`, the one status Layer 2 appends. When a connection later dies, every proxy it signed latches Broken and every waiting future delivers `ASH_ERR_NET`, so the one new fact a network adds reaches a host through the channel it already reads.
 
 **Loading the runtime dynamically.** A compiled module carries undefined references to the runtime's exported symbols, `ash_register_contract` and the allocation helpers its thunks call, and no library dependency of its own; the dynamic linker resolves them against the process global scope when the runtime dlopens the module. A C host that links libashrt into its executable gets this for free, because an executable's startup dependencies join the global scope. A host that opens libashrt dynamically itself, dlopen from C or ctypes from Python, must open it with `RTLD_GLOBAL`, or every module load fails to resolve and reports `ASH_ERR_LOAD`.
 
