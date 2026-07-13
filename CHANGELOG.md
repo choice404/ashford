@@ -5,6 +5,105 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.2.3] the all or nothing
+
+The store layer's headline. A transactional subcontract runs its pledges as one
+episode that commits or vanishes whole, the language's all or nothing written on
+the grouping it already had.
+
+- add the transactional modifier: a lexer keyword, a subcontract flag the parser
+  records after the name and before the body, and a type error when it is written
+  on a subcontract of a contract that declares no schema and so has no database to
+  be durable against
+- carry the flag as a byte array parallel to the subs table, appended at the tail
+  of the descriptor so every earlier descriptor stays byte identical and the shape
+  hash never moves
+- open the episode lazily on the first fulfillment of a transactional pledge,
+  commit the instant the subcontract completes, and roll back on the first Err, on
+  a backend failure, or on a break before the commit
+- key the commit on the same subcontract fulfilled predicate the requirements
+  evaluator reads, never a parallel counter, so the commit point cannot drift from
+  the subcontract's own fulfillment under partial fulfillment
+- refuse a pledge whose episode already resolved with ASH_ERR_STATE through the
+  wait, since a committed transaction is closed and there is nothing left to join;
+  loose pledges stay autocommit, untouched, and the connection stays single
+  threaded under the instance lock with no new lock
+- give the Ledger a transactional Transfer subcontract and add make test-store-txn:
+  a good transfer commits both writes, a failed one rolls the debit back byte
+  identical, a resolved pledge re-call is a state error, and a break mid
+  transaction leaves no write durable, ASan, LSan, and TSan clean
+- teach the parse dump to render a schema member, closing a crash where ashc parse
+  walked a schema as a requirements block and ran off the end
+
+### Notes
+
+The episode state is one byte per subcontract on the instance, beside the pledge
+latches and under the same lock, moving from none to open on the lazy begin to done
+on the one commit or rollback. Because the commit test is the evaluator's own
+predicate, a transaction that spans debit and credit commits on whichever pledge
+completes the pair, order independent and independent of the overall contract
+state. One SQLite connection holds one transaction, so two transactional
+subcontracts open at once on one instance is not attempted in v1: while one is
+open, a pledge of another is refused ASH_ERR_STORE and stays unopened until the
+first resolves, a sound consequence of the single connection model rather than a
+corruption. The break order from the store layer's first milestone, rollback then
+close then reclaim, already covers a teardown mid transaction, so nothing durable
+survives a broken contract.
+
+## [v0.2.2] the schema takes the sign
+
+The first ashc change since Layer 1. A contract can now declare the shape of a
+table it operates against, sign against a live database, and read and write rows
+through a small store surface, all with the schema locked and checked the way a
+vow and a shape hash are.
+
+- add the schema block to ashc: a lexer keyword, a parser node, a row record the
+  schema stands up so a pledge reads a row as an ordinary record, the seven
+  scalar column rule as a named type error, and the schema folded into the
+  contract's shape hash so a changed column fails the sign like a changed pledge
+- lower the store surface: Store.find, insert, update, and delete name a schema
+  in the same contract and lower onto runtime primitives that bind every value
+  positionally and land an Ok result the instance owns
+- open and reconcile at sign: a store backed contract binds its dsn vow, opens
+  the connection, and reconciles every schema against the live database, create
+  if absent and validate column for column if present, ASH_ERR_TYPE on
+  divergence and ASH_ERR_UNBOUND with no dsn; break rolls back, closes, then
+  reclaims the heap, in that order
+- emit the schema descriptor as a pure tail on the contract descriptor, one cols
+  array and one schemas array, so every pre store module reads as not store
+  backed and nothing else in the table moves
+- add the Ledger skeleton and make test-store: sign against a temp file, write a
+  row, read it back, update it, prove a missing account is the contract's own
+  error and an injection string is a value the table survives, both refusal
+  signs, ASan and LSan clean
+- fold the store driver and its sqlite into every gate that links the runtime,
+  since the runtime now speaks to the store
+
+### Notes
+
+A schema stands up a real record, so a row a pledge reads is an ordinary record
+and field access, record literals, and match all reuse the machinery already in
+the language. The cost is that a schema name shares the global type namespace, so
+a clash reads as a duplicate. `Store` is a compiler namespace that turns magic
+only when nothing local or a contract owns the name, so a real contract named
+Store keeps its sign path. The first column of a schema is its primary key, the
+key find, update, and delete write against. A backend failure is the
+`ASH_ERR_STORE` status delivered through the fulfillment, not an `Err` value; the
+`Err(StoreError)` arm exists so the surface types and matches exhaustively, and
+the primitive builds only the `Ok` arm.
+
+Sign opens the connection on the instance before it is published to the runtime,
+so no lock is held across the open and the reconcile, and a sign that fails to
+open or reconcile never leaves a half open connection behind. Break holds the
+instance lock every fulfillment holds, so the rollback and close never race a
+store operation.
+
+Left for the milestones above this one: `Store.query`, transactional
+subcontracts, and the partial record form of `update` are S2, and the schema
+descriptor structs are documented in the ABI reference at the layer's closing
+docs pass. The parse and lex dumps do not yet render a schema member, so nothing
+regresses but `ashc parse` omits it from its tree.
+
 ## [v0.2.1] the store surface
 
 The first executable piece of Layer 3, and it holds no contract yet. Layer 3

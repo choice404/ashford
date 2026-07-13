@@ -22,6 +22,7 @@
 #include "sqlite3.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 struct AshStore {
@@ -201,6 +202,149 @@ void ash_store_close(AshStore* s) {
     if (!s) return;
     sqlite3_close(s->db);
     sqlite3_free(s);
+}
+
+/* ---- schema reconcile ---- */
+
+/* The SQLite column type a scalar tag declares in a CREATE TABLE. Every
+ * integer width and both signednesses land in INTEGER, Float in REAL, and
+ * String in TEXT though the driver binds and reads it as a blob so a byte is a
+ * byte the way the ABI swears. A non scalar has no column type, the composite a
+ * flat row refuses; the caller reports ASH_ERR_TYPE on the NULL. */
+static const char* store_sql_type(uint32_t ty) {
+    switch (ty) {
+    case ASH_TY_INT:
+    case ASH_TY_UINT:
+    case ASH_TY_BOOL:
+    case ASH_TY_BYTE:
+    case ASH_TY_CHAR:
+        return "INTEGER";
+    case ASH_TY_FLOAT:
+        return "REAL";
+    case ASH_TY_STRING:
+        return "TEXT";
+    default:
+        return NULL;
+    }
+}
+
+/* Whether s spells a plain SQL identifier, the ascii letters, digits, and
+ * underscore with a non digit lead. A schema and its columns are ashford
+ * identifiers the compiler chose, never host input, so this holds by
+ * construction; the guard is here so a reconcile that interpolates a name into
+ * DDL, which parameters cannot carry, can never smuggle a fragment past it. */
+static int store_ident_ok(const char* s) {
+    if (!s || !*s) return 0;
+    for (const char* p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        int alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+        int digit = (c >= '0' && c <= '9');
+        if (p == s && !alpha) return 0;
+        if (!alpha && !digit) return 0;
+    }
+    return 1;
+}
+
+/* Case insensitive ascii equality, for matching a declared column type against
+ * what PRAGMA table_info reports the live table carries. */
+static int store_ieq(const char* a, const char* b) {
+    for (;; a++, b++) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+        if (ca != cb) return 0;
+        if (!ca) return 1;
+    }
+}
+
+/* Creates the table from a schema, one CREATE TABLE built from the locked
+ * shape: every column in declaration order at its mapped storage type, the
+ * first column PRIMARY KEY, the convention the store surface keys against. The
+ * SQL is assembled into a heap buffer since a schema's width is not bounded at
+ * compile time here. */
+static AshStatus store_create_table(AshStore* s, const AshSchemaDesc* schema) {
+    /* Two passes: size the buffer, then fill it, so no fixed cap can clip a
+     * wide schema. */
+    size_t need = 64 + strlen(schema->table);
+    for (uint32_t i = 0; i < schema->ncols; i++) {
+        const char* ct = store_sql_type(schema->cols[i].ty);
+        if (!ct) return ASH_ERR_TYPE;
+        if (!store_ident_ok(schema->cols[i].name)) return ASH_ERR_STORE;
+        need += strlen(schema->cols[i].name) + strlen(ct) + 24;
+    }
+    char* sql = (char*)sqlite3_malloc((int)need);
+    if (!sql) return ASH_ERR_OOM;
+    size_t n = 0;
+    n += (size_t)snprintf(sql + n, need - n, "CREATE TABLE %s(", schema->table);
+    for (uint32_t i = 0; i < schema->ncols; i++) {
+        const char* ct = store_sql_type(schema->cols[i].ty);
+        n += (size_t)snprintf(sql + n, need - n, "%s%s %s%s",
+                              i ? ", " : "", schema->cols[i].name, ct,
+                              i == 0 ? " PRIMARY KEY" : "");
+    }
+    snprintf(sql + n, need - n, ")");
+    AshStatus st = ash_store_exec(s, sql);
+    sqlite3_free(sql);
+    return st;
+}
+
+/* Validates a live table against a schema, column for column: the same count,
+ * each column's name and declared storage type matching in declaration order.
+ * A divergence is ASH_ERR_TYPE, the storage version of the shape hash, the same
+ * status a wrong typed value always carried. table_info is read directly here
+ * because it is the one introspection SQLite exposes and a PRAGMA takes no
+ * bound parameter; the table name was identifier checked before it was
+ * interpolated. */
+static AshStatus store_validate_table(AshStore* s, const AshSchemaDesc* schema) {
+    char pragma[128 + 64];
+    snprintf(pragma, sizeof(pragma), "PRAGMA table_info(%s)", schema->table);
+    sqlite3_stmt* stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, pragma, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return ASH_ERR_STORE;
+    }
+    uint32_t i = 0;
+    int rc;
+    AshStatus st = ASH_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        /* table_info columns: cid, name, type, notnull, dflt_value, pk. */
+        const unsigned char* nm = sqlite3_column_text(stmt, 1);
+        const unsigned char* tp = sqlite3_column_text(stmt, 2);
+        if (i >= schema->ncols) { st = ASH_ERR_TYPE; break; }
+        const char* want_ty = store_sql_type(schema->cols[i].ty);
+        if (!nm || !tp || !want_ty ||
+            strcmp((const char*)nm, schema->cols[i].name) != 0 ||
+            !store_ieq((const char*)tp, want_ty)) {
+            st = ASH_ERR_TYPE;
+            break;
+        }
+        i++;
+    }
+    sqlite3_finalize(stmt);
+    if (st != ASH_OK) return st;
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) return ASH_ERR_STORE;
+    if (i != schema->ncols) return ASH_ERR_TYPE;
+    return ASH_OK;
+}
+
+AshStatus ash_store_reconcile(AshStore* s, const AshSchemaDesc* schema) {
+    if (!s || !s->db || !schema || !schema->table) return ASH_ERR_STORE;
+    if (schema->ncols == 0) return ASH_ERR_TYPE;
+    if (!store_ident_ok(schema->table)) return ASH_ERR_STORE;
+    /* A first probe tells absent from present: table_info over an unknown table
+     * yields no rows, so a zero count is the create path and any count is the
+     * validate path. */
+    char pragma[128 + 64];
+    snprintf(pragma, sizeof(pragma), "PRAGMA table_info(%s)", schema->table);
+    sqlite3_stmt* stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, pragma, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return ASH_ERR_STORE;
+    }
+    int present = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    if (present) return store_validate_table(s, schema);
+    return store_create_table(s, schema);
 }
 
 /* ---- exec ---- */

@@ -42,7 +42,11 @@ export struct ProvNode { internal: bool, name: int64, lo: int64, hi: int64, sigs
 export struct VowNode { name: int64, lo: int64, hi: int64, ty: int64, init: int64 }
 export struct PledgeNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, attrs_off: int64, attrs_len: int64, body: int64 }
 export struct ClauseNode { name: int64, lo: int64, hi: int64, params_off: int64, params_len: int64, ret: int64, body: int64 }
-export struct SubNode { name: int64, lo: int64, hi: int64, pledges_off: int64, pledges_len: int64 }
+export struct SubNode { name: int64, lo: int64, hi: int64, pledges_off: int64, pledges_len: int64, transactional: bool }
+// A schema: a table name and its columns, each column a FieldNode reusing the
+// name:type pair. The columns share their kids slice with a synthetic record
+// of the same name, so the row shape a pledge reads is an ordinary record.
+export struct SchemaNode { name: int64, lo: int64, hi: int64, cols_off: int64, cols_len: int64 }
 export struct ReqNode { kind: int64, lo: int64, hi: int64, a: int64, b: int64 }
 export struct ReqBlockNode { lo: int64, hi: int64, fulfill: int64, partial: int64, brk: int64 }
 export struct IncNode { name: int64, lo: int64, hi: int64 }
@@ -74,6 +78,7 @@ export struct Ast {
     pledges: *Vector<PledgeNode>,
     clauses: *Vector<ClauseNode>,
     subs: *Vector<SubNode>,
+    schemas: *Vector<SchemaNode>,
     reqs: *Vector<ReqNode>,
     reqblocks: *Vector<ReqBlockNode>,
     incs: *Vector<IncNode>,
@@ -163,6 +168,7 @@ export func mk_pledge() -> int64 { return 2 }
 export func mk_clause() -> int64 { return 3 }
 export func mk_subcontract() -> int64 { return 4 }
 export func mk_requirements() -> int64 { return 5 }
+export func mk_schema() -> int64 { return 6 }
 
 export func rk_atom() -> int64 { return 0 }
 export func rk_not() -> int64 { return 1 }
@@ -189,6 +195,7 @@ export func ast_new() -> *Ast {
     pledges: *Vector<PledgeNode> = alloc(vec_new())
     clauses: *Vector<ClauseNode> = alloc(vec_new())
     subs: *Vector<SubNode> = alloc(vec_new())
+    schemas: *Vector<SchemaNode> = alloc(vec_new())
     reqs: *Vector<ReqNode> = alloc(vec_new())
     reqblocks: *Vector<ReqBlockNode> = alloc(vec_new())
     incs: *Vector<IncNode> = alloc(vec_new())
@@ -201,7 +208,7 @@ export func ast_new() -> *Ast {
         args: args, arms: arms, blocks: blocks, fields: fields, attrs: attrs,
         imports: imports, records: records, variants: variants, sums: sums,
         clause_sigs: clause_sigs, provs: provs, vows: vows, pledges: pledges,
-        clauses: clauses, subs: subs, reqs: reqs, reqblocks: reqblocks,
+        clauses: clauses, subs: subs, schemas: schemas, reqs: reqs, reqblocks: reqblocks,
         incs: incs, contracts: contracts, decls: decls, kids: kids,
     })
 }
@@ -344,6 +351,13 @@ export func ast_clause(a: *Ast, n: ClauseNode) -> int64 {
 
 export func ast_sub(a: *Ast, n: SubNode) -> int64 {
     v: *Vector<SubNode> = (*a).subs
+    id: int64 = vec_len(v)
+    vec_push(v, n)
+    return id
+}
+
+export func ast_schema(a: *Ast, n: SchemaNode) -> int64 {
+    v: *Vector<SchemaNode> = (*a).schemas
     id: int64 = vec_len(v)
     vec_push(v, n)
     return id

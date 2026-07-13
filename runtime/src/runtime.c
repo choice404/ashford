@@ -60,6 +60,7 @@
  * it. */
 
 #include <ash/ash.h>
+#include <ash/ash_store.h>
 
 #include "ash_net.h"
 #include "ash_remote.h"
@@ -97,6 +98,19 @@ enum {
     PLEDGE_PENDING   = 0,
     PLEDGE_FULFILLED = 1,
     PLEDGE_BROKEN    = 2
+};
+
+/* The per-subcontract transaction state, one slot per descriptor sub for a
+ * store-backed contract. A transactional subcontract opens its episode lazily
+ * on the first fulfillment of one of its pledges, so TXN_NONE is the fresh
+ * state, TXN_OPEN a live transaction on the connection, and TXN_DONE the one
+ * commit or rollback that closes it. Because an episode is one outcome and not
+ * a latch, a pledge whose sub reads TXN_DONE is refused ASH_ERR_STATE rather
+ * than run again. */
+enum {
+    TXN_NONE = 0,
+    TXN_OPEN = 1,
+    TXN_DONE = 2
 };
 
 /* A client's connection to one daemon, defined in full with the remote path at
@@ -137,6 +151,22 @@ struct AshContract {
      * break leaves both alone on purpose, the errors are what it reports. */
     uint8_t*               pledge_state; /* PLEDGE_*, one per pledge */
     AshValue*              pledge_err;   /* first Err payload per pledge */
+
+    /* One TXN_* slot per descriptor subcontract, NULL for a contract with no
+     * subs or no store. A transactional subcontract's episode is tracked here:
+     * TXN_OPEN while a transaction buffers its writes, TXN_DONE once the commit
+     * or rollback landed. Plain heap freed at shutdown, like the latches, and
+     * touched only under this instance's lock so the connection stays single
+     * threaded. */
+    uint8_t*               sub_txn;
+
+    /* The store connection, NULL for a contract that declares no schema. A
+     * store-backed contract opens it at sign to the bound dsn, reconciles every
+     * schema against it in the same call, holds it for the life of the
+     * signature, and closes it at break before the heap is reclaimed. It lives
+     * under this instance's lock like everything else, so the connection is
+     * single-threaded by construction and the runtime adds no store lock. */
+    AshStore*              store;
     pthread_mutex_t        mu;        /* recursive; the instance lock */
 };
 
@@ -680,9 +710,14 @@ void ash_runtime_shutdown(AshRuntime* rt) {
             future_free(f);
             f = next;
         }
+        if (c->store) {
+            ash_store_close(c->store);
+            c->store = NULL;
+        }
         contract_free_owned(c);
         free(c->pledge_state);
         free(c->pledge_err);
+        free(c->sub_txn);
         pthread_mutex_destroy(&c->mu);
         free(c);
     }
@@ -949,6 +984,264 @@ static AshStatus resolve_dispatch(const AshRuntime* rt,
     return ASH_OK;
 }
 
+/* ---- the store path ---- */
+
+/* Rows and their bytes allocate onto the signing instance through this hook, so
+ * the driver stays as pure over an allocator as the wire codec did: S0 handed
+ * it a plain arena, S1 hands it the instance, and a row read out of a table
+ * lives on the instance heap and dies at its break like every other value. */
+static uint8_t* instance_store_bytes(void* ctx, uint64_t n) {
+    return ash_bytes((AshContract*)ctx, n);
+}
+
+/* Opens the store connection at sign and reconciles every schema against the
+ * live database in the same call, the whole store side of sign. A store-backed
+ * contract, one with at least one schema, binds a database named by its dsn
+ * vow: an absent dsn vow, the same gap an unsupplied vow always hit, is
+ * ASH_ERR_UNBOUND; a dsn that will not open is ASH_ERR_STORE; a schema that
+ * will not reconcile is ASH_ERR_TYPE, and none of them leaves a half open
+ * connection on the instance. A contract with no schema takes this path as a no
+ * op and signs with no database, exactly as every contract did before the
+ * store layer. */
+static AshStatus store_sign_reconcile(AshContract* c) {
+    const AshContractDesc* desc = c->desc;
+    if (desc->nschemas == 0) return ASH_OK;
+
+    int slot = -1;
+    for (uint32_t i = 0; i < desc->nvows; i++) {
+        if (strcmp(desc->vows[i].name, "dsn") == 0) { slot = (int)i; break; }
+    }
+    if (slot < 0 || !c->vow_vals) return ASH_ERR_UNBOUND;
+    const AshValue* d = &c->vow_vals[slot];
+    if (d->ty != ASH_TY_STRING) return ASH_ERR_UNBOUND;
+
+    char* dsn = (char*)malloc((size_t)d->as.s.len + 1);
+    if (!dsn) return ASH_ERR_OOM;
+    if (d->as.s.len) memcpy(dsn, d->as.s.ptr, (size_t)d->as.s.len);
+    dsn[d->as.s.len] = 0;
+
+    AshStore* s = NULL;
+    AshStatus st = ash_store_open(dsn, &s);
+    free(dsn);
+    if (st != ASH_OK) return st;
+
+    for (uint32_t i = 0; i < desc->nschemas; i++) {
+        st = ash_store_reconcile(s, &desc->schemas[i]);
+        if (st != ASH_OK) {
+            ash_store_close(s);
+            return st;
+        }
+    }
+    c->store = s;
+    return ASH_OK;
+}
+
+/* The column tags of a schema in one heap array, the col_types the query API
+ * decodes each row against. */
+static uint32_t* store_col_types(const AshSchemaDesc* s) {
+    uint32_t* ct = (uint32_t*)malloc((size_t)s->ncols * sizeof(uint32_t));
+    if (!ct) return NULL;
+    for (uint32_t i = 0; i < s->ncols; i++) ct[i] = s->cols[i].ty;
+    return ct;
+}
+
+/* The byte budget a column name list needs, the shared sizing every builder
+ * leans on so no fixed cap can clip a wide schema. */
+static size_t store_cols_span(const AshSchemaDesc* s) {
+    size_t n = 0;
+    for (uint32_t i = 0; i < s->ncols; i++) n += strlen(s->cols[i].name) + 4;
+    return n;
+}
+
+/* SELECT c0, c1, ... FROM table WHERE pk=?, the one row lookup by primary key. */
+static char* store_sql_select(const AshSchemaDesc* s) {
+    size_t need = 48 + strlen(s->table) + strlen(s->cols[0].name) + store_cols_span(s);
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT ");
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
+    snprintf(q + n, need - n, " FROM %s WHERE %s=?", s->table, s->cols[0].name);
+    return q;
+}
+
+/* INSERT INTO table(c0, ...) VALUES(?, ...), every column bound positionally. */
+static char* store_sql_insert(const AshSchemaDesc* s) {
+    size_t need = 48 + strlen(s->table) + store_cols_span(s) + (size_t)s->ncols * 3;
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "INSERT INTO %s(", s->table);
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
+    n += (size_t)snprintf(q + n, need - n, ") VALUES(");
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s?", i ? ", " : "");
+    snprintf(q + n, need - n, ")");
+    return q;
+}
+
+/* UPDATE table SET c0=?, c1=?, ... WHERE pk=?, the row's columns then the key. */
+static char* store_sql_update(const AshSchemaDesc* s) {
+    size_t need = 48 + strlen(s->table) + strlen(s->cols[0].name) + store_cols_span(s) * 2;
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "UPDATE %s SET ", s->table);
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s=?", i ? ", " : "", s->cols[i].name);
+    snprintf(q + n, need - n, " WHERE %s=?", s->cols[0].name);
+    return q;
+}
+
+/* Wraps a payload value into Ok(payload), the Result the store surface returns
+ * on success; the Err arm is the surface's and a backend failure never reaches
+ * it, riding the status instead. */
+static AshStatus store_ok(AshContract* c, const AshValue* payload, AshValue* out) {
+    AshValue* box = ash_box(c);
+    if (!box) return ASH_ERR_OOM;
+    *box = *payload;
+    memset(out, 0, sizeof(*out));
+    out->ty = ASH_TY_RESULT;
+    out->tag = 0;
+    out->as.box = box;
+    return ASH_OK;
+}
+
+/* Ok(Unit), the result the write forms report. */
+static AshStatus store_ok_unit(AshContract* c, AshValue* out) {
+    AshValue unit;
+    memset(&unit, 0, sizeof(unit));
+    unit.ty = ASH_TY_UNIT;
+    return store_ok(c, &unit, out);
+}
+
+/* The row parameters an insert or update binds: a record's fields are the
+ * schema's columns in declaration order, so its field array is the parameter
+ * frame as it stands. A value that is not a record of the right width is a
+ * codegen bug, refused here as ASH_ERR_TYPE rather than bound wrong. */
+static const AshValue* store_row_params(const AshSchemaDesc* s,
+                                        const AshValue* row) {
+    if (!row || row->ty != ASH_TY_RECORD) return NULL;
+    if (row->as.list.len != s->ncols) return NULL;
+    return (const AshValue*)row->as.list.data;
+}
+
+AshStatus ash_store_find(AshContract* c, const AshSchemaDesc* schema,
+                         const AshValue* key, AshValue* out) {
+    if (!c || !schema || !key || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store && schema->ncols > 0) {
+        char* sql = store_sql_select(schema);
+        uint32_t* cts = store_col_types(schema);
+        if (!sql || !cts) {
+            st = ASH_ERR_OOM;
+        } else {
+            AshStoreAlloc alloc = { instance_store_bytes, c };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, key, 1, cts, NULL,
+                                 schema->ncols, &alloc, &rows);
+            if (st == ASH_OK) {
+                AshValue opt;
+                memset(&opt, 0, sizeof(opt));
+                opt.ty = ASH_TY_OPTION;
+                if (rows.as.list.len > 0) {
+                    AshValue* box = ash_box(c);
+                    if (!box) {
+                        st = ASH_ERR_OOM;
+                    } else {
+                        *box = ((AshValue*)rows.as.list.data)[0];
+                        opt.tag = 1;
+                        opt.as.box = box;
+                    }
+                }
+                if (st == ASH_OK) st = store_ok(c, &opt, out);
+            }
+        }
+        free(sql);
+        free(cts);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* row, AshValue* out) {
+    if (!c || !schema || !row || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    const AshValue* params = store_row_params(schema, row);
+    if (!params) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_insert(schema);
+        if (!sql) {
+            st = ASH_ERR_OOM;
+        } else {
+            st = ash_store_exec_params(c->store, sql, params, schema->ncols, NULL);
+            if (st == ASH_OK) st = store_ok_unit(c, out);
+        }
+        free(sql);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* key, const AshValue* row,
+                           AshValue* out) {
+    if (!c || !schema || !key || !row || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    const AshValue* rowp = store_row_params(schema, row);
+    if (!rowp) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_update(schema);
+        AshValue* params = (AshValue*)malloc((size_t)(schema->ncols + 1) *
+                                             sizeof(AshValue));
+        if (!sql || !params) {
+            st = ASH_ERR_OOM;
+        } else {
+            memcpy(params, rowp, (size_t)schema->ncols * sizeof(AshValue));
+            params[schema->ncols] = *key;
+            st = ash_store_exec_params(c->store, sql, params,
+                                       (size_t)schema->ncols + 1, NULL);
+            if (st == ASH_OK) st = store_ok_unit(c, out);
+        }
+        free(sql);
+        free(params);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_delete(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* key, AshValue* out) {
+    if (!c || !schema || !key || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store && schema->ncols > 0) {
+        size_t need = 48 + strlen(schema->table) + strlen(schema->cols[0].name);
+        char* sql = (char*)malloc(need);
+        if (!sql) {
+            st = ASH_ERR_OOM;
+        } else {
+            snprintf(sql, need, "DELETE FROM %s WHERE %s=?", schema->table,
+                     schema->cols[0].name);
+            st = ash_store_exec_params(c->store, sql, key, 1, NULL);
+            if (st == ASH_OK) st = store_ok_unit(c, out);
+        }
+        free(sql);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
 /* Sign runs in three phases so the runtime lock never sits above an instance
  * mutex. Phase one resolves the descriptor and dispatch table under the
  * runtime lock alone; phase two builds the instance with no locks held,
@@ -1010,6 +1303,17 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
         c->pledge_err = calloc(desc->npledges, sizeof(AshValue));
         if (!c->pledge_state || !c->pledge_err) st = ASH_ERR_OOM;
     }
+    /* One transaction slot per subcontract, all TXN_NONE, so the first
+     * fulfillment of a transactional subcontract opens its episode lazily. A
+     * contract with no subcontract carries none. */
+    if (st == ASH_OK && desc->nsubs > 0) {
+        c->sub_txn = calloc(desc->nsubs, sizeof(uint8_t));
+        if (!c->sub_txn) st = ASH_ERR_OOM;
+    }
+    /* The store side of sign: open the bound dsn and reconcile every schema, so
+     * a store-backed contract that activates has a live, shape checked
+     * connection, and one that fails to open or reconcile never publishes. */
+    if (st == ASH_OK) st = store_sign_reconcile(c);
     if (st == ASH_OK) {
         c->state = ASH_SIGNED;
         c->shape_hash = desc->shape_hash;
@@ -1023,9 +1327,14 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
         pthread_mutex_unlock(&rt->lock);
     }
     if (st != ASH_OK) {
+        if (c->store) {
+            ash_store_close(c->store);
+            c->store = NULL;
+        }
         contract_free_owned(c);
         free(c->pledge_state);
         free(c->pledge_err);
+        free(c->sub_txn);
         pthread_mutex_destroy(&c->mu);
         free(c);
         return st;
@@ -1083,6 +1392,16 @@ AshStatus ash_contract_break(AshContract* c) {
      * partial surface still reports which pledges landed and which broke. */
     if (c->pledge_err && c->desc->npledges > 0) {
         memset(c->pledge_err, 0, c->desc->npledges * sizeof(AshValue));
+    }
+    /* The store side of break, in the order docs/database.md fixes: roll back
+     * any open transaction, then close the connection, then reclaim the heap.
+     * S1 is autocommit so a rollback usually finds nothing open, but it runs
+     * anyway so no uncommitted write can ever survive a break, and the close
+     * lands before the heap the rows live on goes away. */
+    if (c->store) {
+        ash_store_rollback(c->store);
+        ash_store_close(c->store);
+        c->store = NULL;
     }
     contract_free_owned(c);
     c->state = ASH_BROKEN;
@@ -1545,6 +1864,79 @@ static void latch_pledge(AshContract* c, uint32_t pidx, const AshValue* out) {
     }
 }
 
+/* ---- transactional subcontracts ---- */
+
+/* The subcontract a pledge belongs to when that subcontract is transactional,
+ * or -1. A loose pledge, a sub index outside the table, and a subcontract
+ * without the flag all read -1, so the store transaction machinery is a no-op
+ * for every pledge outside a transactional group and for every contract that
+ * carries no sub_flags at all. */
+static int32_t pledge_txn_sub(const AshContractDesc* d, uint32_t pidx) {
+    if (pidx >= d->npledges) return -1;
+    int32_t s = d->pledges[pidx].sub;
+    if (s < 0 || (uint32_t)s >= d->nsubs) return -1;
+    if (!d->sub_flags) return -1;
+    if ((d->sub_flags[s] & ASH_SUB_TRANSACTIONAL) == 0) return -1;
+    return s;
+}
+
+/* Opens the episode before the thunk runs. A pledge outside any transactional
+ * subcontract proceeds untouched; a pledge whose episode already resolved is
+ * refused ASH_ERR_STATE, the once-only law a committed transaction earns; the
+ * first pledge of a transactional subcontract begins the transaction lazily and
+ * marks it open. A begin the backend refuses rides back as ASH_ERR_STORE and
+ * the episode stays unopened. Returns ASH_OK to proceed, or the status to
+ * deliver instead. Called under the instance lock. */
+static AshStatus txn_before(AshContract* c, uint32_t pidx) {
+    int32_t s = pledge_txn_sub(c->desc, pidx);
+    if (s < 0 || !c->sub_txn || !c->store) return ASH_OK;
+    if (c->sub_txn[s] == TXN_DONE) return ASH_ERR_STATE;
+    if (c->sub_txn[s] == TXN_NONE) {
+        AshStatus st = ash_store_begin(c->store);
+        if (st != ASH_OK) return st;
+        c->sub_txn[s] = TXN_OPEN;
+    }
+    return ASH_OK;
+}
+
+/* Resolves the episode after one pledge outcome, the whole all-or-nothing rule
+ * in one place. A backend or runtime failure mid episode rolls the transaction
+ * back and closes it, so no half written episode survives; an Err latched the
+ * pledge broken and the buffered writes vanish the instant it lands; an Ok that
+ * completes the subcontract commits the whole episode. The completion test is
+ * sub_all over PLEDGE_FULFILLED, the same "every pledge of this subcontract
+ * latched Ok" predicate the requirements evaluator reads through atom_true and
+ * sub_item_state, so the commit point can never drift from the subcontract's
+ * own fulfillment. A commit the backend refuses is ASH_ERR_STORE with the
+ * episode rolled back. Returns the status to deliver. Called under the instance
+ * lock, after latch_pledge and eval_policy. */
+static AshStatus txn_after(AshContract* c, uint32_t pidx, AshStatus st,
+                           const AshValue* out) {
+    int32_t s = pledge_txn_sub(c->desc, pidx);
+    if (s < 0 || !c->sub_txn || !c->store || c->sub_txn[s] != TXN_OPEN) {
+        return st;
+    }
+    if (st != ASH_OK) {
+        ash_store_rollback(c->store);
+        c->sub_txn[s] = TXN_DONE;
+        return st;
+    }
+    if (out && out->ty == ASH_TY_RESULT && out->tag == 1) {
+        ash_store_rollback(c->store);
+        c->sub_txn[s] = TXN_DONE;
+        return st;
+    }
+    if (sub_all(c, (uint32_t)s, PLEDGE_FULFILLED)) {
+        AshStatus cs = ash_store_commit(c->store);
+        c->sub_txn[s] = TXN_DONE;
+        if (cs != ASH_OK) {
+            ash_store_rollback(c->store);
+            return ASH_ERR_STORE;
+        }
+    }
+    return st;
+}
+
 /* One fulfillment on a pool worker. The instance lock covers the state
  * check, the thunk run, and the latch, so fulfillments against one instance
  * serialize while distinct instances run truly in parallel, and a break can
@@ -1558,14 +1950,20 @@ static void run_task(struct AshFuture* f) {
         c->state != ASH_FULFILLED) {
         future_finish(f, ASH_ERR_STATE, NULL);
     } else {
-        AshValue out;
-        memset(&out, 0, sizeof(out));
-        AshStatus st = f->fn((void*)c, f->frame, f->frame_nargs, &out);
-        if (st == ASH_OK) {
-            latch_pledge(c, f->pidx, &out);
-            eval_policy(c);
+        AshStatus gate = txn_before(c, f->pidx);
+        if (gate != ASH_OK) {
+            future_finish(f, gate, NULL);
+        } else {
+            AshValue out;
+            memset(&out, 0, sizeof(out));
+            AshStatus st = f->fn((void*)c, f->frame, f->frame_nargs, &out);
+            if (st == ASH_OK) {
+                latch_pledge(c, f->pidx, &out);
+                eval_policy(c);
+            }
+            st = txn_after(c, f->pidx, st, &out);
+            future_finish(f, st, &out);
         }
-        future_finish(f, st, &out);
     }
     pthread_mutex_unlock(&c->mu);
 }
@@ -1701,13 +2099,22 @@ static AshStatus fulfill_inline(AshContract* c, const char* pledge_name,
         AshValue* frame = NULL;
         st = prepare_frame(c, args, nargs, refs, nrefs, &frame);
         if (st != ASH_OK) break;
+        uint32_t pidx = (uint32_t)(p - c->desc->pledges);
+        AshStatus gate = txn_before(c, pidx);
+        if (gate != ASH_OK) {
+            st = gate;
+            break;
+        }
         AshValue res;
         memset(&res, 0, sizeof(res));
         AshPledgeFn fn = c->fns[p - c->desc->pledges];
         st = fn((void*)c, frame, p->nargs, &res);
+        if (st == ASH_OK) {
+            latch_pledge(c, pidx, &res);
+            eval_policy(c);
+        }
+        st = txn_after(c, pidx, st, &res);
         if (st != ASH_OK) break;
-        latch_pledge(c, (uint32_t)(p - c->desc->pledges), &res);
-        eval_policy(c);
         if (nrefs > 0 && frame) {
             AshStatus wb = write_back_refs(refs, frame + nargs, nrefs);
             if (wb != ASH_OK) {

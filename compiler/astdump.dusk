@@ -247,6 +247,10 @@ func render_sub(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
         push_string(out, ast_name(a, s.name))
     }
     sb_push(out, ",\n")
+    if s.transactional {
+        ind(out, level + 1)
+        sb_push(out, "transactional: true,\n")
+    }
     ind(out, level + 1)
     sb_push(out, "pledges: ")
     if s.pledges_len == 0 {
@@ -327,6 +331,21 @@ func render_reqblock(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> v
     sb_push_char(out, 125)
 }
 
+func render_schema(out: *StringBuilder, a: *Ast, id: int64, level: int64) -> void {
+    sc: SchemaNode = vec_get((*a).schemas, id)
+    sb_push(out, "Schema {\n")
+    ind(out, level + 1)
+    sb_push(out, "name: ")
+    push_string(out, ast_name(a, sc.name))
+    sb_push(out, ",\n")
+    ind(out, level + 1)
+    sb_push(out, "cols: ")
+    render_field_list(out, a, sc.cols_off, sc.cols_len, level + 1)
+    sb_push(out, ",\n")
+    ind(out, level)
+    sb_push_char(out, 125)
+}
+
 func render_member(out: *StringBuilder, a: *Ast, kind: int64, id: int64, level: int64) -> void {
     if kind == mk_incorporate() {
         inc: IncNode = vec_get((*a).incs, id)
@@ -368,6 +387,10 @@ func render_member(out: *StringBuilder, a: *Ast, kind: int64, id: int64, level: 
     }
     if kind == mk_subcontract() {
         render_sub(out, a, id, level)
+        return
+    }
+    if kind == mk_schema() {
+        render_schema(out, a, id, level)
         return
     }
     render_reqblock(out, a, id, level)

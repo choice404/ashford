@@ -304,6 +304,44 @@ func collect_pledge(s: *Sigs, key: string, pid: int64, sub: int64) -> void {
     }
 }
 
+// Whether a lowered type is one of the seven scalars a store column may hold.
+// A composite is refused so a row stays flat and a store is never the place a
+// nested value hides; the unknown recovery type passes so one fault stays one.
+func is_scalar_col(t: *TyArena, id: int64) -> bool {
+    k: int64 = ty_get(t, id).kind
+    if k == tyk_int() || k == tyk_uint() || k == tyk_float() { return true }
+    if k == tyk_bool() || k == tyk_byte() || k == tyk_char() { return true }
+    if k == tyk_str() { return true }
+    return k == tyk_unknown()
+}
+
+// A schema's row record: its columns lower into FieldSigs the same way a record
+// does, so the row a Store.* operation carries reads as an ordinary record, and
+// each column is held to the seven scalars a flat row can store.
+func collect_schema(s: *Sigs, schid: int64) -> void {
+    a: *Ast = (*s).ast
+    t: *TyArena = (*s).ty
+    sc: SchemaNode = vec_get((*a).schemas, schid)
+    key: string = rs_gkey(sc.name)
+    tab: *Map<RecSig> = (*s).recs
+    if map_has(tab, key) { return }
+    fields: *Vector<FieldSig> = (*s).fields
+    off: int64 = vec_len(fields)
+    (*s).abi_pos = true
+    mut i: int64 = 0
+    while i < sc.cols_len {
+        f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, sc.cols_off + i))
+        cty: int64 = lower_type(s, f.ty, sc.lo, sc.hi)
+        if !is_scalar_col(t, cty) {
+            sig_emit(s, sc.lo, sc.hi, smsg3("schema column '", ast_name(a, f.name), "' must be a scalar type (Int, UInt, Float, Bool, Byte, Char, or String)"))
+        }
+        vec_push(fields, FieldSig { name: f.name, ty: cty })
+        i = i + 1
+    }
+    (*s).abi_pos = false
+    map_put(tab, key, RecSig { off: off, len: sc.cols_len, found: true })
+}
+
 func collect_contract(s: *Sigs, cid: int64) -> void {
     a: *Ast = (*s).ast
     c: ContractNode = vec_get((*a).contracts, cid)
@@ -311,7 +349,9 @@ func collect_contract(s: *Sigs, cid: int64) -> void {
     while i < c.members_len {
         mkind: int64 = vec_get((*a).kids, c.members_off + i)
         mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
-        if mkind == mk_vow() {
+        if mkind == mk_schema() {
+            collect_schema(s, mid)
+        } else if mkind == mk_vow() {
             v: VowNode = vec_get((*a).vows, mid)
             vkey: string = rs_mkey(cid, v.name)
             vows: *Map<VowSigT> = (*s).vows

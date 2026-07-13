@@ -759,6 +759,98 @@ func gen_break_call(g: *Cg, base: CVal) -> CVal {
     return CVal { cvar: v, ty: ty_unit((*g).ty) }
 }
 
+// The schema of the given name in the contract: its declaration index, the one
+// the emitted AshSchemaDesc array shares, and its arena id. (-1, -1) when the
+// contract declares no such schema, which the checker already reported.
+func cg_schema_index(g: *Cg, cid: int64, name: int64) -> (int64, int64) {
+    a: *Ast = (*g).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut idx: int64 = 0
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_schema() {
+            schid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+            sc: SchemaNode = vec_get((*a).schemas, schid)
+            if sc.name == name { return (idx, schid) }
+            idx = idx + 1
+        }
+        i = i + 2
+    }
+    return (-1, -1)
+}
+
+// The i-th argument's expression id of a call.
+func cg_arg_expr(g: *Cg, e: ExprNode, i: int64) -> int64 {
+    a: *Ast = (*g).ast
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+    return arg.expr
+}
+
+// A Store.* operation lowered onto its runtime primitive. The schema name is a
+// bare identifier, resolved to the emitted descriptor entry and never lowered
+// as a value; the key and row lower against the types the schema fixes. The
+// primitive runs in the thunk's exit convention, a status other than ASH_OK
+// returning straight through the body, and lands its Ok(...) result in the
+// fresh temporary, which is the value the surface promised.
+func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    cid: int64 = (*g).cur_cid
+    op: string = ast_name(a, cn.b)
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    a0e: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 0))
+    idx, schid := cg_schema_index(g, cid, a0e.a)
+    if schid < 0 {
+        cg_unsupported(g, e.lo, e.hi, "a Store operation on an unknown schema")
+        return bad_val(g)
+    }
+    sc: SchemaNode = vec_get((*a).schemas, schid)
+    row_ty: int64 = ty_named(t, ast_name(a, sc.name))
+    err_ty: int64 = ty_named(t, "StoreError")
+    rs: RecSig = sig_rec((*g).sigs, sc.name)
+    mut pk_ty: int64 = ty_unknown(t)
+    if rs.found {
+        if rs.len > 0 { pk_ty = sig_field((*g).sigs, rs.off, 0).ty }
+    }
+    schref: string = tmsg7("&k_", cname, "_schemas[", int_to_string(idx), "]", "", "")
+
+    out: string = new_value(g)
+    st: string = cg_tmp(g)
+    if str_eq(op, "find") {
+        key: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
+        call: string = tmsg5(" = ash_store_find(cc, ", schref, ", &", key.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("AshStatus ", st, call))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_option(t, row_ty), err_ty) }
+    }
+    if str_eq(op, "insert") {
+        row: CVal = gen_expr(g, cg_arg_expr(g, e, 1), row_ty)
+        call2: string = tmsg5(" = ash_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("AshStatus ", st, call2))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
+    }
+    if str_eq(op, "update") {
+        key2: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
+        row2: CVal = gen_expr(g, cg_arg_expr(g, e, 2), row_ty)
+        call3: string = tmsg7(" = ash_store_update(cc, ", schref, ", &", key2.cvar, tmsg5(", &", row2.cvar, ", &", out, ");"), "", "")
+        cg_line(g, tmsg3("AshStatus ", st, call3))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
+    }
+    if str_eq(op, "delete") {
+        key3: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
+        call4: string = tmsg5(" = ash_store_delete(cc, ", schref, ", &", key3.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("AshStatus ", st, call4))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
+    }
+    cg_unsupported(g, e.lo, e.hi, tmsg3("the Store operation '", op, "' in a pledge body"))
+    return bad_val(g)
+}
+
 // A call expression. The lowered callables are a sum variant constructor, a
 // bare clause of the enclosing contract, sign on a contract name, and the
 // pledge and break operations on a signed instance; a call through a first
@@ -795,6 +887,13 @@ func gen_call(g: *Cg, e: ExprNode) -> CVal {
                     }
                     cg_unsupported(g, e.lo, e.hi, "this call on a contract name in a pledge body")
                     return bad_val(g)
+                }
+                // The Store namespace: a bare Store that no local shadows and
+                // no contract owns lowers its op onto the store primitive.
+                if str_eq(ast_name(a, be.a), "Store") {
+                    if (*g).cur_cid >= 0 {
+                        return gen_store_op(g, e, cn)
+                    }
                 }
             }
         }

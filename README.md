@@ -66,7 +66,7 @@ The runtime is a shared C library. A compiled `.ash` module carries its contract
 
 ## How to use
 
-New to Ashford, start with [docs/tutorial.md](docs/tutorial.md): it walks the whole language and then drives one contract from C and from Python with no generated bindings. [CHANGELOG.md](CHANGELOG.md) carries the full history, version by version.
+New to Ashford, start with [docs/tutorial.md](docs/tutorial.md): it walks the whole language and then drives one contract from C and from Python with no generated bindings. [spec.md](spec.md) is the full language reference, and [CHANGELOG.md](CHANGELOG.md) carries the history version by version.
 
 The toolchain is early, but the whole pipeline already runs: `ashc` compiles a module, the runtime loads it, and a C host signs and fulfills a contract end to end.
 

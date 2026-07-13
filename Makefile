@@ -20,7 +20,15 @@ OUT     := target/ashc-out
 # the shared library split into sources: the runtime, its wire codec, and the
 # socket helpers the codec and the client path lean on. Kept as one list so a
 # gate that links the runtime in gets net.c and wire.c with it.
-RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c
+RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c runtime/src/store.c
+
+# The runtime now speaks to the store, so runtime.c references the driver in
+# store.c and its vendored SQLite; every gate that links the runtime in gets
+# both. RT_INC adds the amalgamation's header to the include path store.c needs,
+# and RT_SQLITE is the compiled amalgamation object those gates link beside the
+# instrumented units, uninstrumented the way test-store already links it.
+RT_INC := -I runtime/include -I runtime/third_party
+RT_SQLITE = $(SQLITE_OBJ)
 
 # The SQLite amalgamation, compiled once into its own object and linked into
 # the runtime and the store gate. It builds with warnings off and no sanitizer:
@@ -42,10 +50,11 @@ MODULE_PAY := $(OUT)/libpayment.ash.so
 MODULE_NETPAY := $(OUT)/libnet_payment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
+MODULE_LEDGER := $(OUT)/libledger.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
@@ -84,6 +93,9 @@ $(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
 $(MODULE_STD): $(ASHC) skeleton/std_user.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/std_user.ash
 
+$(MODULE_LEDGER): $(ASHC) skeleton/ledger.ash lib/ashstd/store.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/ledger.ash
+
 $(BIN_DEMO): $(ASHC) skeleton/main_demo.ash $(RT_SO) runtime/include/ash/ash_abi.h
 	$(ASHC) build --bin skeleton/main_demo.ash
 
@@ -114,8 +126,8 @@ smoke: $(RT_SO) $(MODULE) $(HOST)
 # one binary under ASan and LSan so every instance allocation is watched.
 test-runtime:
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_value.c $(RT_UNITS) -ldl -o $(OUT)/test_value
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread $(RT_INC) \
+	    tests/runtime/test_value.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_value
 	./$(OUT)/test_value
 
 # The wire codec gate under ASan: the canonical value encoding against its
@@ -125,8 +137,8 @@ test-runtime:
 # with ./$(OUT)/test_wire --emit tests/wire after a deliberate format change.
 test-wire:
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_wire.c $(RT_UNITS) -ldl -o $(OUT)/test_wire
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread $(RT_INC) \
+	    tests/runtime/test_wire.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_wire
 	./$(OUT)/test_wire tests/wire
 
 # The store driver gate under ASan and LSan: the SQLite backend against a real
@@ -140,18 +152,47 @@ test-wire:
 # deliberate format change. Not folded into all yet; it is verified on its own.
 test-store-unit:
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    -I runtime/third_party \
-	    tests/runtime/test_store.c runtime/src/store.c $(SQLITE_OBJ) $(RT_UNITS) \
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread $(RT_INC) \
+	    tests/runtime/test_store.c $(RT_UNITS) $(RT_SQLITE) \
 	    -ldl -o $(OUT)/test_store
 	./$(OUT)/test_store tests/store
+
+# The S1 store gate under ASan and LSan: the compiled Ledger signed against a
+# temp SQLite file, the schema reconciled into a fresh file, a row written and
+# read back, an update round tripped, a missing account answered as the
+# contract's own Err, an injection string bound as a value that leaves the table
+# standing, and the two refusal signs, a divergent schema (ASH_ERR_TYPE) and a
+# missing dsn vow (ASH_ERR_UNBOUND). The runtime, the driver, and the
+# uninstrumented sqlite object are compiled in so LSan watches every row that
+# lands on the instance to zero leaks; -rdynamic exports the ash_* symbols the
+# dlopened module resolves against.
+test-store: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_ledger.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_ledger
+	./$(OUT)/test_store_ledger
+
+# The S2 transactional gate under ASan and LSan: the Ledger's Transfer
+# subcontract driven as one all-or-nothing episode. A good transfer commits both
+# writes and the file reflects the moved balances; a failed transfer rolls the
+# debit back so nothing durable survives; a second call to a resolved
+# transactional pledge is ASH_ERR_STATE; and a break mid transaction leaves no
+# debit durable. Every persistence assertion reopens the file in a fresh
+# instance so the file, not a cache, is the witness.
+test-store-txn: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_txn.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_txn
+	./$(OUT)/test_store_txn
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.
 test-thread:
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -I runtime/include \
-	    tests/runtime/test_thread.c $(RT_UNITS) -ldl -o $(OUT)/test_thread
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread $(RT_INC) \
+	    tests/runtime/test_thread.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_thread
 	./$(OUT)/test_thread
 
 # The iname gate under ASan: two compiled generations loaded side by side,
@@ -159,8 +200,8 @@ test-thread:
 # canonical dump against its golden, tests/runtime/iname.expect.
 test-iname: $(MODULE) $(MODULE_V2)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_iname.c $(RT_UNITS) -ldl -o $(OUT)/test_iname
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_iname.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_iname
 	./$(OUT)/test_iname
 
 # The requirements gate under ASan: the compiled payment module's policy
@@ -169,8 +210,8 @@ test-iname: $(MODULE) $(MODULE_V2)
 # the errors it reports.
 test-partial: $(MODULE_PAY)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_partial.c $(RT_UNITS) -ldl -o $(OUT)/test_partial
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_partial.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_partial
 	./$(OUT)/test_partial
 
 # The language lowering gate under ASan: the compiled gauntlet module walks
@@ -179,8 +220,8 @@ test-partial: $(MODULE_PAY)
 # the out of bounds index rule.
 test-lang: $(MODULE_LANG)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_lang.c $(RT_UNITS) -ldl -o $(OUT)/test_lang
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_lang.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_lang
 	./$(OUT)/test_lang
 
 # The standard library gate under ASan: the std_user module merges four
@@ -190,8 +231,8 @@ test-lang: $(MODULE_LANG)
 # in the Err box, and the sort that runs through an incorporated clause.
 test-std: $(MODULE_STD)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    tests/runtime/test_std.c $(RT_UNITS) -ldl -o $(OUT)/test_std
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_std.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_std
 	./$(OUT)/test_std
 
 # The Python interop gate: the ctypes binding drives the payment walk and
@@ -229,7 +270,7 @@ test-header: $(ASHC) $(MODULE) $(RT_SO)
 	diff tests/golden/hello.ash.h $(OUT)/hello.ash.h
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic \
 	    -I runtime/include -I $(OUT) \
-	    tests/runtime/test_header.c $(RT_UNITS) -ldl -o $(OUT)/test_header
+	    tests/runtime/test_header.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_header
 	./$(OUT)/test_header
 
 # The determinism gate: two builds of the same source must emit byte
@@ -296,11 +337,11 @@ test-net-tsan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/ashd_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_handshake.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/test_handshake_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/test_handshake_tsan
 	tests/net/run_net.sh $(OUT)/ashd_tsan $(OUT)/test_handshake_tsan $(MODULE)
 
 # The N2 transparency gate: ashd serves the payment module on loopback, and one
@@ -330,11 +371,11 @@ test-net2-tsan: $(MODULE_NETPAY)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/ashd_net2_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_net2_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_remote.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/test_remote_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/test_remote_tsan
 	tests/net/run_net2.sh $(OUT)/ashd_net2_tsan $(OUT)/test_remote_tsan $(MODULE_NETPAY)
 
 # The Python network gate: two ashd daemons serve the payment module on
@@ -385,11 +426,11 @@ test-net-stress-tsan: $(MODULE_NETPAY)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/ashd_stress_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_stress_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_stress.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c -ldl -o $(OUT)/test_stress_tsan
+	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/test_stress_tsan
 	tests/net/run_stress.sh $(OUT)/ashd_stress_tsan $(OUT)/test_stress_tsan $(MODULE_NETPAY)
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
@@ -398,16 +439,16 @@ test-net-stress-tsan: $(MODULE_NETPAY)
 # and host side of every race is.
 tsan: $(MODULE)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -I runtime/include \
-	    tests/runtime/test_thread.c $(RT_UNITS) -ldl -o $(OUT)/test_thread_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread $(RT_INC) \
+	    tests/runtime/test_thread.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_thread_tsan
 	./$(OUT)/test_thread_tsan
-	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic -I runtime/include \
-	    skeleton/host.c $(RT_UNITS) -ldl -o $(OUT)/host_tsan
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic $(RT_INC) \
+	    skeleton/host.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/host_tsan
 	./$(OUT)/host_tsan
 
 smoke-asan: $(MODULE)
-	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic -I runtime/include \
-	    skeleton/host.c $(RT_UNITS) -ldl -o $(OUT)/host_asan
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    skeleton/host.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/host_asan
 	./$(OUT)/host_asan
 
 clean:

@@ -131,6 +131,21 @@ func check_pledge_body(tc: *Tc, key: string, pid: int64) -> void {
     check_body(tc, pl.params_off, pl.params_len, ps.params, ret, pl.body, pl.lo, pl.hi)
 }
 
+// Whether the contract declares at least one schema, the test that decides
+// store-backed from not. A transactional subcontract groups durable writes, so
+// it is only meaningful over a contract that binds a database.
+func contract_has_schema(a: *Ast, c: ContractNode) -> bool {
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_schema() {
+            return true
+        }
+        i = i + 2
+    }
+    return false
+}
+
 func check_contract(tc: *Tc, cid: int64) -> void {
     a: *Ast = (*tc).ast
     (*tc).cur_cid = cid
@@ -158,6 +173,11 @@ func check_contract(tc: *Tc, cid: int64) -> void {
             check_body(tc, cl.params_off, cl.params_len, cs.params, ret, cl.body, cl.lo, cl.hi)
         } else if mkind == mk_subcontract() {
             sub: SubNode = vec_get((*a).subs, mid)
+            if sub.transactional {
+                if !contract_has_schema(a, c) {
+                    tc_emit(tc, sub.lo, sub.hi, "transactional requires a store-backed contract")
+                }
+            }
             mut j: int64 = 0
             while j < sub.pledges_len {
                 pid: int64 = vec_get((*a).kids, sub.pledges_off + j)

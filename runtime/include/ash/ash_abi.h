@@ -226,6 +226,41 @@ typedef struct AshRef {
     void*          user;        /* passed through to write_back untouched */
 } AshRef;
 
+/* One column of a schema: its name and the scalar tag a row's field carries in
+ * that slot. The seven scalars are the whole vocabulary a flat row holds, so ty
+ * is one of Int, UInt, Float, Bool, Byte, Char, String; a composite never
+ * reaches a column, refused at the type checker before a descriptor is emitted.
+ * The columns ride in declaration order, and the first is the schema's primary
+ * key, the convention Store.find, update, and delete key against. */
+typedef struct AshSchemaCol {
+    const char* name;
+    uint32_t    ty;    /* AshTypeTag of the column, always a scalar */
+} AshSchemaCol;
+
+/* One schema of a store-backed contract: the table it names, its column count,
+ * and its columns in declaration order. The runtime reconciles this against the
+ * live database at sign, creating the table when absent and validating it
+ * column for column when present, so the shape a contract signed against is the
+ * shape it operates against or the sign never lands. */
+typedef struct AshSchemaDesc {
+    const char*         table;
+    uint32_t            ncols;
+    const AshSchemaCol* cols;
+} AshSchemaDesc;
+
+/* The subcontract flag bits, carried in a byte array parallel to the subs name
+ * table, one entry per subcontract in declaration order. ASH_SUB_TRANSACTIONAL
+ * marks a subcontract whose pledges run as one all or nothing episode: the
+ * runtime opens a transaction on the first fulfillment of one of its pledges,
+ * commits the instant the subcontract completes, and rolls back on the first
+ * Err or at a break before the commit. The bits ride their own array so the
+ * subs table and every descriptor ashc emitted before the store layer stay
+ * byte identical; a NULL sub_flags reads as all zero, the loose grouping every
+ * earlier contract carried. */
+enum {
+    ASH_SUB_TRANSACTIONAL = 1
+};
+
 /* The requirements surface rides at the tail of the contract descriptor so a
  * zero-filled handwritten descriptor stays valid: no atoms and no lines means
  * the runtime applies the structural default policy over subs and loose
@@ -234,7 +269,14 @@ typedef struct AshRef {
  * the compiler's static satisfiability check and the runtime evaluate the
  * same trees. subs lists every subcontract in declaration order, anonymous
  * ones as NULL entries, so a pledge's sub index and a sub atom resolve
- * against one table. */
+ * against one table.
+ *
+ * The schema surface, nschemas and schemas, appends at the tail so a
+ * zero-filled handwritten descriptor and every module ashc emitted before the
+ * store layer read as nschemas 0: no schema, not store-backed, signed with no
+ * database. A store-backed contract carries one entry per declared schema, and
+ * the runtime reads them at sign to reconcile the tables and to route a
+ * Store.* primitive against the right one. */
 typedef struct AshContractDesc {
     const char*          name;
     uint64_t             shape_hash;
@@ -254,6 +296,14 @@ typedef struct AshContractDesc {
     const AshReqOp*      req_fulfill;
     const AshReqOp*      req_partial;
     const AshReqOp*      req_break;
+    uint32_t             nschemas;
+    const AshSchemaDesc* schemas;
+    /* One flag byte per subcontract, ASH_SUB_* bits, indexed by the same
+     * ordinal a pledge's sub field and a sub atom resolve against. NULL when no
+     * subcontract carries a flag, which is every descriptor emitted before the
+     * transactional modifier and every handwritten one, so the field is a pure
+     * tail addition the runtime reads beside the subs table. */
+    const uint8_t*       sub_flags;
 } AshContractDesc;
 
 /* A vow override a host supplies at sign. The value is copied onto the

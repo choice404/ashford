@@ -51,14 +51,13 @@ A pledge body reads and writes through the standard library store module, `lib/a
 pledge debit(id: Int, amount: Float) -> Result<Unit, PaymentError> {
     let acct = Store.find(Accounts, id)?
     match acct {
-        None => Err(PaymentError.NoSuchAccount(id)),
-        Some(row) => {
+        None -> { return Err(NoSuchAccount(id)) }
+        Some(row) -> {
             if row.balance < amount {
-                Err(PaymentError.Insufficient(id))
-            } else {
-                Store.update(Accounts, id, Accounts { balance: row.balance - amount })?
-                Ok(Unit)
+                return Err(Insufficient(id))
             }
+            Store.update(Accounts, id, Accounts { balance: row.balance - amount })?
+            return Ok(Unit)
         }
     }
 }
@@ -108,7 +107,7 @@ Storage adds one status, the store layer's single genuinely new failure, numbere
 |---|---|
 | `ASH_ERR_STORE` | the backend could not complete a store operation |
 
-`ASH_ERR_STORE` is the backend failing to do what it was told: a connection lost mid fulfillment, a disk with no room, a commit a constraint refused, a `dsn` that would not open. It rides back through the future the host already waits on, the same channel every fulfillment error uses, so a host's store error handling has one place to live. It is deliberately narrow. A contract's own rules, an overdrawn account, an unknown id, a duplicate the contract means to reject, are the contract's errors, returned as values in the contract's own error type, `PaymentError` and its variants, not folded into `ASH_ERR_STORE`. The status is for the store failing the runtime, not for the contract failing its business. A `CHECK` constraint the schema did not ask for is the backend's refusal and is `ASH_ERR_STORE`; a balance the pledge checks and rejects is `Err(PaymentError.Insufficient)` and is the contract working.
+`ASH_ERR_STORE` is the backend failing to do what it was told: a connection lost mid fulfillment, a disk with no room, a commit a constraint refused, a `dsn` that would not open. It rides back through the future the host already waits on, the same channel every fulfillment error uses, so a host's store error handling has one place to live. It is deliberately narrow. A contract's own rules, an overdrawn account, an unknown id, a duplicate the contract means to reject, are the contract's errors, returned as values in the contract's own error type, `PaymentError` and its variants, not folded into `ASH_ERR_STORE`. The status is for the store failing the runtime, not for the contract failing its business. A `CHECK` constraint the schema did not ask for is the backend's refusal and is `ASH_ERR_STORE`; a balance the pledge checks and rejects is `Err(Insufficient)` and is the contract working.
 
 ## Concurrency
 

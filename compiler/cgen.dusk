@@ -81,6 +81,21 @@ export func collect(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vector<PlI
     }
 }
 
+// The contract's schemas in declaration order, their arena ids, the order the
+// descriptor table and every Store.* index share.
+export func collect_schemas(g: *Cg, cid: int64, out: *Vector<int64>) -> void {
+    a: *Ast = (*g).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_schema() {
+            vec_push(out, vec_get((*a).kids, c.members_off + i + 1))
+        }
+        i = i + 2
+    }
+}
+
 // The contract's version attribute, defaulting to 1.
 export func contract_version(g: *Cg, c: ContractNode) -> int64 {
     a: *Ast = (*g).ast
@@ -134,6 +149,32 @@ export func shape_string(g: *Cg, cid: int64, vows: *Vector<VowInfo>, pls: *Vecto
         free(sig)
         sb_push_char(b, 59)
         j = j + 1
+    }
+    // The schemas join the signature after the pledges, each its name then its
+    // columns in declaration order under the same canonical type spellings, so
+    // a column added, renamed, retyped, or reordered moves the shape hash and a
+    // host that signed against the old shape fails the sign the way the iname
+    // table already made it fail for a changed pledge.
+    schemas: *Vector<int64> = alloc(vec_new())
+    collect_schemas(g, cid, schemas)
+    mut k: int64 = 0
+    while k < vec_len(schemas) {
+        sc: SchemaNode = vec_get((*a).schemas, vec_get(schemas, k))
+        rs: RecSig = sig_rec(s, sc.name)
+        sb_push(b, "schema ")
+        sb_push(b, ast_name(a, sc.name))
+        sb_push_char(b, 58)
+        mut ci: int64 = 0
+        while ci < rs.len {
+            f: FieldSig = sig_field(s, rs.off, ci)
+            if ci > 0 { sb_push_char(b, 44) }
+            sb_push(b, ast_name(a, f.name))
+            sb_push_char(b, 58)
+            sb_push(b, ty_canon_str((*g).ty, f.ty))
+            ci = ci + 1
+        }
+        sb_push_char(b, 59)
+        k = k + 1
     }
     out: string = substring(sb_cstr(b), 0, sb_size(b))
     sb_free(b)
@@ -214,6 +255,48 @@ func emit_vows(g: *Cg, cid: int64, cname: string, vows: *Vector<VowInfo>) -> voi
             cg_unsupported(g, v.lo, v.hi, "a vow of this type in a compiled module")
         }
         i = i + 1
+    }
+    cg_top(g, "};")
+    cg_top(g, "")
+}
+
+// Emits the schema descriptor tables of one contract: one AshSchemaCol array
+// per schema, its columns in declaration order at their scalar tags, then one
+// AshSchemaDesc array the contract descriptor points at. A contract with no
+// schema emits nothing and reads as not store-backed, the zero the descriptor
+// tail defaults to. The row shape is read back from the schema's RecSig, the
+// same one the row record and the shape hash share, so the descriptor and the
+// language surface can never disagree on a column.
+func emit_schemas(g: *Cg, cid: int64, cname: string, schemas: *Vector<int64>) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    if vec_len(schemas) == 0 { return }
+    mut i: int64 = 0
+    while i < vec_len(schemas) {
+        sc: SchemaNode = vec_get((*a).schemas, vec_get(schemas, i))
+        sname: string = ast_name(a, sc.name)
+        rs: RecSig = sig_rec(s, sc.name)
+        cg_top(g, tmsg7("static const AshSchemaCol k_", cname, "_", sname, "_cols[] = {", "", ""))
+        mut ci: int64 = 0
+        while ci < rs.len {
+            f: FieldSig = sig_field(s, rs.off, ci)
+            tag: string = cg_tag_of(g, f.ty)
+            cg_top(g, tmsg7("    { \"", ast_name(a, f.name), "\", ", tag, " },", "", ""))
+            ci = ci + 1
+        }
+        cg_top(g, "};")
+        cg_top(g, "")
+        i = i + 1
+    }
+    cg_top(g, tmsg3("static const AshSchemaDesc k_", cname, "_schemas[] = {"))
+    mut j: int64 = 0
+    while j < vec_len(schemas) {
+        sc2: SchemaNode = vec_get((*a).schemas, vec_get(schemas, j))
+        sname2: string = ast_name(a, sc2.name)
+        rs2: RecSig = sig_rec(s, sc2.name)
+        head: string = tmsg7("    { \"", sname2, "\", ", int_to_string(rs2.len), ", k_", cname, tmsg3("_", sname2, "_cols },"))
+        cg_top(g, head)
+        j = j + 1
     }
     cg_top(g, "};")
     cg_top(g, "")
@@ -384,6 +467,13 @@ func emit_contract(g: *Cg, cid: int64) -> void {
         cj = cj + 1
     }
 
+    // The schema descriptor tables come before the thunks so a Store.* call in
+    // a body can name the descriptor by symbol; a compiled body references
+    // k_<C>_schemas, so it must already be declared above it.
+    schemas: *Vector<int64> = alloc(vec_new())
+    collect_schemas(g, cid, schemas)
+    emit_schemas(g, cid, cname, schemas)
+
     version: int64 = contract_version(g, c)
     shape: string = shape_string(g, cid, vows, pls)
     shash: int64 = fnv1a64(shape)
@@ -438,6 +528,35 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     }
     re: ReqEmit = emit_reqs(g, cid, cname, sub_ids, sub_names, pl_pids, pl_subs)
 
+    // The subcontract flag bytes, one per subcontract in the same declaration
+    // order the subs table and every sub atom index share, so the runtime reads
+    // a subcontract's transactional bit off the ordinal the requirements
+    // evaluator already groups by. The array is emitted only when a subcontract
+    // wears the modifier; a contract without one references NULL and its
+    // descriptor stays byte identical to what it emitted before the store layer.
+    mut any_txn: bool = false
+    mut si: int64 = 0
+    while si < vec_len(sub_ids) {
+        stx: SubNode = vec_get((*a).subs, vec_get(sub_ids, si))
+        if stx.transactional { any_txn = true }
+        si = si + 1
+    }
+    mut subflags_ref: string = "NULL"
+    if any_txn {
+        cg_top(g, tmsg3("static const uint8_t k_", cname, "_sub_flags[] = {"))
+        mut sk: int64 = 0
+        while sk < vec_len(sub_ids) {
+            stx2: SubNode = vec_get((*a).subs, vec_get(sub_ids, sk))
+            mut bit: string = "0"
+            if stx2.transactional { bit = "ASH_SUB_TRANSACTIONAL" }
+            cg_top(g, tmsg3("    ", bit, ","))
+            sk = sk + 1
+        }
+        cg_top(g, "};")
+        cg_top(g, "")
+        subflags_ref = tmsg3("k_", cname, "_sub_flags")
+    }
+
     hex: string = hash_hex16(shash)
     mut pl_ref: string = "NULL"
     if vec_len(pls) > 0 { pl_ref = tmsg3("k_", cname, "_pledges") }
@@ -464,6 +583,10 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     cg_top(g, tmsg7("    ", atoms_ref, ", ", has_reqs_text, ",", "", ""))
     cg_top(g, tmsg7("    ", int_to_string(re.nfulfill), ", ", int_to_string(re.npartial), ", ", int_to_string(re.nbreak), ","))
     cg_top(g, tmsg7("    ", rf_ref, ", ", rp_ref, ", ", rb_ref, ","))
+    mut sch_ref: string = "NULL"
+    if vec_len(schemas) > 0 { sch_ref = tmsg3("k_", cname, "_schemas") }
+    cg_top(g, tmsg5("    ", int_to_string(vec_len(schemas)), ", ", sch_ref, ","))
+    cg_top(g, tmsg3("    ", subflags_ref, ","))
     cg_top(g, "};")
     cg_top(g, "")
 }

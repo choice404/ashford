@@ -93,6 +93,16 @@ AshStatus ash_store_query(AshStore* s, const char* sql,
                           const AshString* col_names /*nullable*/, size_t ncols,
                           const AshStoreAlloc* alloc, AshValue* rows_out);
 
+/* Reconciles a schema with the live database on this connection: an absent
+ * table is created to match the schema exactly, one CREATE TABLE from the
+ * declared shape with the first column as the primary key, so a fresh database
+ * is a working one; a present table is validated column for column, name and
+ * declared storage type in declaration order, and a divergence is ASH_ERR_TYPE.
+ * An empty schema or one whose column type is not a scalar is ASH_ERR_TYPE; a
+ * backend failure is ASH_ERR_STORE. No ALTER is ever issued: reconcile is
+ * create or validate, never migrate, which is v1's whole schema defense. */
+AshStatus ash_store_reconcile(AshStore* s, const AshSchemaDesc* schema);
+
 /* The transaction primitives. S0 wires their implementations and tests their
  * round trip; S1 and S2 drive them from a transactional subcontract's fate. A
  * begin over an already open transaction, or a commit or rollback with none

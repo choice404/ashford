@@ -388,6 +388,34 @@ AshStatus ash_value_deep_copy(AshContract* c, const AshValue* src,
 AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
                            size_t* need);
 
+/* ---- the store surface ---- */
+
+/* The runtime primitives lib/ashstd/store lowers onto. Each resolves the store
+ * connection from the instance the pledge runs against, binds every value it
+ * carries as a positional parameter so a string is a string and never SQL, and
+ * lands its result in out as an ordinary AshValue owned by the instance, dead
+ * at its break like every other value. A schema descriptor names the table and
+ * its columns in declaration order; the first column is the primary key the key
+ * argument matches. A backend failure is ASH_ERR_STORE, returned through the
+ * pledge the way every fulfillment error rides the wait; the contract's own
+ * rules stay values in its own error type and never reach this status.
+ *
+ * find looks one row up by primary key and lands Ok(Some(row)) or Ok(None).
+ * insert adds one row from a record whose fields are the schema's columns in
+ * order, and update replaces a keyed row's columns from the same shape; both
+ * land Ok(Unit). delete removes a row by key and lands Ok(Unit). Every out is a
+ * Result whose Ok arm the primitive builds; the Err arm is the surface's, never
+ * reached here because a backend failure is the status, not a value. */
+AshStatus ash_store_find(AshContract* c, const AshSchemaDesc* schema,
+                         const AshValue* key, AshValue* out);
+AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* row, AshValue* out);
+AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* key, const AshValue* row,
+                           AshValue* out);
+AshStatus ash_store_delete(AshContract* c, const AshSchemaDesc* schema,
+                           const AshValue* key, AshValue* out);
+
 #ifdef __cplusplus
 }
 #endif

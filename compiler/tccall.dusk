@@ -395,6 +395,135 @@ func call_ident(tc: *Tc, cn: ExprNode, e: ExprNode) -> int64 {
     return ty_unknown(t)
 }
 
+// The schema of the given name declared in the contract, its arena id, or -1
+// when the contract declares no such schema. Store.* operations name a schema
+// this way, and codegen counts the same walk to index the descriptor.
+export func find_schema(tc: *Tc, cid: int64, name: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    if cid < 0 { return -1 }
+    c: ContractNode = vec_get((*a).contracts, cid)
+    mut i: int64 = 0
+    while i < c.members_len {
+        mkind: int64 = vec_get((*a).kids, c.members_off + i)
+        if mkind == mk_schema() {
+            schid: int64 = vec_get((*a).kids, c.members_off + i + 1)
+            sc: SchemaNode = vec_get((*a).schemas, schid)
+            if sc.name == name { return schid }
+        }
+        i = i + 2
+    }
+    return -1
+}
+
+// Whether the base of a member call is the bare Store namespace: an identifier
+// spelling Store that no local shadows and no contract owns. A contract named
+// Store keeps its sign path, and a local named Store is an ordinary value, so
+// the namespace is magic only when nothing else claims the name.
+func is_store_ns(tc: *Tc, base_id: int64) -> bool {
+    a: *Ast = (*tc).ast
+    be: ExprNode = vec_get((*a).exprs, base_id)
+    if be.kind != xk_ident() { return false }
+    if !str_eq(ast_name(a, be.a), "Store") { return false }
+    if lookup(tc, be.a) >= 0 { return false }
+    g: GEntry = rs_global((*tc).res, be.a)
+    return g.kind != gk_contract()
+}
+
+// One Store.* operation: find, insert, update, or delete, each naming a schema
+// declared in the same contract. The first argument is the schema name, read as
+// a bare identifier rather than inferred as a value, and the rest are the key
+// and the row the operation binds. A row is the schema's record, so find yields
+// Result<Option<Row>, StoreError>, and the write forms yield Result<Unit,
+// StoreError>; a store failure rides that Result's Err, the surface's one new
+// value. query is the bound predicate form and lands in S2, so it is named as
+// not yet supported rather than guessed at.
+func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    op: string = ast_name(a, mname)
+    err_ty: int64 = ty_named(t, "StoreError")
+    if str_eq(op, "query") {
+        // The schema name is not a value, so the arguments are left un-inferred
+        // rather than faulted one by one for a form that lands in S2.
+        tc_emit(tc, e.lo, e.hi, "not yet supported: Store.query, the bound predicate form arrives in S2")
+        return ty_unknown(t)
+    }
+    if !str_eq(op, "find") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg3("Store has no operation '", op, "'"))
+        return ty_unknown(t)
+    }
+    if (*tc).cur_cid < 0 {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, "a Store operation runs only inside a contract pledge")
+        return ty_unknown(t)
+    }
+    if e.c < 1 {
+        tc_emit(tc, e.lo, e.hi, tmsg3("Store.", op, " names a schema as its first argument"))
+        return ty_unknown(t)
+    }
+    a0: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b))
+    a0e: ExprNode = vec_get((*a).exprs, a0.expr)
+    if a0e.kind != xk_ident() {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg3("the first argument of Store.", op, " is a schema name"))
+        return ty_unknown(t)
+    }
+    schid: int64 = find_schema(tc, (*tc).cur_cid, a0e.a)
+    if schid < 0 {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg5("no schema '", ast_name(a, a0e.a), "' in this contract for Store.", op, ""))
+        return ty_unknown(t)
+    }
+    sc: SchemaNode = vec_get((*a).schemas, schid)
+    row_ty: int64 = ty_named(t, ast_name(a, sc.name))
+    rs: RecSig = sig_rec((*tc).sigs, sc.name)
+    mut pk_ty: int64 = ty_unknown(t)
+    if rs.found {
+        if rs.len > 0 { pk_ty = sig_field((*tc).sigs, rs.off, 0).ty }
+    }
+    // The argument shapes per operation. The count is checked first, then each
+    // trailing argument against the key or row type the schema fixes.
+    mut want: int64 = 2
+    if str_eq(op, "update") { want = 3 }
+    if e.c != want {
+        tc_emit(tc, e.lo, e.hi, tmsg_count(tmsg3("Store.", op, " takes "), want, tmsg_count(" arguments, got ", e.c, "")))
+    }
+    if str_eq(op, "find") || str_eq(op, "delete") {
+        check_store_arg(tc, e, 1, pk_ty, "the key")
+        if str_eq(op, "find") {
+            return ty_result(t, ty_option(t, row_ty), err_ty)
+        }
+        return ty_result(t, ty_unit(t), err_ty)
+    }
+    if str_eq(op, "insert") {
+        check_store_arg(tc, e, 1, row_ty, "the row")
+        return ty_result(t, ty_unit(t), err_ty)
+    }
+    // update: key then row.
+    check_store_arg(tc, e, 1, pk_ty, "the key")
+    check_store_arg(tc, e, 2, row_ty, "the row")
+    return ty_result(t, ty_unit(t), err_ty)
+}
+
+// One trailing argument of a Store operation, checked against the type the
+// schema fixes for that position. An argument past the end is absent, already
+// reported by the count check, so nothing is inferred for it.
+func check_store_arg(tc: *Tc, e: ExprNode, idx: int64, want: int64, what: string) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    if idx >= e.c { return }
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + idx))
+    ae: ExprNode = vec_get((*a).exprs, arg.expr)
+    if arg.label >= 0 {
+        tc_emit(tc, ae.lo, ae.hi, "named arguments are used only with sign")
+    }
+    at: int64 = infer_expr(tc, arg.expr, want)
+    if !compat(t, want, at) {
+        tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, tmsg3(what, " of the Store operation expects ", ""), want, ", got ", at))
+    }
+}
+
 export func infer_call(tc: *Tc, e: ExprNode) -> int64 {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
@@ -405,6 +534,9 @@ export func infer_call(tc: *Tc, e: ExprNode) -> int64 {
         }
     }
     if cn.kind == xk_member() {
+        if is_store_ns(tc, cn.a) {
+            return check_store_op(tc, e, cn.b)
+        }
         scid: int64 = static_contract(tc, cn.a)
         if scid >= 0 {
             be: ExprNode = vec_get((*a).exprs, cn.a)

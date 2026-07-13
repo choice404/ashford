@@ -325,12 +325,20 @@ func collect_members(r: *Resolved, cid: int64) -> void {
     a: *Ast = (*r).ast
     c: ContractNode = vec_get((*a).contracts, cid)
     cname: string = ast_name(a, c.name)
+    cg: GEntry = rs_global(r, c.name)
     mut have_req: bool = false
     mut i: int64 = 0
     while i < c.members_len {
         mkind: int64 = vec_get((*a).kids, c.members_off + i)
         mid: int64 = vec_get((*a).kids, c.members_off + i + 1)
-        if mkind == mk_vow() {
+        if mkind == mk_schema() {
+            // A schema stands up a row record of the same name, so the row a
+            // pledge reads is an ordinary record: the name joins the global
+            // namespace as a record, the sig builder gives it a RecSig from the
+            // columns, and every record machinery downstream works unchanged.
+            sc: SchemaNode = vec_get((*a).schemas, mid)
+            declare_global(r, gk_record(), mid, cg.pkg, sc.name, sc.lo, sc.hi)
+        } else if mkind == mk_vow() {
             v: VowNode = vec_get((*a).vows, mid)
             declare_member(r, cid, cname, mk_vow(), mid, -1, v.name, v.lo, v.hi)
         } else if mkind == mk_pledge() {

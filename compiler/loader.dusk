@@ -271,7 +271,7 @@ func shift_spans(a: *Ast, m: Marks, base: int64) -> void {
     i = m.subs
     while i < vec_len(subs) {
         sb2: SubNode = vec_get(subs, i)
-        vec_set(subs, i, SubNode { name: sb2.name, lo: sb2.lo + base, hi: sb2.hi + base, pledges_off: sb2.pledges_off, pledges_len: sb2.pledges_len })
+        vec_set(subs, i, SubNode { name: sb2.name, lo: sb2.lo + base, hi: sb2.hi + base, pledges_off: sb2.pledges_off, pledges_len: sb2.pledges_len, transactional: sb2.transactional })
         i = i + 1
     }
     reqs: *Vector<ReqNode> = (*a).reqs

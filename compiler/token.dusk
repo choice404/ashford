@@ -107,6 +107,8 @@ export func keyword_name(text: string) -> string {
     if str_eq(text, "clause") { return "Clause" }
     if str_eq(text, "provisional") { return "Provisional" }
     if str_eq(text, "subcontract") { return "Subcontract" }
+    if str_eq(text, "transactional") { return "Transactional" }
+    if str_eq(text, "schema") { return "Schema" }
     if str_eq(text, "requirements") { return "Requirements" }
     if str_eq(text, "incorporate") { return "Incorporate" }
     if str_eq(text, "internal") { return "Internal" }
@@ -139,6 +141,8 @@ export func is_keyword_range(s: string, lo: int64, hi: int64) -> bool {
     if str_eq_range(s, lo, hi, "clause") { return true }
     if str_eq_range(s, lo, hi, "provisional") { return true }
     if str_eq_range(s, lo, hi, "subcontract") { return true }
+    if str_eq_range(s, lo, hi, "transactional") { return true }
+    if str_eq_range(s, lo, hi, "schema") { return true }
     if str_eq_range(s, lo, hi, "requirements") { return true }
     if str_eq_range(s, lo, hi, "incorporate") { return true }
     if str_eq_range(s, lo, hi, "internal") { return true }

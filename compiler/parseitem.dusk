@@ -328,6 +328,12 @@ func parse_member(p: *Parser, members: *Vector<int64>) -> void {
         vec_push(members, id5)
         return
     }
+    if p_kw(p, "schema") {
+        id7: int64 = parse_schema(p)
+        vec_push(members, mk_schema())
+        vec_push(members, id7)
+        return
+    }
     if p_kw(p, "requirements") {
         id6: int64 = parse_requirements(p)
         vec_push(members, mk_requirements())
@@ -336,6 +342,44 @@ func parse_member(p: *Parser, members: *Vector<int64>) -> void {
     }
     p_error(p, expected_found(p, "a contract member"))
     p_bump(p)
+}
+
+// schema IDENT "{" NL { IDENT ":" Type [ "," ] NL } "}". A column is a
+// name:type pair, the same FieldDecl shape a record field carries, separated by
+// a newline or a comma so both the block form and the inline form of
+// docs/database.md parse. The columns share their kids slice with the row
+// record the schema stands up, so a pledge reads a row as an ordinary record.
+func parse_schema(p: *Parser) -> int64 {
+    lo: int64 = p_lo(p)
+    p_bump(p)
+    name: int64 = p_ident(p)
+    hi: int64 = p_prev_hi(p)
+    cols: *Vector<int64> = alloc(vec_new())
+    p_expect(p, k_lbrace(), "'{' to open the schema body")
+    mut reading: bool = true
+    while reading {
+        if p_at(p, k_rbrace()) {
+            reading = false
+        } else if p_at_end(p) {
+            reading = false
+        } else {
+            before: int64 = (*p).pos
+            cname: int64 = p_ident(p)
+            p_expect(p, k_colon(), "':' between the column name and its type")
+            ty: int64 = parse_type(p)
+            vec_push(cols, ast_field(p_ast(p), cname, ty))
+            // A comma separates two columns on one line; otherwise a newline
+            // ends the column, so both the block form and the inline form parse.
+            if p_eat(p, k_comma()) {
+            } else {
+                p_sep(p, "expected a newline or ',' after the schema column")
+            }
+            p_guard_progress(p, before, "expected a column in the schema body")
+        }
+    }
+    p_expect_close(p, "the schema body is not closed; expected '}' before end of input")
+    off, len := ast_kids(p_ast(p), cols)
+    return ast_schema(p_ast(p), SchemaNode { name: name, lo: lo, hi: hi, cols_off: off, cols_len: len })
 }
 
 // pledge IDENT "(" [ Params ] ")" "->" Type [ Attrs ] [ Block ]. The body is
@@ -420,6 +464,15 @@ func parse_subcontract(p: *Parser) -> int64 {
     if p_at(p, k_ident()) {
         name = p_ident(p)
     }
+    // The transactional modifier rides after the name and before the body, so a
+    // subcontract's pledges become one all or nothing episode. The flag is
+    // parsed here and the type checker later confines it to a store-backed
+    // contract; a subcontract without the word groups loosely as it always did.
+    mut transactional: bool = false
+    if p_kw(p, "transactional") {
+        p_bump(p)
+        transactional = true
+    }
     hi: int64 = p_prev_hi(p)
     pledges: *Vector<int64> = alloc(vec_new())
     p_expect(p, k_lbrace(), "'{' to open the subcontract body")
@@ -445,7 +498,7 @@ func parse_subcontract(p: *Parser) -> int64 {
     }
     p_expect_close(p, "the subcontract body is not closed; expected '}' before end of input")
     off, len := ast_kids(p_ast(p), pledges)
-    return ast_sub(p_ast(p), SubNode { name: name, lo: lo, hi: hi, pledges_off: off, pledges_len: len })
+    return ast_sub(p_ast(p), SubNode { name: name, lo: lo, hi: hi, pledges_off: off, pledges_len: len, transactional: transactional })
 }
 
 // Attrs ::= "[" IDENT ":" Literal { "," IDENT ":" Literal } "]". The known
