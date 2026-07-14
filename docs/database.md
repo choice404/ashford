@@ -68,12 +68,11 @@ The surface is small and every operation returns a `Result` so a store failure i
 | operation | shape | returns |
 |---|---|---|
 | `Store.find(S, key)` | look up one row by primary key | `Result<Option<Row>, StoreError>` |
-| `Store.query(S, where)` | rows matching a bound predicate | `Result<List<Row>, StoreError>` |
 | `Store.insert(S, row)` | add one row | `Result<Unit, StoreError>` |
 | `Store.update(S, key, row)` | replace a row's columns by key | `Result<Unit, StoreError>` |
 | `Store.delete(S, key)` | remove a row by key | `Result<Unit, StoreError>` |
 
-A row is a `Record` whose fields are the schema's columns in declaration order, so `find` returns `Some(row)` or `None`, `query` returns a list, and the write forms return `Unit`. The connection every operation uses is the current instance's, resolved from the pledge's own context, so a store operation never names a connection and never reaches another instance's. Every value bound into an operation crosses as a parameter, positionally bound in the prepared statement, never concatenated into text, so a string column holding `'; drop table` is a string and nothing else. Rows read out are decoded onto the instance the way every result is, so a row lives on the instance heap and dies at the instance's break, one lifetime rule from the language surface down to the database driver.
+A row is a `Record` whose fields are the schema's columns in declaration order, so `find` returns `Some(row)` or `None` and the write forms return `Unit`. A set of rows or a join across schemas is composed in the pledge from several keyed reads. The connection every operation uses is the current instance's, resolved from the pledge's own context, so a store operation never names a connection and never reaches another instance's. Every value bound into an operation crosses as a parameter, positionally bound in the prepared statement, never concatenated into text, so a string column holding `'; drop table` is a string and nothing else. Rows read out are decoded onto the instance the way every result is, so a row lives on the instance heap and dies at the instance's break, one lifetime rule from the language surface down to the database driver.
 
 ## Transactions
 
@@ -124,7 +123,7 @@ Named so nothing is discovered missing by surprise. Each has a place to land lat
 - **NoSQL and key value stores.** v1 is relational: a schema is a table and a row is flat. A document or key value backend behind the same `AshStore` vtable, with its own schema shape, is a later layer.
 - **Postgres and other servers.** The vtable is built for a second backend and SQLite is the only one wired in v1. A server backend adds a driver, not a language change.
 - **Migrations.** A schema reconciles with a live table by create or validate; altering an existing table to a changed schema is a migration, and v1 fails the sign on divergence rather than pretend to migrate.
-- **A query language surface.** `Store.query` takes a bound predicate, not arbitrary SQL, and joins across schemas are composed in the pledge from several reads. Raw SQL in the language is not a v1 feature.
+- **A query language surface.** The store surface reads one row at a time by primary key through `Store.find`, and a set of rows or a join across schemas is composed in the pledge from several keyed reads. A bound predicate query form, `Store.query`, and arbitrary SQL in the language are later steps, neither a v1 feature.
 - **Cross instance and distributed transactions.** A transaction lives on one instance's connection. Two instances do not share one transaction, and nothing coordinates a commit across two databases.
 - **Connection pooling.** One instance holds one connection for its life. A shared pool under many short lived instances is future work and a runtime concern only, invisible to the surface.
 - **A prepared statement cache.** Statements are prepared per operation in v1; caching them per connection is a backend optimization with no surface effect.

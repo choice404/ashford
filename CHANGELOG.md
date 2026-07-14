@@ -5,6 +5,44 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.2.5] the store in the second language
+
+Layer 3 closes the way every layer here closes, with a second language driving it
+and the reference made normative. The store is invisible to the binding, which is
+the point: a contract backed by a database signs and fulfills from Python with the
+same calls a local contract does.
+
+- give the Python binding the store layer's one status, `ASH_ERR_STORE` in the
+  constant block and the status names, readable in the second language
+- add the Python ledger host, the twin of the C one: it signs the compiled Ledger
+  against a temp SQLite file with a dsn override, opens accounts and reads their
+  balances, rewrites a row, binds an injection string the table survives, and
+  drives the transactional Transfer to a commit and a rollback, asserting the
+  outcomes the C hosts assert
+- hold the business boundary from Python: an overdraft is `Err(Insufficient)` with
+  an `ASH_OK` delivery and moves no balance, never a store status
+- add test-store-python beside test-python and test-net-python, skipping clean
+  where python3 is absent
+- record the schema descriptor in the ABI reference, `AshSchemaCol` and
+  `AshSchemaDesc` and the schema and sub_flags tail of `AshContractDesc`, with the
+  transactional bit
+- write the schema block and the transactional subcontract modifier into the
+  normative grammar, columns the seven scalars and transactional on a store backed
+  subcontract alone
+- mark the store design normative, its surface the four keyed operations with a
+  set of rows composed from reads
+- carry the store story and its gates into the README
+
+### Notes
+
+A row crosses to Python as a record, the `ASH_TY_RECORD` arm the binding already
+decodes, its fields the schema's columns in order. The demo reads balances through
+fresh, loose, autocommit instances the way the C host does, so a committed transfer
+is visible to a later sign and a rolled back one leaves the file as it was. The
+store surface is four operations keyed by the primary key, find, insert, update,
+and delete; a set of rows or a join is composed in a pledge from several reads, and
+a bound predicate query form is a later step on the same surface.
+
 ## [v0.2.4] the store under failure
 
 The store's one new failure proven to be exactly what the design says, and the

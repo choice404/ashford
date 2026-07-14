@@ -47,7 +47,7 @@ subcontract requirements incorporate internal   record
 import      let         mut         return      if
 else        match       while       for         in
 break       continue    is          either      or
-true        false
+true        false       schema      transactional
 ```
 
 Contextual keywords, ordinary identifiers except in the positions named:
@@ -162,12 +162,15 @@ A provisional clause is a clause template. A contract that incorporates one must
 
 ```text
 ContractDecl ::= [ "internal" ] "contract" IDENT [ Attrs ] "{" NL { Member NL } "}"
-Member       ::= Incorporate | VowDecl | PledgeDecl | ClauseDecl
+Member       ::= Incorporate | VowDecl | SchemaDecl | PledgeDecl | ClauseDecl
                | SubcontractDecl | RequirementsBlock
 
 Incorporate  ::= "incorporate" IDENT
 
 VowDecl      ::= "vow" IDENT ":" Type [ "=" Expr ]
+
+SchemaDecl   ::= "schema" IDENT "{" NL { ColumnDecl NL } "}"
+ColumnDecl   ::= IDENT ":" Type
 
 PledgeDecl   ::= "pledge" IDENT "(" [ Params ] ")" "->" Type [ Attrs ] [ Block ]
 
@@ -176,7 +179,7 @@ ClauseDecl   ::= "clause" IDENT "(" [ Params ] ")" "->" Type Block
 Params       ::= Param { "," Param }
 Param        ::= IDENT ":" Type
 
-SubcontractDecl ::= "subcontract" [ IDENT ] "{" NL { PledgeDecl NL } "}"
+SubcontractDecl ::= "subcontract" [ IDENT ] [ "transactional" ] "{" NL { PledgeDecl NL } "}"
 ```
 
 Semantic notes.
@@ -186,6 +189,8 @@ Semantic notes.
 - A vow initializer must be a constant expression of the vow type. A vow without an initializer must be supplied at sign time.
 - Clauses are not first class. A clause is callable by bare name only inside its own contract.
 - Subcontracts do not nest. An anonymous subcontract cannot be named in a `requirements` block.
+- A `schema` names a table and its columns for a store-backed contract. A column type is one of the seven scalars a flat row holds, `Int`, `UInt`, `Float`, `Bool`, `Byte`, `Char`, or `String`; a composite column type is a type error. The first column is the schema's primary key. A contract may declare more than one schema, one per table it touches, and the schema is vow shaped: it joins the shape hash and locks at sign. A contract that declares at least one schema is store-backed and must carry a `dsn` vow, or the sign fails unbound.
+- The `transactional` modifier runs a subcontract's pledges as one all-or-nothing episode and is allowed only on a subcontract in a store-backed contract. Its pledges commit together when the subcontract completes and roll back on the first `Err` or at a break before the commit; a subcontract without the modifier groups for the policy alone, its pledges autocommit.
 
 ## Requirements
 

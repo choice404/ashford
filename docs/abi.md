@@ -170,6 +170,17 @@ typedef struct AshVowDesc {
     AshValue    default_value;
 } AshVowDesc;
 
+typedef struct AshSchemaCol {
+    const char* name;
+    uint32_t    ty;           /* AshTypeTag of the column, always a scalar */
+} AshSchemaCol;
+
+typedef struct AshSchemaDesc {
+    const char*         table;
+    uint32_t            ncols;
+    const AshSchemaCol* cols;
+} AshSchemaDesc;
+
 typedef struct AshContractDesc {
     const char*          name;
     uint64_t             shape_hash;
@@ -189,12 +200,23 @@ typedef struct AshContractDesc {
     const AshReqOp*      req_fulfill;
     const AshReqOp*      req_partial;
     const AshReqOp*      req_break;
+    uint32_t             nschemas;
+    const AshSchemaDesc* schemas;
+    const uint8_t*       sub_flags;    /* one ASH_SUB_* byte per subcontract */
 } AshContractDesc;
 ```
 
 Pledges and vows appear in declaration order. A vow whose declaration carried an initializer has `has_default` set and the literal encoded in `default_value`; a string default points at bytes inside the module. Signing copies every vow value onto the instance, so nothing an instance reads aliases the descriptor after sign.
 
 `subs` names every subcontract in declaration order, an anonymous one as a NULL entry, and each pledge's `sub` indexes it, -1 for a pledge declared outside any subcontract. A `sub` outside `[0, nsubs)` reads as loose, which is what a zero-filled handwritten descriptor gets. The atom table, the `has_reqs` flag, and the three postfix policy programs are the requirements surface, described in their own section below; a handwritten descriptor that carries none of them gets the structural default policy.
+
+The schema surface and the subcontract flags append at the tail, so a zero-filled handwritten descriptor and every module compiled before the store layer read as `nschemas` 0 with a NULL `sub_flags`: no schema, not store-backed, and every subcontract loose. `schemas` carries one `AshSchemaDesc` per schema a store-backed contract declared, each naming a table, its column count, and its columns in declaration order. An `AshSchemaCol`'s `ty` is one of the seven scalar tags a flat row holds, `Int`, `UInt`, `Float`, `Bool`, `Byte`, `Char`, or `String`; a composite never reaches a column, refused at the type checker before a descriptor is emitted. The first column is the schema's primary key, the convention the store operations key against. The runtime reads the schemas at sign to reconcile the tables and to route a store operation against the right one. `sub_flags` is one byte per subcontract, indexed by the same ordinal a pledge's `sub` field and a sub atom resolve against, carrying the `ASH_SUB_*` bits:
+
+```c
+enum { ASH_SUB_TRANSACTIONAL = 1 };
+```
+
+`ASH_SUB_TRANSACTIONAL` marks a subcontract whose pledges run as one all-or-nothing episode: the runtime opens a transaction on the first fulfillment of one of its pledges, commits the instant the subcontract completes, and rolls back on the first `Err` or at a break before the commit. The bits ride their own array so the subs table and every descriptor emitted before the store layer stay byte identical, and a NULL `sub_flags` reads as all zero, the loose grouping every earlier contract carried. Both tails are pure additions the shape hash already covers, never a change to an existing field.
 
 ## The registrar
 

@@ -44,7 +44,7 @@
 @import cgenbin
 
 func version_string() -> string {
-    return "ashc 0.0.1 (M0 spike)"
+    return "ashc 0.2.4"
 }
 
 func usage() -> void {
@@ -232,13 +232,36 @@ func push_arg(cmd: *StringBuilder, arg: string) -> void {
     free(q)
 }
 
+// The runtime include directory the emitted C compiles against. ASH_ROOT, when
+// set, points at a toolchain checkout so ashc runs from any working directory;
+// unset it falls back to the relative path a run from the repository root uses.
+func runtime_include() -> string {
+    r: string = env("ASH_ROOT")
+    if str_len(r) > 0 {
+        return join2(r, "/runtime/include")
+    }
+    return "runtime/include"
+}
+
+// The directory libashrt lives in, target/ashc-out under ASH_ROOT when set, the
+// relative build directory otherwise.
+func runtime_libdir() -> string {
+    r: string = env("ASH_ROOT")
+    if str_len(r) > 0 {
+        return join2(r, "/target/ashc-out")
+    }
+    return "target/ashc-out"
+}
+
 // Compiles the emitted C into a shared library with cc. Returns the cc exit
 // code, zero on success.
 func link_module(cpath: string, sopath: string) -> int64 {
     cmd: *StringBuilder = alloc(sb_new())
     sb_push(cmd, "cc -shared -fPIC")
     push_arg(cmd, cpath)
-    sb_push(cmd, " -I runtime/include -o")
+    sb_push(cmd, " -I ")
+    sb_push(cmd, runtime_include())
+    sb_push(cmd, " -o")
     push_arg(cmd, sopath)
     linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))
     sb_free(cmd)
@@ -258,11 +281,18 @@ func link_module(cpath: string, sopath: string) -> int64 {
 // Returns the cc exit code, zero on success.
 func link_bin(wpath: string, cpath: string, binpath: string) -> int64 {
     cmd: *StringBuilder = alloc(sb_new())
+    libdir: string = runtime_libdir()
     sb_push(cmd, "cc")
     push_arg(cmd, wpath)
     push_arg(cmd, cpath)
-    sb_push(cmd, " -I runtime/include -L target/ashc-out -lashrt")
+    sb_push(cmd, " -I ")
+    sb_push(cmd, runtime_include())
+    sb_push(cmd, " -L ")
+    sb_push(cmd, libdir)
+    sb_push(cmd, " -lashrt")
     push_arg(cmd, "-Wl,-rpath,$ORIGIN")
+    sb_push(cmd, " -Wl,-rpath,")
+    sb_push(cmd, libdir)
     sb_push(cmd, " -o")
     push_arg(cmd, binpath)
     linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))

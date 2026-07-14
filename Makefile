@@ -54,7 +54,7 @@ MODULE_LEDGER := $(OUT)/libledger.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
@@ -248,6 +248,21 @@ test-store-stress-tsan: $(MODULE_LEDGER) $(SQLITE_OBJ)
 	    tests/runtime/test_store_stress.c $(RT_UNITS) $(RT_SQLITE) \
 	    -ldl -o $(OUT)/test_store_stress_tsan
 	./$(OUT)/test_store_stress_tsan
+
+# The S4 Python store gate: the ctypes binding drives the compiled Ledger
+# against a temp SQLite file with no C written and no generated code, the store
+# twin of test-python and test-net-python. It signs with a dsn override, opens
+# accounts and reads their balances, rewrites a row, commits a good transfer and
+# rolls a bad one back, and asserts the same outcomes the C hosts assert, proving
+# the store is invisible to a foreign host. Skips cleanly where python3 is not
+# installed. ASan is not needed here, the runtime is a subprocess and the C store
+# gates already watch its allocations; libashrt is the ordinary build.
+test-store-python: $(RT_SO) $(MODULE_LEDGER)
+	@if command -v python3 >/dev/null 2>&1; then \
+	    python3 interop/python/demo_ledger.py; \
+	else \
+	    echo "[test-store-python] python3 not found, skipping"; \
+	fi
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.

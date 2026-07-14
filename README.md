@@ -89,7 +89,7 @@ target/dusk-out/ashc build --bin skeleton/main_demo.ash
 target/dusk-out/ashc emit-header skeleton/hello.ash
 ```
 
-`build` reads the source, emits the module C into `target/ashc-out/`, and links it with cc into a loadable `.ash.so`. Run it from the repository root, since it hands cc the relative include path.
+`build` reads the source, emits the module C into `target/ashc-out/`, and links it with cc into a loadable `.ash.so`. Run it from the repository root, since it hands cc the relative include path, or set `ASH_ROOT` to a checkout and run `ashc` from anywhere: `ASH_ROOT` points cc at the runtime headers and `libashrt`, and `ASH_HOME` at the standard library for imports.
 
 Ashford is a standalone language too. A program declares one `Main` contract with a `run(args: List<String>) -> Result<Int, E>` pledge, and `build --bin` links it into a real executable: `Ok(n)` becomes the exit code, `Err` prints itself to stderr and exits 1.
 
@@ -126,11 +126,26 @@ make test-net-python
 
 `make test-net-python` stands up two daemons on loopback, one under a token and one without, and runs `interop/python/demo_remote.py`, the remote twin of the local payment demo. It drives the same sign, fulfill, partial, and break sequence once from a module loaded in process and once over a connection, proves the two agree outcome for outcome, then walks the token matrix and kills the daemon mid fulfillment to watch the network's one new failure reach an in flight wait.
 
+The same contracts run backed by a database. A contract declares the table shape it needs as a `schema`, a vow like any other that locks at sign, binds a live database through a `dsn` vow, and its pledges read and write rows through the store standard library. A group of writes that must all land or all vanish is a `transactional` subcontract, the unit the language already had for all-or-nothing, so a transfer is a modifier and not a new idea. The database sits behind the contract, not in front of the host: the store is invisible across the C ABI, so a host signs, fulfills, and breaks a store-backed contract with the same calls it always used, and the storage never shows through. The reference backend is SQLite, vendored as the amalgamation and compiled into `libashrt`, so the store gates are hermetic and need no server. [docs/database.md](docs/database.md) is the normative store design.
+
+```sh
+# the Ledger skeleton over a temp SQLite file, from C
+make test-store
+
+# the transactional Transfer subcontract, commit and rollback
+make test-store-txn
+
+# the same ledger walk from Python, sign, transfer, rollback, over ctypes
+make test-store-python
+```
+
+`make test-store` signs the `Ledger` against a temp file, reconciles the `Accounts` schema into it, and drives the loose store pledges: `open` writes a row, `balance` reads one back, and `set_balance` rewrites one, each a `Result` whose `Err` is the ledger's own business and never a store status. `make test-store-txn` drives the transactional `Transfer`, a good transfer that commits both writes and a bad one that rolls the whole episode back, reopening the file each time so the file is the witness. `make test-store-python` runs `interop/python/demo_ledger.py`, the store twin of the payment demos, which asserts the same outcomes from Python that the C hosts assert, proving the store stays invisible in the second language too.
+
 ## Status
 
-The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. An `ashd` daemon serves those same contracts over TCP, and a client, C or Python, connects with `ash_runtime_connect` and signs, fulfills, and breaks across the wire with its host code unchanged, a shared token guarding the connection and a dropped connection surfacing as one new status through the wait a host already reads. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over both the pool and the socket, and network gates that stand up a real daemon hold the line on every build.
+The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. An `ashd` daemon serves those same contracts over TCP, and a client, C or Python, connects with `ash_runtime_connect` and signs, fulfills, and breaks across the wire with its host code unchanged, a shared token guarding the connection and a dropped connection surfacing as one new status through the wait a host already reads. Contracts run backed by a database too: a `schema` is a vow, a `transactional` subcontract is a transaction, and a SQLite backend vendored into the runtime persists the rows, the store invisible across the boundary. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over both the pool and the socket, network gates that stand up a real daemon, and store gates that sign a contract against a real SQLite file hold the line on every build.
 
-Layer 1 is complete, from the language surface through the memory model, threading, discovery, and a second language over the boundary, and Layer 2, the network runtime, runs. What remains is the layer beyond it: contracts backed by a database, schemas as vows and transactions as subcontracts.
+Layer 1 is complete, from the language surface through the memory model, threading, discovery, and a second language over the boundary; Layer 2, the network runtime, runs; and Layer 3, the store runtime, runs, contracts backed by a database with schemas as vows and transactions as subcontracts, driven from C and from Python alike.
 
 ## Requirements
 
