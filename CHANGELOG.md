@@ -5,6 +5,48 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.2.4] the store under failure
+
+The store's one new failure proven to be exactly what the design says, and the
+all or nothing claim proven to survive a crash mid transaction. A pure tests and
+gates milestone: every SQLite refusal already maps to `ASH_ERR_STORE`, so this
+proves the semantics rather than changing them, and no runtime code moves.
+
+- pin the store failure paths, all `ASH_ERR_STORE` through the wait with the
+  database left consistent: a read only connection refuses a loose insert and a
+  transactional debit, the debit rolled back; a duplicate primary key is the
+  backend's own constraint refusal, a status and not a value; a contended writer
+  that loses the file to an open transaction surfaces the status at once rather
+  than stalling
+- write the business boundary first and red: an overdraft is `Err(Insufficient)`,
+  the ledger's own rule as a value with an `ASH_OK` delivery, asserted never once
+  `ASH_ERR_STORE`, the line between a store layer and an ORM that swallows domain
+  logic
+- prove rollback on crash, the proof the layer rests on: a forked child opens a
+  transaction, buffers a debit, and is killed dead in it; the reopened file shows
+  the buffered debit gone, rolled back on the next open, and a twelve round sign
+  and kill loop leaves the file consistent every pass
+- stress concurrency: many threads sign one instance per transfer against one
+  shared file; the race loser is `ASH_ERR_STORE` and an overdraft a business
+  `Err`, but every transfer is whole, so the pool total is conserved to the unit
+  however the races fall, clean under ASan and LSan and race free under
+  ThreadSanitizer
+- keep the new gates out of the default all gate the way the other store and
+  daemon gates are, run on their own
+
+### Notes
+
+The contended loser is deterministic and immediate: SQLite returns `SQLITE_BUSY`
+without the busy handler in the reader upgrade deadlock case, so the loser is
+`ASH_ERR_STORE` at once, never a silent stall past the busy window. The stress ran
+into a standing runtime limit worth its own future work: an instance is tracked in
+a fixed table freed only at shutdown, and a break keeps the instance struct alive
+so a host can still read its partial report, so a broken instance holds its slot
+for the runtime's life and a run of signs is capped rather than unbounded. The
+stress is sized under the cap and a worker that reaches it stops clean, so
+conservation still stands; reclaiming a broken instance's slot is an instance
+lifetime redesign left for later.
+
 ## [v0.2.3] the all or nothing
 
 The store layer's headline. A transactional subcontract runs its pledges as one

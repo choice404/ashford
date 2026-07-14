@@ -54,7 +54,7 @@ MODULE_LEDGER := $(OUT)/libledger.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
@@ -186,6 +186,68 @@ test-store-txn: $(MODULE_LEDGER) $(SQLITE_OBJ)
 	    tests/runtime/test_store_txn.c $(RT_UNITS) $(RT_SQLITE) \
 	    -ldl -o $(OUT)/test_store_txn
 	./$(OUT)/test_store_txn
+
+# The S3 failure gate under ASan and LSan: ASH_ERR_STORE proven to be the store
+# failing the runtime and nothing else, and the business boundary proven to hold
+# against it. A read only connection made from a mode=ro dsn refuses every write
+# with ASH_ERR_STORE, a loose insert and a transactional debit both, the latter
+# rolled back; a duplicate primary key is the backend's own constraint refusal,
+# ASH_ERR_STORE and distinct from a value Err, and the table stands after it; a
+# contended writer that loses the file to an open transaction surfaces
+# ASH_ERR_STORE rather than a stall. The guard the milestone turns on is here
+# too: an overdraft is Err(Insufficient), the ledger's own rule as a value with
+# an ASH_OK delivery, never once a store status. Every persistence claim reopens
+# the file in a fresh instance so the file is the witness.
+test-store-fail: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_fail.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_fail
+	./$(OUT)/test_store_fail
+
+# The S3 durability gate under ASan and LSan: the rollback on crash proof the
+# whole store layer rests on. It forks a child that opens a transaction, buffers
+# a debit, signals over a pipe, and is SIGKILLed dead in the transaction; the
+# parent reopens the file and reads the account back to find the buffered debit
+# gone, rolled back on the next open. A sign kill loop drives that crash over and
+# over against one file, the balance never drifting and the reconcile never
+# refusing the shape, so a run of crashes cannot corrupt the store. The child
+# opens its own runtime because a pool does not cross a fork; it is SIGKILLed so
+# no sanitizer watches its allocations, while the parent shuts down clean.
+test-store-crash: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_crash.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_crash
+	./$(OUT)/test_store_crash
+
+# The S3 concurrency gate under ASan and LSan: many worker threads sign one
+# Ledger instance per transfer, each its own connection to one shared file, and
+# storm the pool with transactional transfers. The loser of a write race is
+# ASH_ERR_STORE and an overdraft is a business Err, but every transfer is whole
+# either way, so the money in the pool is conserved to the last unit no matter
+# how the races fall. The gate seeds a known total, runs the storm, and reads it
+# back on one thread: a drift is a half committed episode, and there is none.
+test-store-stress: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_stress.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_stress
+	./$(OUT)/test_store_stress
+
+# The S3 concurrency gate under ThreadSanitizer: the same storm of many
+# instances on one file, so TSan watches the pool, the waiters, and the per
+# instance lock that keeps each connection single threaded. The dlopened module
+# and the uninstrumented sqlite object are tolerated the way every other TSan
+# gate tolerates them; -rdynamic exports the ash_* symbols the module resolves
+# against. Not in the default all gate because it stands up the store under a
+# sanitizer; run it explicitly.
+test-store-stress-tsan: $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_store_stress.c $(RT_UNITS) $(RT_SQLITE) \
+	    -ldl -o $(OUT)/test_store_stress_tsan
+	./$(OUT)/test_store_stress_tsan
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.
