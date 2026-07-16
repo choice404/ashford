@@ -57,8 +57,13 @@ AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
  * successful connect the remote entries appear in lookup, enumeration, and the
  * canonical dump beside the local ones.
  *
- * Connect counts as registration and obeys the freeze law: ASH_ERR_STATE once
- * the runtime is frozen, exactly like ash_module_load. A remote name that
+ * Connect obeys the freeze law from the consume side. A runtime frozen with no
+ * server running refuses it with ASH_ERR_STATE, exactly like ash_module_load,
+ * the closed registration a pure client presents. A runtime that is serving does
+ * not: a consume edge extends only the remote surface a node never re-serves,
+ * never the frozen surface it offers, so a node may serve its own contracts and
+ * still open an edge to a peer, which is how two serving nodes form the
+ * symmetric pair a single freeze would otherwise deadlock. A remote name that
  * collides with a name already in the table, local or from another
  * connection, fails with ASH_ERR_NAME and merges nothing. A version the
  * daemon does not speak is ASH_ERR_VERSION; a refused token, an unreachable
@@ -103,6 +108,18 @@ AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr,
  * The runtime the server served is untouched and may still be shut down by its
  * owner afterward. */
 void      ash_server_stop(AshServer* server);
+
+/* Connects this runtime to each of n peers in turn, addrs[i] under tokens[i],
+ * the startup wiring a mesh node does written as one call over a config array.
+ * A NULL tokens makes every edge tokenless; otherwise tokens[i] is addrs[i]'s
+ * secret, NULL for a tokenless peer in that slot. The connects run in order
+ * through ash_runtime_connect and the first that fails returns its status at
+ * once, the edges opened before it left in place, so a caller wanting all or
+ * nothing shuts the runtime down on a failure. This is convenience over
+ * ash_runtime_connect and no more: no registry, no discovery, the addresses
+ * still explicit. ASH_ERR_TYPE on a NULL rt, or a NULL addrs with n nonzero. */
+AshStatus ash_runtime_connect_all(AshRuntime* rt, const char** addrs,
+                                  const char** tokens, size_t n);
 
 /* Called by a module's registrar. The runtime keeps the descriptor pointer,
  * it does not copy the tables. Registering also fills the iname table: one

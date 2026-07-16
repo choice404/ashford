@@ -237,6 +237,16 @@ struct AshRuntime {
     size_t                 ninames;
     size_t                 iname_cap;
     int                    frozen;
+
+    /* Live ash_runtime_serve handles on this runtime, guarded by lock. The
+     * freeze fixes the surface a node offers; a consume edge extends only the
+     * surface a node holds, which is never re-served, so a node that serves may
+     * still connect out past its own freeze. A runtime frozen with no server is
+     * a closed registration and connect stays ASH_ERR_STATE, the Layer 2 rule;
+     * a serving node reads nservers above zero and its consume side stays open,
+     * which is what lets two nodes each serve then connect and so form the
+     * symmetric pair a single freeze would otherwise deadlock. */
+    int                    nservers;
     pthread_mutex_t        lock;      /* guards the tables above */
 
     /* The handshake timeout ash_runtime_connect gives a daemon, resolved from
@@ -2708,6 +2718,34 @@ uint32_t ash_runtime_handshake_ms(const AshRuntime* rt) {
     return rt ? rt->handshake_ms : ASH_HANDSHAKE_MS_DEFAULT;
 }
 
+/* The serve loop lives in mesh.c, a separate unit that cannot see the runtime
+ * struct, so it reports a server's arrival and departure here. attach counts one
+ * live server so a frozen node keeps its consume side open; detach drops the
+ * count when a server stops, and a runtime back to zero servers is a closed
+ * registration again. Both take the runtime lock the connect gate reads under. */
+void ash_runtime_server_attach(AshRuntime* rt) {
+    if (!rt) return;
+    pthread_mutex_lock(&rt->lock);
+    rt->nservers++;
+    pthread_mutex_unlock(&rt->lock);
+}
+
+int ash_runtime_has_remotes(const AshRuntime* rt) {
+    if (!rt) return 0;
+    AshRuntime* mrt = (AshRuntime*)rt;
+    pthread_mutex_lock(&mrt->lock);
+    int has = mrt->nremotes > 0;
+    pthread_mutex_unlock(&mrt->lock);
+    return has;
+}
+
+void ash_runtime_server_detach(AshRuntime* rt) {
+    if (!rt) return;
+    pthread_mutex_lock(&rt->lock);
+    if (rt->nservers > 0) rt->nservers--;
+    pthread_mutex_unlock(&rt->lock);
+}
+
 /* ---- the client's remote surface ---- */
 
 static AshStatus error_status(const AshWireFrame* fr, const uint8_t* pl) {
@@ -3644,12 +3682,18 @@ static AshStatus remote_partial_error(AshContract* c, size_t idx,
 AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
                               const char* token) {
     if (!rt || !addr) return ASH_ERR_TYPE;
+    /* Connect obeys the freeze law from the consume side: a closed registration
+     * refuses it, but a serving node does not, because a consume edge grows only
+     * the remote surface a node never re-serves, never the frozen surface it
+     * offers. So the gate is frozen and not serving, which keeps a pure client's
+     * post-freeze connect the ASH_ERR_STATE Layer 2 pins while letting a node
+     * that already serves open the edge the symmetric pair needs. */
     pthread_mutex_lock(&rt->lock);
-    int frozen = rt->frozen;
+    int blocked = rt->frozen && rt->nservers == 0;
     uint32_t hs = rt->handshake_ms ? rt->handshake_ms
                                    : ASH_HANDSHAKE_MS_DEFAULT;
     pthread_mutex_unlock(&rt->lock);
-    if (frozen) return ASH_ERR_STATE;
+    if (blocked) return ASH_ERR_STATE;
 
     /* The connect itself is on the handshake clock, so a peer that drops its
      * SYNs cannot park the caller forever; the reads and writes of the HELLO

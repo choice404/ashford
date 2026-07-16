@@ -48,6 +48,23 @@ const AshValue* ash_instance_vow_value(const AshContract* c, size_t i);
  * NULL reads the default. */
 uint32_t        ash_runtime_handshake_ms(const AshRuntime* rt);
 
+/* The serve side's count of itself on the runtime. ash_runtime_serve calls
+ * attach once it is bound and accepting, ash_server_stop calls detach as it
+ * tears down, and the connect gate reads the count to keep a serving node's
+ * consume side open past its own freeze while a pure client's stays closed. The
+ * count lives on the runtime struct mesh.c cannot see, so it moves through
+ * these two calls under the runtime lock. */
+void            ash_runtime_server_attach(AshRuntime* rt);
+void            ash_runtime_server_detach(AshRuntime* rt);
+
+/* Whether the runtime has merged any remote origin from a connect. A node
+ * serves its local registrations only and never re-serves a remote it consumed,
+ * so ash_runtime_serve refuses once a consume edge has merged, which keeps a
+ * node serving before it connects and the served surface exactly its own. Reads
+ * the remote count under the runtime lock; the count lives on the struct mesh.c
+ * cannot see. */
+int             ash_runtime_has_remotes(const AshRuntime* rt);
+
 #ifdef __cplusplus
 }
 #endif

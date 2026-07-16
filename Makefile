@@ -51,10 +51,11 @@ MODULE_NETPAY := $(OUT)/libnet_payment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 MODULE_LEDGER := $(OUT)/libledger.ash.so
+MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
@@ -95,6 +96,9 @@ $(MODULE_STD): $(ASHC) skeleton/std_user.ash $(wildcard lib/ashstd/*.ash) runtim
 
 $(MODULE_LEDGER): $(ASHC) skeleton/ledger.ash lib/ashstd/store.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/ledger.ash
+
+$(MODULE_CALC): $(ASHC) skeleton/mesh_calc.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/mesh_calc.ash
 
 $(BIN_DEMO): $(ASHC) skeleton/main_demo.ash $(RT_SO) runtime/include/ash/ash_abi.h
 	$(ASHC) build --bin skeleton/main_demo.ash
@@ -438,6 +442,70 @@ test-mesh-serve: $(MODULE) $(SQLITE_OBJ)
 	    tests/net/test_mesh_serve.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_serve
 	./$(OUT)/test_mesh_serve $(MODULE)
 
+# The B1 symmetric node gate under ASan and LSan: two runtimes in one process,
+# each serving one contract and connecting to the other, so each is a provider and
+# a consumer at once. Node A serves Greeter and consumes B's PaymentService, node B
+# serves PaymentService and consumes A's Greeter, and two host threads drive the
+# two edges at once so one runtime's serve loop and its own reader run together,
+# the coexistence B1 pins. The runtime is compiled in so the sanitizer watches
+# both accept loops, every connection thread and waiter, and both client readers
+# across the two serves, the two connects, and the two stops; the dlopened modules
+# are uninstrumented, which ASan tolerates, and -rdynamic exports the ash_* symbols
+# they resolve against. No harness process is needed: the servers bind and listen
+# before serve returns, so the connects that follow cannot race the listen.
+test-mesh-pair: $(MODULE) $(MODULE_NETPAY) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/net/test_mesh_pair.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_pair
+	./$(OUT)/test_mesh_pair $(MODULE) $(MODULE_NETPAY)
+
+# The B1 gate under ThreadSanitizer, the main risk proof: one runtime serving on
+# its connection threads and pool while its own reader thread completes a
+# fulfillment it made as a client, both directions concurrent across the pair. TSan
+# watches the serve side and the connect side of a single runtime for a race the
+# two edges could open. The dlopened modules are not instrumented, which TSan
+# tolerates; -rdynamic exports the ash_* symbols they resolve against. Explicit,
+# never in the default all gate, because it runs two embedded servers under a
+# sanitizer.
+test-mesh-pair-tsan: $(MODULE) $(MODULE_NETPAY) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic $(RT_INC) \
+	    tests/net/test_mesh_pair.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_pair_tsan
+	./$(OUT)/test_mesh_pair_tsan $(MODULE) $(MODULE_NETPAY)
+
+# The B3 N node mesh gate under ASan and LSan: three nodes in one process, three
+# runtimes and three servers on three ports, each serving one contract and
+# connecting to the other two, so six one directional edges form a full three node
+# mesh. A storm of concurrent fulfillments crosses every edge and each result is
+# checked against its owner's exact answer, the routing proof that a sign resolves
+# one hop to the owner with no relay; a kill phase drops a node mid mesh and demands
+# ASH_ERR_NET on exactly the dead edges' in flight waits while the others hold; and
+# a memflat phase runs a serving node through a connect and drop loop so LSan proves
+# the instance reclaim leaves no leak. The runtime is compiled in so the sanitizer
+# watches all three accept loops, every connection thread and waiter, and all six
+# client readers; the dlopened modules are uninstrumented, which ASan tolerates, and
+# -rdynamic exports the ash_* symbols they resolve against. No harness process is
+# needed: the three serves bind and listen before the connects begin.
+test-mesh-stress: $(MODULE) $(MODULE_NETPAY) $(MODULE_CALC) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/net/test_mesh_stress.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_stress
+	./$(OUT)/test_mesh_stress $(MODULE) $(MODULE_NETPAY) $(MODULE_CALC)
+
+# The B3 gate under ThreadSanitizer, the milestone's main risk proof: three nodes'
+# serve sides and connect sides all running at once under a fulfillment storm, so
+# TSan watches every accept loop, connection thread, waiter, and client reader on
+# three runtimes for a race the six concurrent edges could open, and the kill and
+# memflat phases for a teardown race across a drop. The dlopened modules are not
+# instrumented, which TSan tolerates; -rdynamic exports the ash_* symbols they
+# resolve against. Explicit, never in the default all gate, because it stands up
+# three embedded servers under a sanitizer.
+test-mesh-stress-tsan: $(MODULE) $(MODULE_NETPAY) $(MODULE_CALC) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic $(RT_INC) \
+	    tests/net/test_mesh_stress.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_stress_tsan
+	./$(OUT)/test_mesh_stress_tsan $(MODULE) $(MODULE_NETPAY) $(MODULE_CALC)
+
 # The N2 transparency gate: ashd serves the payment module on loopback, and one
 # client links libashrt and runs the same sign, fulfill, partial, and break
 # sequence twice, once by loading the module locally and once by connecting to
@@ -486,6 +554,29 @@ test-net-python: $(RT_SO) $(MODULE_NETPAY) $(ASHD)
 	    tests/net/run_net_python.sh $(ASHD) $(MODULE_NETPAY); \
 	else \
 	    echo "[test-net-python] python3 not found, skipping"; \
+	fi
+
+# The B2 foreign language provider gate: a Python host binds a Python function
+# over the abstract PaymentService.charge and serves it as a mesh node, and a C
+# consumer connects and fulfills it and reads back the value Python computed, two
+# processes in two languages meeting at one contract. The harness stands the
+# Python provider up in the background, waits until it listens, runs the C
+# consumer against it, and asserts the cross language result; the consumer also
+# dials with a wrong token and demands ASH_ERR_NET, the provider refusing it
+# before any table crosses. The consumer links libashrt like any foreign host and
+# drives the ordinary connect, sign, fulfill surface, unaware its answers are
+# Python. Skips cleanly where python3 is absent, and has no TSan variant on
+# purpose: the TSan runtime cannot be mixed into an uninstrumented python3
+# process, so the serve concurrency stays covered by the C mesh-pair tsan gate.
+test-mesh-python: $(RT_SO) $(MODULE_PAY)
+	@mkdir -p $(OUT)
+	@if command -v python3 >/dev/null 2>&1; then \
+	    $(CC) $(CFLAGS) -pthread -I runtime/include \
+	        tests/net/test_mesh_python.c -L $(OUT) -lashrt \
+	        -Wl,-rpath,'$$ORIGIN' -o $(OUT)/test_mesh_python; \
+	    tests/net/run_mesh_python.sh $(OUT)/test_mesh_python; \
+	else \
+	    echo "[test-mesh-python] python3 not found, skipping"; \
 	fi
 
 # The N3 resilience gate: ashd serves the payment module on loopback and one

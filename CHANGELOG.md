@@ -5,6 +5,54 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.1] the mesh
+
+The serve call turned symmetric, and the bridge stands: many processes, each in
+any language, every node providing the contracts it implements and consuming the
+contracts its peers implement. A project's languages talk through contracts the
+way a program's modules talk through calls. The wire stays Layer 2's, no new frame
+and no new status.
+
+- make a node symmetric: connect gates on frozen and no server, so a serving
+  runtime opens a consume edge past its own freeze while a pure client frozen with
+  no server stays refused, the rule that lets two nodes each serve and then connect
+  to each other; a node tracks its live servers on the runtime under its lock,
+  attached when a serve binds and detached when it stops
+- keep a node's offered surface exactly its own: serving once a consume edge has
+  merged is `ASH_ERR_STATE`, so a node serves before it connects and never
+  re-serves a remote it consumed, one hop to the owner with no relay
+- make the provider side any language: add `Runtime.serve(addr, token=None)` to the
+  Python binding over the serve call, an opaque server handle with an idempotent
+  stop and a context manager, the token never logged; a Python node binds a Python
+  charge over the abstract pledge and serves it while a C peer connects and reads
+  the `Ok(true)` and `Err(41)` the live Python process computed, the callback
+  running on a runtime pool worker as every bound pledge does
+- wire a node to its peers in one call with `ash_runtime_connect_all`, a loop over
+  connect across an address and token array returning the first failure, still by
+  explicit address and with no registry
+- add Calculator, a third mesh contract named apart from Greeter and
+  PaymentService, its answers Int where the others are String and Bool
+- pin the mesh under load: two runtimes each serving one contract and consuming the
+  other's with both edges driven at once, and three nodes storming six edges where
+  three answer shapes make a misrouted sign fail rather than pass, so a green storm
+  is the one hop routing proof; a node dropped mid mesh lands `ASH_ERR_NET` on
+  exactly the dead edges' in flight waits with the untouched edges still
+  delivering, and a serving node absorbs a connect and drop loop with no leak, all
+  clean under ASan, LSan, and ThreadSanitizer
+- document the serve surface in the ABI reference beside connect, carry the mesh
+  section and its four gates into the README, and keep the mesh design normative
+  and matched to the serve call and the connect gate
+
+### Notes
+
+A mutual pair brings its edges up after it serves, not before: each node's connect
+wants its peer already serving, so if the freeze closed the consume side too
+neither could open its edge. The freeze fixes what a node offers; a consume edge
+extends only the remote surface a node never re-serves, so a serving node connects
+out past its own freeze and the pair bootstraps. The three node storm's proof rests
+on the answer shapes: String, Bool, and Int, so a sign that resolved to the wrong
+owner fails on its type rather than passing quietly.
+
 ## [v0.3.0] the serve call
 
 Layer 4 opens by making serving a call any host can make. The accept loop the

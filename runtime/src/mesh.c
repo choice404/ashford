@@ -850,6 +850,11 @@ AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr, const char* token,
     if (!rt || !addr || !out) return ASH_ERR_TYPE;
     *out = NULL;
 
+    /* A node serves what it registered locally and never re-serves a remote it
+     * consumed, so serving after a consume edge has merged is refused: a node
+     * serves before it connects, and its offered surface is exactly its own. */
+    if (ash_runtime_has_remotes(rt)) return ASH_ERR_STATE;
+
     AshServer* srv = (AshServer*)calloc(1, sizeof(AshServer));
     if (!srv) return ASH_ERR_OOM;
     srv->rt = rt;
@@ -875,9 +880,9 @@ AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr, const char* token,
     srv->token_len = tlen;
 
     /* Freeze first, then snapshot the dump: serve fixes the offered surface the
-     * moment a node is reachable, so a runtime is loaded, bound, connected to
-     * its peers, and only then served. Freeze is idempotent, so a host that
-     * already froze pays nothing here. */
+     * moment a node is reachable, so a runtime is loaded, bound, and served, and
+     * only then connected to its peers, its offered surface exactly its own
+     * locals. Freeze is idempotent, so a host that already froze pays nothing. */
     ash_runtime_freeze(rt);
     if (build_dump(srv) != 0) {
         free(srv->token);
@@ -904,6 +909,11 @@ AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr, const char* token,
         return ASH_ERR_OOM;
     }
     srv->accept_started = 1;
+
+    /* The server is bound and accepting, so the runtime is a node that serves;
+     * mark it so its consume side stays open past the freeze this call performed
+     * and a peer edge can be opened next. */
+    ash_runtime_server_attach(rt);
 
     *out = srv;
     return ASH_OK;
@@ -944,9 +954,35 @@ void ash_server_stop(AshServer* server) {
     }
 
     if (server->listen_fd >= 0) close(server->listen_fd);
+
+    /* This server is gone; drop its count on the runtime before the handle is
+     * freed, so a runtime back to no servers is a closed registration again and
+     * a later connect on it reads the frozen refusal, the way it did before the
+     * node ever served. */
+    ash_runtime_server_detach(server->rt);
+
     free(server->conns);
     free(server->dump);
     free(server->token);
     pthread_mutex_destroy(&server->conns_mu);
     free(server);
+}
+
+/* The static wiring convenience: open one consume edge per configured peer, in
+ * order, and stop at the first that fails. It is a loop over ash_runtime_connect
+ * and holds no state of its own, so every rule connect carries, the freeze gate a
+ * serving node passes and a pure client does not, the origin marked merge, the
+ * collision and version and net statuses, rides through unchanged. A caller that
+ * wants the mesh all or nothing reads the returned status and shuts the runtime
+ * down when it is not ASH_OK, since the edges opened before the failure stay
+ * open. */
+AshStatus ash_runtime_connect_all(AshRuntime* rt, const char** addrs,
+                                  const char** tokens, size_t n) {
+    if (!rt || (n && !addrs)) return ASH_ERR_TYPE;
+    for (size_t i = 0; i < n; i++) {
+        const char* tok = tokens ? tokens[i] : NULL;
+        AshStatus st = ash_runtime_connect(rt, addrs[i], tok);
+        if (st != ASH_OK) return st;
+    }
+    return ASH_OK;
 }

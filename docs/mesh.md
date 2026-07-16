@@ -49,12 +49,14 @@ down, drains the connection threads, and returns; a node may run more than one
 server, one per address it wants to be reachable at.
 
 Serving exposes the runtime's frozen iname table, the same table `ash_iname_dump`
-renders and the same one a connecting peer already merges. So serving obeys the
-freeze law from the far side that connect obeys from the near one: a runtime is
-loaded and bound, connected to its peers, frozen, and then served, and the table
-every peer fetches at handshake is the table every later sign resolves against.
+renders. A node is loaded and bound, then served, and only then connected to its
+peers, so the table every peer fetches at handshake is exactly the node's own
+local registrations, the surface every later sign against it resolves against.
 `ash_runtime_serve` before `ash_runtime_freeze` freezes the runtime itself, so the
-surface a node offers is fixed the moment it is reachable.
+offered surface is fixed the moment a node is reachable; and because a node serves
+its locals and never re-serves a remote it consumed, serving after a consume edge
+has merged is refused with `ASH_ERR_STATE`, which keeps a node serving before it
+connects and its offered surface exactly its own.
 
 ## What a node serves
 
@@ -82,7 +84,17 @@ frame. A mesh does not need that to change, because both nodes serve. When node 
 wants to call node B it connects to B's address, and when B wants to call A it
 connects to A's address. The two directions are two edges, each a plain Layer 2
 connection, each one directional, and together they are a full duplex
-conversation built out of parts that were already proven. A node that only
+conversation built out of parts that were already proven.
+
+A mutual pair brings its edges up after it serves, not before. Each node's
+connect wants its peer already serving, and serving fixes the offered surface
+behind the freeze, so if the freeze also closed the consume side neither node
+could open its edge and the pair would deadlock. It does not: the freeze fixes
+what a node offers, and a consume edge extends only the remote surface a node
+never re-serves, so a serving node connects out past its own freeze. Each node
+loads and binds, serves its own contracts, and then opens the edges to the peers
+it consumes, its offered surface fixed at the freeze and its consumed surface
+grown by the edges it opens after. A node that only
 consumes opens the one edge it needs; a node that only provides, the `ashd` case,
 opens none and waits to be connected to.
 
