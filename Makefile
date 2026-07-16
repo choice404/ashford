@@ -57,7 +57,13 @@ BIN_DEMO   := $(OUT)/main_demo
 
 .PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan tsan clean
 
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
+# The full suite, one gate per surface the language carries: the walking
+# skeleton, the runtime's own units, the compiled language, the store, the
+# network, and the mesh, with the thread sanitizer over the concurrency surface
+# last. The stress and sanitizer variants of the store, network, and mesh gates
+# stay out and are run on their own, since each is minutes of load on ground the
+# functional gate beside it already covers.
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
 
 runtime: $(RT_SO)
 

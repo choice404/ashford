@@ -5,6 +5,31 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.2] the whole suite
+
+Every layer the language carries now answers to one command. `make all` runs the
+walking skeleton, the runtime's units, the compiled language, the store, the
+network, and the mesh, and finishes in half a minute.
+
+- fold the store's gates into the default suite: the driver units, the ledger, the
+  transactional transfer, the failure paths, the crash durability proof, and the
+  Python store host
+- fold the mesh's gates in beside them: a host serving through the library call, the
+  symmetric pair driving both edges at once, and the Python provider a C peer
+  consumes
+- keep the stress and sanitizer variants of the store, network, and mesh out of the
+  default suite and run on their own, the treatment the network's own variants
+  already had, since each is minutes of load over ground the functional gate beside
+  it covers
+
+### Notes
+
+The suite is one gate per surface rather than every gate that exists, which is what
+keeps it a half minute command a build can afford to run every time. The variants
+left out, the thread sanitizer over the mesh pair and the network, and the stress
+runs over the store, the network, and the three node mesh, are the ones that take
+minutes each and are run deliberately.
+
 ## [v0.3.1] the mesh
 
 The serve call turned symmetric, and the bridge stands: many processes, each in
