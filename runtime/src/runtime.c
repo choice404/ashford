@@ -2704,6 +2704,10 @@ const AshValue* ash_instance_vow_value(const AshContract* c, size_t i) {
     return &c->vow_vals[i];
 }
 
+uint32_t ash_runtime_handshake_ms(const AshRuntime* rt) {
+    return rt ? rt->handshake_ms : ASH_HANDSHAKE_MS_DEFAULT;
+}
+
 /* ---- the client's remote surface ---- */
 
 static AshStatus error_status(const AshWireFrame* fr, const uint8_t* pl) {

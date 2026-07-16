@@ -20,7 +20,7 @@ OUT     := target/ashc-out
 # the shared library split into sources: the runtime, its wire codec, and the
 # socket helpers the codec and the client path lean on. Kept as one list so a
 # gate that links the runtime in gets net.c and wire.c with it.
-RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c runtime/src/store.c
+RT_UNITS := runtime/src/runtime.c runtime/src/net.c runtime/src/wire.c runtime/src/store.c runtime/src/mesh.c
 
 # The runtime now speaks to the store, so runtime.c references the driver in
 # store.c and its vendored SQLite; every gate that links the runtime in gets
@@ -54,7 +54,7 @@ MODULE_LEDGER := $(OUT)/libledger.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve tsan clean
 
 all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net2 test-net-python tsan
 
@@ -64,9 +64,9 @@ $(SQLITE_OBJ): runtime/third_party/sqlite3.c runtime/third_party/sqlite3.h
 	@mkdir -p $(OUT)
 	$(CC) $(SQLITE_FLAGS) -I runtime/third_party -c runtime/third_party/sqlite3.c -o $(SQLITE_OBJ)
 
-$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c runtime/src/ash_net.h runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h runtime/include/ash/ash_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
+$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c runtime/src/mesh.c runtime/src/ash_net.h runtime/src/ash_remote.h runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h runtime/include/ash/ash_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
+	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/net.c runtime/src/store.c runtime/src/mesh.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
 
 compiler: $(ASHC)
 
@@ -107,11 +107,13 @@ $(HOST): skeleton/host.c $(RT_SO)
 
 daemon: $(ASHD)
 
-# The network daemon: a small main over the runtime that loads modules,
-# freezes, and serves the frozen iname table over TCP. It links libashrt like
-# any foreign host and reaches the internal socket helpers through ash_net.h.
-$(ASHD): runtime/src/ashd.c runtime/src/ash_net.h $(RT_SO)
-	$(CC) $(CFLAGS) -pthread -I runtime/include -I runtime/src \
+# The network daemon: a thin main over the runtime that loads modules, loads a
+# token, and makes one ash_runtime_serve call, the accept loop and the dispatch
+# now living in libashrt. It links the library like any foreign host and needs
+# nothing but the public header; the serve loop it drives is the same code an
+# embedded server runs.
+$(ASHD): runtime/src/ashd.c $(RT_SO)
+	$(CC) $(CFLAGS) -pthread -I runtime/include \
 	    runtime/src/ashd.c -L $(OUT) -lashrt \
 	    -Wl,-rpath,'$$ORIGIN' -o $(ASHD)
 
@@ -414,12 +416,27 @@ test-net-tsan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_tsan
+	    runtime/src/net.c runtime/src/store.c runtime/src/mesh.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_handshake.c runtime/src/runtime.c runtime/src/wire.c \
 	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/test_handshake_tsan
 	tests/net/run_net.sh $(OUT)/ashd_tsan $(OUT)/test_handshake_tsan $(MODULE)
+
+# The B0 mesh gate under ASan and LSan: a plain C host, not the ashd binary,
+# stands a server up through ash_runtime_serve and a client drives it, both in
+# one process over two runtimes. The runtime is compiled in so the sanitizer
+# watches the accept loop, the connection threads, and the waiters the serve
+# call starts, every allocation to zero leaks across the serve and the stop; the
+# dlopened module is uninstrumented, which ASan tolerates, and -rdynamic exports
+# the ash_* symbols it resolves against. No harness process is needed because
+# serve and connect share the process: serve binds and listens before it
+# returns, so the client that connects next cannot race the listen.
+test-mesh-serve: $(MODULE) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/net/test_mesh_serve.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_mesh_serve
+	./$(OUT)/test_mesh_serve $(MODULE)
 
 # The N2 transparency gate: ashd serves the payment module on loopback, and one
 # client links libashrt and runs the same sign, fulfill, partial, and break
@@ -448,7 +465,7 @@ test-net2-tsan: $(MODULE_NETPAY)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_net2_tsan
+	    runtime/src/net.c runtime/src/store.c runtime/src/mesh.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_net2_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_remote.c runtime/src/runtime.c runtime/src/wire.c \
@@ -503,7 +520,7 @@ test-net-stress-tsan: $(MODULE_NETPAY)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    runtime/src/ashd.c runtime/src/runtime.c runtime/src/wire.c \
-	    runtime/src/net.c runtime/src/store.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_stress_tsan
+	    runtime/src/net.c runtime/src/store.c runtime/src/mesh.c $(RT_SQLITE) -ldl -o $(OUT)/ashd_stress_tsan
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic \
 	    -I runtime/include -I runtime/src \
 	    tests/net/test_stress.c runtime/src/runtime.c runtime/src/wire.c \

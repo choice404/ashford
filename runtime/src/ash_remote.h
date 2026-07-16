@@ -40,6 +40,14 @@ size_t          ash_instance_nvows(const AshContract* c);
 const char*     ash_instance_vow_name(const AshContract* c, size_t i);
 const AshValue* ash_instance_vow_value(const AshContract* c, size_t i);
 
+/* The resolved handshake clock the runtime carries, the same value connect
+ * gives a daemon and the value the serve loop reaps a stalled HELLO on. It is
+ * fixed at init from AshRuntimeConfig.handshake_ms and never zero: an init with
+ * no override reads the ten second default. The serve loop lives in mesh.c, a
+ * separate unit that cannot see the runtime struct, so it reads the clock here.
+ * NULL reads the default. */
+uint32_t        ash_runtime_handshake_ms(const AshRuntime* rt);
+
 #ifdef __cplusplus
 }
 #endif

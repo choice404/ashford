@@ -5,6 +5,47 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.0] the serve call
+
+Layer 4 opens by making serving a call any host can make. The accept loop the
+daemon ran is now a library entry point, so a process that links the runtime is a
+node: it serves the contracts it holds and connects to the contracts its peers
+hold, both at once, the symmetry the bridge is made of.
+
+- lift the server side into libashrt behind an opaque `AshServer` handle in the
+  new `runtime/src/mesh.c`: the connection table, the accept loop, the per
+  connection reader and waiter threads, the request dispatch for SIGN, FULFILL,
+  BREAK, and PARTIAL_QUERY, and the served dump snapshot
+- add `ash_runtime_serve`, which freezes the runtime if it is not, snapshots the
+  dump and its hash, binds the address, starts the accept loop on a background
+  thread, and returns an `AshServer` at once so the host keeps running
+- add `ash_server_stop`, which shuts the listener down, wakes and joins every
+  connection thread, breaks the instances they signed, and frees the handle
+- give each server its own state, one table and one listener and one stop flag per
+  handle guarded by the connection mutex, so two servers in one process share no
+  mutable state and cannot collide
+- rewrite `ashd` as a thin main over the serve call: parse args, load modules and
+  the token, serve, then block on SIGINT and SIGTERM and stop from its own thread;
+  the signal policy stays the daemon's, the library carries none
+- declare `ash_runtime_serve`, `ash_server_stop`, and `AshServer` in the ABI header
+  beside `ash_runtime_connect`, and speak the Layer 2 wire unchanged, no new frame
+  and no new status
+- add the test-mesh-serve gate: a plain C host serves a module through the library
+  call and a client drives Greeter over loopback, no daemon binary in sight, with
+  every network gate green over the lifted path and clean under ThreadSanitizer
+
+### Notes
+
+The daemon and an embedded server now run the exact same code, so the two cannot
+drift. Serving exposes the frozen iname table, the same one a connecting peer
+merges, so a node loads and binds, connects to its peers, freezes, and serves,
+with the surface it offers and the surface it consumes both fixed at the one
+freeze. A node serves its own registrations only and never re-serves a remote it
+consumed, so a sign is one hop to the owner with no relay and no routing. The stop
+flag moved from the daemon's `volatile sig_atomic_t`, a signal handler's handoff,
+to an `int` under the connection mutex, a thread to thread handoff with a real
+happens before.
+
 ## [v0.2.5] the store in the second language
 
 Layer 3 closes the way every layer here closes, with a second language driving it

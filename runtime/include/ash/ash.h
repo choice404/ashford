@@ -25,6 +25,7 @@ extern "C" {
 typedef struct AshRuntime  AshRuntime;
 typedef struct AshContract AshContract;
 typedef struct AshFuture   AshFuture;
+typedef struct AshServer   AshServer;
 
 /* ---- runtime lifecycle ---- */
 
@@ -71,6 +72,37 @@ AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
  * ASH_ERR_NET to every future still waiting on it. */
 AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
                               const char* token);
+
+/* Serves this runtime's frozen iname table over TCP, the far side of connect
+ * and the call that turns any host into a mesh node. addr is the host:port the
+ * node listens on; token is the shared secret every peer must present, NULL to
+ * accept peers without one. The runtime is frozen if it is not already, so the
+ * table a peer fetches at handshake is the table every later sign resolves
+ * against, then the dump and its hash are snapshot, the address is bound, and
+ * an accept loop is started on a background thread. The call returns at once
+ * with an AshServer handle in out, so the host keeps its calling thread to
+ * serve more, connect out, and do its own work while the loop runs behind it.
+ *
+ * A node serves the contracts it registered locally and only those; a remote
+ * origin merged from a peer is never re-served, so a sign is one hop to the
+ * owner and the served table is exactly this runtime's own dump. More than one
+ * server may run at once, one per address a node wants to be reachable at, each
+ * with its own token and its own connection threads.
+ *
+ * ASH_ERR_TYPE on a NULL rt, addr, or out; ASH_ERR_NET when the address will
+ * not bind; ASH_ERR_OOM when the dump or a thread cannot be had. The library
+ * carries no signal policy: a host that wants a SIGINT to stop a server installs
+ * its own handler and calls ash_server_stop from it, the way ashd's main does. */
+AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr,
+                            const char* token, AshServer** out);
+
+/* Stops a server: shuts the listener down, wakes and joins every connection
+ * thread the way a break drains a client's waiters, breaks every instance those
+ * connections signed, and frees the handle. Returns when the server is fully
+ * torn down and nothing it started is still running. A NULL server is a no-op.
+ * The runtime the server served is untouched and may still be shut down by its
+ * owner afterward. */
+void      ash_server_stop(AshServer* server);
 
 /* Called by a module's registrar. The runtime keeps the descriptor pointer,
  * it does not copy the tables. Registering also fills the iname table: one
