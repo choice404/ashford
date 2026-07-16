@@ -1,0 +1,89 @@
+// The step 1 bridge surface for skeleton/payment.ash, hand written to the
+// shape ashc emits in step 2. Every pledge is its own typed rpc, so a Go or
+// Java consumer gets the contract's argument and result types from protoc
+// alone, with no generic Value envelope and no language side dispatch on a
+// pledge name string. The vow is an optional field on the sign call, the
+// contract's own Result maps to a oneof, and the instance id threads the
+// session the C ABI got free from the connection.
+
+syntax = "proto3";
+package ashford.payment;
+
+// The sign call carries the vow overrides and the shape check, the two
+// things ash_contract_sign takes beside the contract name. currency unset
+// takes the declared default, matching the vows dict a Python host omits.
+message SignRequest {
+  optional string currency = 1;   // the vow; unset takes the declared default
+  uint64 expected_hash = 2;       // 0 skips the check
+}
+
+// The signature as the instance carries it: the id the session is keyed by,
+// the vow that actually landed, and the hash and timestamp the in process
+// host reads off the handle.
+message SignReply {
+  uint64 instance_id = 1;
+  string currency = 2;            // the effective vow after defaults and overrides
+  uint64 shape_hash = 3;
+  int64 signed_at = 4;
+}
+
+// Result<Bool, Int>: the contract's own Err is a value, not a transport
+// error. Every payment pledge declares this one return type, so one message
+// serves all four; a contract with distinct pledge results gets one result
+// message per shape.
+message BoolIntResult {
+  oneof result {
+    bool ok = 1;
+    int64 err = 2;
+  }
+}
+
+message ValidateCardRequest   { uint64 instance_id = 1; string card = 2; }
+message ValidateAmountRequest { uint64 instance_id = 1; double amount = 2; }
+message ChargeRequest         { uint64 instance_id = 1; string card = 2; double amount = 3; }
+message NotifyUserRequest     { uint64 instance_id = 1; bool ok = 2; }
+
+// The lifecycle states, ASH_UNSIGNED through ASH_BROKEN, in the runtime's
+// own numbering.
+enum ContractState {
+  UNSIGNED = 0;
+  SIGNED = 1;
+  FULFILLED = 2;
+  PARTIAL = 3;
+  BROKEN = 4;
+}
+
+message PledgeError { string pledge = 1; int64 err = 2; }
+
+message PartialRequest { uint64 instance_id = 1; }
+
+// The partial surface, name lists in the runtime's insertion order.
+// repeated, not map, so the order Ashford pins as normative survives the
+// wire.
+message PartialReply {
+  ContractState state = 1;
+  repeated string fulfilled = 2;
+  repeated string pending = 3;
+  repeated string broken = 4;
+  repeated PledgeError errors = 5;
+}
+
+message BreakRequest { uint64 instance_id = 1; }
+message BreakReply {}
+
+// Prototype only: the instance table is server internal and no shipped
+// contract surface should expose it. This exists so the client can watch the
+// orphan reaper collect an instance nobody broke.
+message DebugRequest {}
+message DebugReply { uint32 live_instances = 1; }
+
+service PaymentService {
+  rpc Sign(SignRequest) returns (SignReply);
+  rpc ValidateCard(ValidateCardRequest) returns (BoolIntResult);
+  rpc ValidateAmount(ValidateAmountRequest) returns (BoolIntResult);
+  rpc Charge(ChargeRequest) returns (BoolIntResult);
+  rpc NotifyUser(NotifyUserRequest) returns (BoolIntResult);
+  rpc GetPartial(PartialRequest) returns (PartialReply);
+  rpc Break(BreakRequest) returns (BreakReply);
+  rpc Debug(DebugRequest) returns (DebugReply);
+}

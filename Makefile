@@ -55,7 +55,7 @@ MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -636,6 +636,59 @@ tsan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=thread -g -pthread -rdynamic $(RT_INC) \
 	    skeleton/host.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/host_tsan
 	./$(OUT)/host_tsan
+
+# The gRPC bridge prototype: the payment contract served as a gRPC service,
+# one signed instance per session, driven by a client that holds no runtime
+# handle and knows its instance only by the uint64 the server issued. It
+# proves the walk demo_payment.py runs in process survives a process boundary
+# with the same answers, that a pledge's Err crosses as a value on an OK rpc
+# while an Ashford status crosses as a gRPC code, and that the orphan reaper
+# collects an instance nobody broke. Out of the all gate on purpose: this is a
+# prototype answering whether the session model works, not a shipped surface.
+#
+# grpcio is not in the system python3 here, so grpc-venv builds a venv the
+# gate prefers. The gate takes the venv if it has grpc, else the system
+# python3 if that has grpc, else skips clean the way test-python does.
+GRPCVENV := target/grpcvenv
+GRPC_GEN := target/grpc-gen
+GRPC_PROTO := interop/grpc/payment_bridge.proto
+
+grpc-venv:
+	@if [ ! -x $(GRPCVENV)/bin/python ]; then \
+	    echo "[grpc-venv] creating $(GRPCVENV)"; \
+	    python3 -m venv $(GRPCVENV) && \
+	    $(GRPCVENV)/bin/pip install --quiet --disable-pip-version-check \
+	        grpcio grpcio-tools; \
+	fi
+	@$(GRPCVENV)/bin/python -c \
+	    "import grpc; print('[grpc-venv] grpcio ' + grpc.__version__)"
+
+# The stubs are generated, never tracked: the .proto is the source and
+# grpc_tools regenerates from it, so a stale stub cannot outlive a change to
+# the contract surface.
+test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-grpc-bridge] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	mkdir -p $(GRPC_GEN); \
+	$$py -m grpc_tools.protoc -I interop/grpc \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    $(GRPC_PROTO) || exit 1; \
+	$$py interop/grpc/bridge_server.py --port 50251 --ttl 2.0 & \
+	srv=$$!; \
+	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
+	$$py interop/grpc/bridge_client.py --port 50251 --ttl 2.0; \
+	code=$$?; \
+	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	exit $$code
 
 smoke-asan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
