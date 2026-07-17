@@ -1,10 +1,17 @@
-// The step 1 bridge surface for skeleton/payment.ash, hand written to the
+// The step 1b bridge surface for skeleton/payment.ash, hand written to the
 // shape ashc emits in step 2. Every pledge is its own typed rpc, so a Go or
 // Java consumer gets the contract's argument and result types from protoc
 // alone, with no generic Value envelope and no language side dispatch on a
-// pledge name string. The vow is an optional field on the sign call, the
-// contract's own Result maps to a oneof, and the instance id threads the
-// session the C ABI got free from the connection.
+// pledge name string. The vow is an optional field on the sign call and the
+// contract's own Result maps to a oneof.
+//
+// Signing is a server streaming rpc, and that is the surface's one load
+// bearing decision. Session takes what sign takes and answers with a stream
+// whose first event is the signature. The stream stays open for the
+// instance's life, so the connection is the session again, exactly the
+// property the C ABI got free from the process. The unary pledge rpcs are
+// unchanged and still carry the instance id, because that is what protoc
+// turns into a typed call in a language with no Ashford binding.
 
 syntax = "proto3";
 package ashford.payment;
@@ -17,14 +24,24 @@ message SignRequest {
   uint64 expected_hash = 2;       // 0 skips the check
 }
 
-// The signature as the instance carries it: the id the session is keyed by,
-// the vow that actually landed, and the hash and timestamp the in process
-// host reads off the handle.
-message SignReply {
+// The signature as the instance carries it: the id the pledge rpcs are keyed
+// by, the vow that actually landed, and the hash and timestamp the in
+// process host reads off the handle.
+message Signed {
   uint64 instance_id = 1;
   string currency = 2;            // the effective vow after defaults and overrides
   uint64 shape_hash = 3;
   int64 signed_at = 4;
+}
+
+// What the session stream carries. Signed is the first event and today it is
+// the only one; the oneof is here because the stream's other job is holding
+// the session open, and anything a server later needs to push, a heartbeat, a
+// break the contract took on itself, arrives as another arm.
+message SessionEvent {
+  oneof event {
+    Signed signed = 1;
+  }
 }
 
 // Result<Bool, Int>: the contract's own Err is a value, not a transport
@@ -72,13 +89,16 @@ message BreakRequest { uint64 instance_id = 1; }
 message BreakReply {}
 
 // Prototype only: the instance table is server internal and no shipped
-// contract surface should expose it. This exists so the client can watch the
-// orphan reaper collect an instance nobody broke.
+// contract surface should expose it. This exists so the client can watch an
+// instance appear with its stream and leave with it.
 message DebugRequest {}
 message DebugReply { uint32 live_instances = 1; }
 
 service PaymentService {
-  rpc Sign(SignRequest) returns (SignReply);
+  // Signs, then holds. The first event carries the signature; the stream
+  // then stays open and empty for as long as the instance lives. Ending the
+  // stream, by close, by cancel, or by dying, ends the instance.
+  rpc Session(SignRequest) returns (stream SessionEvent);
   rpc ValidateCard(ValidateCardRequest) returns (BoolIntResult);
   rpc ValidateAmount(ValidateAmountRequest) returns (BoolIntResult);
   rpc Charge(ChargeRequest) returns (BoolIntResult);

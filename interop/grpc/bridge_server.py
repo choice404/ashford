@@ -1,34 +1,45 @@
 """bridge_server.py: one signed PaymentService instance per session, served
-over gRPC. The prototype Appendix III asks for first, because the session is
-the load bearing unknown: the C ABI got a session free from the connection
-and gRPC gives one back for nothing.
+over gRPC, where the session is a stream. Step 1 asked whether an instance can
+live behind gRPC and found that it can, easily, and that the hard question is
+who ends it. Step 1 answered that with an idle timer. This one answers it with
+the connection, which is the answer the C ABI always had.
 
-The runtime side is ordinary. ashford.py loads libashrt and libpayment.ash.so
-through ctypes, binds a Python charge over the abstract pledge exactly the way
-demo_payment.py does, and freezes. What is new sits above that: a table
-keyed by a server issued instance id, a lock over it, and a reaper thread
-that breaks instances nobody touched inside the TTL.
+The runtime side is unchanged and ordinary. ashford.py loads libashrt and
+libpayment.ash.so through ctypes, binds a Python charge over the abstract
+pledge exactly the way demo_payment.py does, and freezes. What sits above it is
+a table keyed by a server issued instance id, a lock per instance, and one
+rule.
+
+The rule: an instance lives exactly as long as its Session stream.
+
+  Session signs, yields the signature as the stream's first event, and then
+  blocks. The handler holds the instance for as long as the peer holds the
+  stream. gRPC calls the termination callback the moment the stream ends, for
+  any reason, and that callback breaks the instance and drops the row. There
+  is no window in which an instance exists without a stream: the id is issued
+  on the stream and cannot outlive it.
 
 Three lines this server holds, and they are the findings:
 
-  1. The instance id is the session. Every rpc carries it, the table resolves
-     it, an unknown one is NOT_FOUND. There is no other handle.
-  2. A pledge's Err is a value. The contract answering Err(41) is a BoolIntResult
-     with the err arm set and an OK rpc status. Only an Ashford status, a
-     fulfillment that did not run, becomes a gRPC error.
-  3. Nothing tells this server a client left. Unary gRPC has no disconnect
-     signal a handler can hang cleanup off, so idle TTL is the only reaping
-     rule available, and it is a guess about the client's intent.
+  1. The instance id is the session's name; the stream is the session. Every
+     pledge rpc carries the id, the table resolves it, an unknown one is
+     NOT_FOUND. The id names an instance only for as long as the stream that
+     issued it is up.
+  2. A pledge's Err is a value. The contract answering Err(41) is a
+     BoolIntResult with the err arm set and an OK rpc status. Only an Ashford
+     status, a fulfillment that did not run, becomes a gRPC error.
+  3. There is no timer in this file. Nothing here presumes anything about a
+     client from how long it has been quiet, because it no longer has to
+     guess: a client that left is a fact gRPC hands over.
 
-Run it directly: python bridge_server.py --port 50251 --ttl 2.0
+Run it directly: python bridge_server.py --port 50251
 """
 
 import argparse
 import sys
 import threading
-import time
 from concurrent import futures
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import grpc
@@ -46,6 +57,12 @@ import payment_bridge_pb2 as pb  # noqa: E402
 import payment_bridge_pb2_grpc as pb_grpc  # noqa: E402
 
 OUT = ROOT / "target" / "ashc-out"
+
+# A session holds a worker thread for the instance's whole life, so the pool
+# has to be wide enough for every live session plus the pledge calls driving
+# them. This is the price of the streaming session on a sync Python server and
+# it is a real number, not a detail.
+MAX_WORKERS = 32
 
 # The status map, and the whole point of the split. An Ashford status is a
 # transport or lifecycle failure: the fulfillment did not run. A contract's
@@ -83,22 +100,26 @@ def charge(inst, args):
 
 
 @dataclass(frozen=True)
-class Session:
-    """One signed instance and its liveness bookkeeping. Frozen: a touch
-    replaces the entry rather than mutating it, so a reader holding an entry
-    holds a consistent snapshot. The lock is per instance and guards the
-    contract handle itself against a reap racing a fulfillment."""
+class Instance:
+    """One signed instance. Frozen and never replaced: entries are written
+    once at sign and read until the stream drops them, because the liveness
+    bookkeeping that used to rewrite them existed only to feed a timer.
+
+    lock guards the contract handle against a pledge call in flight racing the
+    stream's termination. done releases the Session handler, and shutdown sets
+    it so a handler cannot outlive the server it belongs to."""
     instance_id: int
     contract: object
-    created: float
-    last_touched: float
     lock: threading.Lock
+    done: threading.Event
 
 
 class InstanceTable:
-    """The session store gRPC does not provide. Ids are server issued and
-    monotonic, never client supplied, so a peer cannot name an instance it
-    was not handed."""
+    """The session store gRPC does not provide, minus the half that was
+    guessing. Ids are server issued and monotonic, never client supplied, so a
+    peer cannot name an instance it was not handed. remove is atomic and
+    returns the entry only to its first caller, which is what makes ending a
+    session exactly once free: whoever pops the row owns the break."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -106,32 +127,15 @@ class InstanceTable:
         self._live = {}
 
     def insert(self, contract):
-        now = time.monotonic()
         with self._lock:
             iid = self._next_id
             self._next_id += 1
-            self._live[iid] = Session(instance_id=iid, contract=contract,
-                                      created=now, last_touched=now,
-                                      lock=threading.Lock())
-            return iid
+            inst = Instance(instance_id=iid, contract=contract,
+                            lock=threading.Lock(), done=threading.Event())
+            self._live[iid] = inst
+            return inst
 
-    def touch(self, instance_id):
-        """Resolves an id and marks it live in one step. The touch lands
-        before the caller takes the per instance lock, so a reaper already
-        holding that lock rechecks and stands down instead of breaking an
-        instance with a call in flight."""
-        with self._lock:
-            s = self._live.get(instance_id)
-            if s is None:
-                return None
-            fresh = replace(s, last_touched=time.monotonic())
-            self._live[instance_id] = fresh
-            return fresh
-
-    def peek(self, instance_id):
-        """Reads an entry without marking it live. The reaper needs this:
-        touching an instance it is deciding to reap would keep it alive
-        forever."""
+    def get(self, instance_id):
         with self._lock:
             return self._live.get(instance_id)
 
@@ -143,11 +147,6 @@ class InstanceTable:
         with self._lock:
             return len(self._live)
 
-    def idle_candidates(self, ttl):
-        cutoff = time.monotonic() - ttl
-        with self._lock:
-            return [s for s in self._live.values() if s.last_touched <= cutoff]
-
     def drain(self):
         with self._lock:
             out = list(self._live.values())
@@ -155,48 +154,12 @@ class InstanceTable:
             return out
 
 
-class Reaper(threading.Thread):
-    """The orphan collector, and the honest cost of this design. A unary gRPC
-    handler learns nothing about a client that walked away, so the only
-    available rule is idle time: an instance untouched for ttl seconds is
-    presumed abandoned, broken, and dropped. This is a guess. A slow client
-    and a dead client look identical from here."""
-
-    def __init__(self, table, ttl, interval):
-        super().__init__(daemon=True, name="ash-reaper")
-        self._table = table
-        self._ttl = ttl
-        self._interval = interval
-        self._stop = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        while not self._stop.wait(self._interval):
-            for s in self._table.idle_candidates(self._ttl):
-                with s.lock:
-                    # Recheck under the instance lock: a call that touched
-                    # the entry after the sweep read it is still in flight,
-                    # and its instance is not an orphan.
-                    current = self._table.peek(s.instance_id)
-                    if current is None:
-                        continue
-                    if current.last_touched > s.last_touched:
-                        continue
-                    self._table.remove(s.instance_id)
-                    _break_quietly(s)
-                    print(f"[bridge_server] reaped orphan instance "
-                          f"{s.instance_id} after {self._ttl}s idle",
-                          flush=True)
-
-
-def _break_quietly(session):
+def _break_quietly(inst):
     """Breaks an instance and swallows the state error a broken one answers.
-    An instance the contract already broke by itself is not an error to
-    reclaim."""
+    An instance the contract already broke by itself, or one that fulfilled,
+    is not an error to reclaim."""
     try:
-        session.contract.break_()
+        inst.contract.break_()
     except AshError as e:
         if e.status != ASH_ERR_STATE:
             raise
@@ -220,32 +183,64 @@ def _result_pb(value):
 
 
 class PaymentServicer(pb_grpc.PaymentServiceServicer):
-    """One servicer over one frozen runtime. Every handler is the same three
-    steps: resolve the id, run one runtime call under the instance lock, and
-    map what came back."""
+    """One servicer over one frozen runtime. Every pledge handler is the same
+    three steps: resolve the id, run one runtime call under the instance lock,
+    and map what came back. Session is the one handler that is not shaped like
+    that, because it is the one that owns a lifetime."""
 
     def __init__(self, rt, table):
         self._rt = rt
         self._table = table
 
-    def _session(self, instance_id, context):
-        s = self._table.touch(instance_id)
+    def _instance(self, instance_id, context):
+        s = self._table.get(instance_id)
         if s is None:
             context.abort(grpc.StatusCode.NOT_FOUND,
                           f"unknown instance {instance_id}")
         return s
 
     def _fulfill(self, context, instance_id, pledge, *args):
-        s = self._session(instance_id, context)
+        s = self._instance(instance_id, context)
         with s.lock:
             try:
                 return _result_pb(s.contract.fulfill_sync(pledge, *args))
             except AshError as e:
                 _abort(context, e)
 
-    # ---- signing ----
+    def end_session(self, instance_id, reason):
+        """Ends a session, once. The table pop is the arbiter: the termination
+        callback, the handler's own exit, and shutdown all call this, and only
+        the caller that pops the row breaks the instance.
 
-    def Sign(self, request, context):
+        The order matters. The row goes first, so no new pledge call can
+        resolve the id while the break is in flight. Then the instance lock,
+        which waits out any call admitted before the row went, so a body that
+        was already running finishes against a live instance instead of one
+        being torn down under it. Then the break."""
+        s = self._table.remove(instance_id)
+        if s is None:
+            return
+        s.done.set()
+        with s.lock:
+            _break_quietly(s)
+        print(f"[bridge_server] session {instance_id} ended ({reason}), "
+              f"instance broken and dropped", flush=True)
+
+    # ---- the session, which is the signing rpc ----
+
+    def Session(self, request, context):
+        """Sign, hand back the signature, hold the instance for as long as the
+        peer holds the stream.
+
+        This is the whole finding of step 1b in one handler. The id is issued
+        on the stream, so there is no window where an instance exists that no
+        stream owns, and no orphan for a timer to guess at. add_callback fires
+        on termination for every way a stream can end: an explicit cancel, a
+        channel close, a client process that died, a network that dropped. It
+        returns False if the rpc is already over, which is the one case the
+        callback cannot cover, so that case ends the session inline. The
+        finally is the third path and it is free, because ending is idempotent
+        by the table."""
         vows = None
         if request.HasField("currency"):
             vows = {"currency": request.currency}
@@ -254,11 +249,27 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
                               expected_hash=request.expected_hash)
         except AshError as e:
             _abort(context, e)
-        iid = self._table.insert(c)
-        print(f"[bridge_server] signed instance {iid}, currency "
+
+        inst = self._table.insert(c)
+        iid = inst.instance_id
+        print(f"[bridge_server] session {iid} signed, currency "
               f"{c.vow('currency')}", flush=True)
-        return pb.SignReply(instance_id=iid, currency=c.vow("currency"),
-                            shape_hash=c.hash(), signed_at=c.signed_at())
+
+        if not context.add_callback(lambda: self.end_session(iid, "stream terminated")):
+            self.end_session(iid, "stream was already over")
+            return
+
+        try:
+            yield pb.SessionEvent(signed=pb.Signed(
+                instance_id=iid, currency=c.vow("currency"),
+                shape_hash=c.hash(), signed_at=c.signed_at()))
+            # Nothing else to send. The handler exists from here on only to
+            # keep the stream up, and the stream exists only to say the peer
+            # is still there. That sentence is what the idle timer was
+            # standing in for.
+            inst.done.wait()
+        finally:
+            self.end_session(iid, "handler exit")
 
     # ---- the pledges, one typed rpc each ----
 
@@ -281,7 +292,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
     # ---- the partial surface and the break ----
 
     def GetPartial(self, request, context):
-        s = self._session(request.instance_id, context)
+        s = self._instance(request.instance_id, context)
         with s.lock:
             try:
                 p = s.contract.partial()
@@ -295,15 +306,20 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
                                broken=p.broken, errors=errors)
 
     def Break(self, request, context):
-        """Breaks the instance but leaves the entry standing. This is
-        deliberate and it is a finding: in process, a broken handle still
-        answers ASH_ERR_STATE to a fulfillment and still reads its partial
-        surface, so the owner learns it broke. Dropping the row here would
-        make a broken instance answer NOT_FOUND instead, indistinguishable
-        from an id that never existed, and the bridge would lose a
-        distinction the C ABI keeps. The row is a tombstone the reaper
-        collects on the same TTL as any other idle instance."""
-        s = self._session(request.instance_id, context)
+        """Breaks the instance but leaves the entry standing, which is the
+        same choice step 1 made and it survives the move to streams intact. In
+        process, a broken handle still answers ASH_ERR_STATE to a fulfillment
+        and still reads its partial surface, so the owner learns it broke.
+        Dropping the row here would make a broken instance answer NOT_FOUND
+        instead, indistinguishable from an id that never existed, and the
+        bridge would lose a distinction the C ABI keeps.
+
+        What changed is what collects the row afterward. It was a tombstone on
+        a second guess at a TTL. It is now a row the stream still owns: it
+        reads broken for as long as the peer stays to read it, and it goes
+        when the peer goes. The tombstone lifetime question does not have a
+        better answer here, it stopped being a question."""
+        s = self._instance(request.instance_id, context)
         with s.lock:
             try:
                 _break_quietly(s)
@@ -314,40 +330,44 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
     # ---- prototype only ----
 
     def Debug(self, request, context):
-        """Not a contract surface. It exists so the client can watch the
-        reaper collect an instance nobody broke, which is the measurement
-        this prototype was built to take."""
+        """Not a contract surface. It exists so the client can watch an
+        instance leave with its stream, which is the measurement this
+        prototype was built to take."""
         return pb.DebugReply(live_instances=self._table.count())
 
 
-def serve(port, ttl, reap_interval):
+def serve(port):
     rt = Runtime(OUT / "libashrt.so")
     rt.load(OUT / "libpayment.ash.so")
     rt.bind("PaymentService.charge", charge)
     rt.freeze()
 
     table = InstanceTable()
-    reaper = Reaper(table, ttl, reap_interval)
-    reaper.start()
+    servicer = PaymentServicer(rt, table)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
-    pb_grpc.add_PaymentServiceServicer_to_server(
-        PaymentServicer(rt, table), server)
+    pool = futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    server = grpc.server(pool)
+    pb_grpc.add_PaymentServiceServicer_to_server(servicer, server)
     bound = server.add_insecure_port(f"127.0.0.1:{port}")
     server.start()
     print(f"[bridge_server] serving PaymentService on 127.0.0.1:{bound}, "
-          f"ttl {ttl}s", flush=True)
+          f"sessions are streams", flush=True)
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:
         pass
     finally:
         # Shutdown breaks every instance still standing. A signed contract
-        # that outlives its server is an obligation nobody can keep.
-        reaper.stop()
+        # that outlives its server is an obligation nobody can keep. Draining
+        # the table sets each session's done, so the handlers wake and exit on
+        # their own rather than depending on the transport to tell them, and
+        # the pool joins before the runtime goes away underneath a body.
         server.stop(0).wait()
         for s in table.drain():
-            _break_quietly(s)
+            s.done.set()
+            with s.lock:
+                _break_quietly(s)
+        pool.shutdown(wait=True)
         rt.shutdown()
         print("[bridge_server] stopped", flush=True)
 
@@ -355,12 +375,8 @@ def serve(port, ttl, reap_interval):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=50251)
-    ap.add_argument("--ttl", type=float, default=2.0,
-                    help="seconds an instance may sit untouched before the "
-                         "reaper breaks it")
-    ap.add_argument("--reap-interval", type=float, default=0.25)
     args = ap.parse_args()
-    serve(args.port, args.ttl, args.reap_interval)
+    serve(args.port)
     return 0
 
 

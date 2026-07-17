@@ -642,9 +642,12 @@ tsan: $(MODULE)
 # handle and knows its instance only by the uint64 the server issued. It
 # proves the walk demo_payment.py runs in process survives a process boundary
 # with the same answers, that a pledge's Err crosses as a value on an OK rpc
-# while an Ashford status crosses as a gRPC code, and that the orphan reaper
-# collects an instance nobody broke. Out of the all gate on purpose: this is a
-# prototype answering whether the session model works, not a shipped surface.
+# while an Ashford status crosses as a gRPC code, and that an instance lives
+# exactly as long as the Session stream that issued it: a killed client's
+# instance is broken at once, and a client that holds its stream and says
+# nothing keeps its instance however long it stays quiet. Out of the all gate
+# on purpose: this is a prototype answering whether the session model works,
+# not a shipped surface.
 #
 # grpcio is not in the system python3 here, so grpc-venv builds a venv the
 # gate prefers. The gate takes the venv if it has grpc, else the system
@@ -682,10 +685,10 @@ test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
 	$$py -m grpc_tools.protoc -I interop/grpc \
 	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
 	    $(GRPC_PROTO) || exit 1; \
-	$$py interop/grpc/bridge_server.py --port 50251 --ttl 2.0 & \
+	$$py interop/grpc/bridge_server.py --port 50251 & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
-	$$py interop/grpc/bridge_client.py --port 50251 --ttl 2.0; \
+	$$py interop/grpc/bridge_client.py --port 50251 --legacy-ttl 2.0; \
 	code=$$?; \
 	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
 	exit $$code

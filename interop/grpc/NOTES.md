@@ -1,4 +1,4 @@
-# The gRPC bridge, step 1: what the prototype found
+# The gRPC bridge, step 1: what the unary prototype found
 
 Appendix III names instance state over stateless gRPC the load bearing unknown
 and asks for one contract in one language before anything else moves. This is
@@ -204,3 +204,213 @@ and easily. The load bearing unknown is who ends it, and unary gRPC's answer is 
 timer, which is not an answer a contract language should accept. Prototype the
 streaming session next, and let the store answer affinity. Retire the custom wire
 after that, not before.
+
+# The gRPC bridge, step 1b: the session as a stream
+
+Step 1 named the rule the TTL was standing in for and said it already exists in
+gRPC, one layer up. This is that rule, taken. `Sign` is now
+`rpc Session(SignRequest) returns (stream SessionEvent)`: it signs, yields the
+signature as the stream's first event, and then holds. The instance lives
+exactly as long as the stream. Everything else is untouched on purpose. The
+pledge rpcs are still one typed unary call each carrying the instance id,
+because that is what step 2 consumes and nothing about lifetimes should be
+allowed to cost it.
+
+The reaper is gone. Not reduced to a backstop, gone, and the reason is the
+finding below.
+
+## Does the stream own the lifetime
+
+Yes, and the measurement is not close.
+
+A child process opens a session, is killed with no break and no close, and the
+server has the instance broken and dropped in **1ms**, on five consecutive runs
+with no spread. Step 1 waited out a 2s timer and then presumed. The same fact,
+three orders of magnitude apart, and one of them is a fact.
+
+The other direction holds too. A client that holds its stream and says nothing
+for **6s, three times the old TTL**, keeps its instance, keeps its state, and
+resumes its walk on latches it set before the silence. Step 1's server would
+have broken that instance three times over. This is the human approval case from
+cost 3, and it now runs in the same server, with the same code, as the payment
+walk that finishes in milliseconds. There is no number to pick because there is
+no number.
+
+`context.add_callback` fires on every way a stream ends: an explicit cancel, a
+channel close, a dead process, a dropped connection. The handler blocks on an
+event, the callback sets it, and the table pop is the arbiter so the break
+happens exactly once no matter which of the three paths, callback, handler exit,
+or shutdown, gets there first. That is the whole mechanism, and it is smaller
+than the reaper it replaced. The table shrank with it: entries used to be
+rewritten on every touch to feed the sweep, and now they are written once and
+read until the stream drops them. `touch`, `peek`, `idle_candidates`, and the
+recheck under the instance lock all went away. The per instance lock stayed,
+because the race it guards is real and unchanged: a pledge call in flight when
+the stream terminates. The end path pops the row first so no new call can
+resolve the id, then takes the lock, which waits out any call admitted before
+the pop, and only then breaks.
+
+The hazard step 1 called invisible until it corrupts under load is still there
+and still needs the lock. Streams did not fix it. It just got smaller, because
+the thing racing the call is now an event rather than a thread that wakes up
+four times a second looking for work.
+
+## The four costs, revisited
+
+All four go, and it is worth being precise about how, because they do not go the
+same way.
+
+1. **A timer breaks contracts.** Gone. There is no timer in the server. Every
+   break it now performs has a cause the contract could name: its own break
+   line, an explicit `Break`, or the party holding the obligation ceasing to
+   exist. That last one is the in process semantics restated, not invented. Step
+   1's complaint was that a process that goes away takes its obligations with it
+   honestly and the bridge had no analog. The stream is the analog.
+2. **A slow client and a dead client are the same client.** Gone. They are now
+   different, and the difference is observed rather than inferred. A slow client
+   is a quiet client and a quiet client is a live one.
+3. **One TTL cannot serve two lifetimes.** Gone, and this is the one that could
+   not have been fixed by picking better. Both lifetimes are the same code now.
+4. **The break is not the end of the row.** Dissolved rather than answered. The
+   row still outlives the break, and it still must, because a broken instance
+   answering `NOT_FOUND` would lose a distinction the C ABI keeps. What changed
+   is who collects it. The tombstone is now owned by the stream: it reads broken
+   for exactly as long as somebody is there to read it, and it leaves when they
+   leave. There is no second TTL guessing at a second thing, because there is no
+   first one. The client asserts this directly: break explicitly, read `BROKEN`
+   off the still open stream, close the stream, and the id is `NOT_FOUND`.
+
+Note what that list is. Every one of these was a cost of the unary choice, which
+is what step 1 predicted, and paying for the stream is what collects all four at
+once.
+
+## What the stream costs, honestly
+
+Three things, and the first is the one that matters.
+
+**The stream is a hard liveness coupling, and it trades one failure for
+another.** A client that is alive, well, and intends to finish loses its
+instance if the connection blips. Under a TTL of an hour, a thirty second
+partition was survivable; under a stream it is not. This is real and it is the
+strongest argument against this design, so take it at full strength: the TTL was
+more forgiving of a bad network, and forgiveness is what a long lived contract
+on a real network wants.
+
+It is still the right trade, on three counts and against one.
+
+- **It is an event, not a guess.** The server acts on something that happened.
+  When it is wrong, it is wrong because the network lied, which is a failure the
+  whole stack already knows how to talk about. When the TTL was wrong, it was
+  wrong because a number was wrong, which is a failure nobody can debug.
+- **The client learns.** A broken stream breaks at both ends. The client knows
+  its instance is gone at the moment it is gone, and can resign. Under the TTL
+  the client found out later, by getting `NOT_FOUND` from its next call, which
+  is both strictly later and indistinguishable from an id it never had.
+- **It is the transport's problem, tuned in the transport's language.**
+  Keepalives, deadlines, and retry policy are gRPC's, they are configured per
+  deployment, and they are not the application inventing a lifecycle rule. The
+  TTL was Ashford making a networking decision in a contract runtime, which is
+  the wrong place for it.
+- **Against:** none of that gives back the thirty second partition. A stream is
+  strictly less tolerant than a long timer.
+
+That last point has an answer and it is the same answer as before. An instance
+that can be written down survives losing its stream, because the row is not the
+memory. This is now the third distinct problem Layer 3 has answered from this
+document: affinity under a load balancer, the orphan as a scheduled job over the
+store rather than a thread racing a table, and now partition tolerance for a
+long lived session. Three unrelated symptoms, one cause, and the cause is that
+an instance is memory resident. That convergence is the most useful thing in
+this file.
+
+**A session holds a thread.** The sync Python server dedicates a pool worker to
+each instance for its whole life, so the pool size is the concurrency ceiling
+and `max_workers` went from 8 to 32 to hold this walk's sessions plus the pledge
+calls driving them. This is a property of a sync threaded server, not of gRPC,
+and an async server or a Go server does not have it. It is named here anyway
+because a naive port of this server into any sync threaded language inherits it
+silently and discovers it at exactly the wrong time.
+
+**The break at stream end is still a break the contract did not write.** It has
+a defensible reading now, the holder is gone, which the timer never had. It is
+still not something `payment.ash` can see coming or write a policy about. The
+honest statement is that the bridge no longer invents an ending, it reports one,
+and reporting is a different act from inventing. That closes cost 1 as written.
+It does not mean a contract language has nothing left to say about what a
+counterparty's disappearance means, and it probably does have something to say.
+That question is now askable, which it was not while a timer was answering it.
+
+## An explicit break zeroes the payload, and the bridge inherits that
+
+Writing the tombstone check turned this up and it is worth recording. An
+explicit `ash_contract_break` zeroes the stored Err payloads, deliberately,
+because they point into the heap the break frees, and it keeps the latches so
+the partial surface still names which pledges landed and which broke. So step
+1's line about the partial surface still reading the payload belongs to the
+contract's **own** break line, not to an explicit break. After
+`Charge(-2.0)` the errors read `[("charge", 41)]`; after an explicit `Break` on
+top of that they read `[]`, and `broken` still reads `["Processing"]`.
+
+The bridge reproduces this exactly without knowing about it, which is the
+fidelity result and is reassuring. It is also a note for step 2: a Go client
+that reads `errors` after calling `Break` gets an empty list, the `.proto` says
+nothing about why, and nothing in the generated surface would lead anyone to
+expect it. That is a documentation obligation on the emitted contract, not a bug
+in either layer.
+
+## What step 2 inherits
+
+The typed pledge surface is untouched, which was the requirement. A Go consumer
+still gets `client.Charge(ctx, &ChargeRequest{...})` from protoc alone, with the
+argument and result types the contract declared and no dispatch on a string.
+Nothing about the lifetime change reached the part step 2 is about.
+
+What protoc does not write is the session. A Go consumer must call
+`client.Session(ctx, req)`, take the first message off `stream.Recv()`, keep
+both the stream and its context alive for the instance's life, and cancel when
+done. That is idiomatic Go and it is small, a struct holding the stream and a
+`defer cancel()`, maybe twenty lines. It is not free. The failure mode of
+getting it wrong, letting the stream variable fall out of scope or letting a
+request scoped context cancel, is losing the instance, and it will be somebody's
+first bug.
+
+So step 1's claim needs one word changed. It said protoc alone kills the
+language coverage objection. It is protoc plus a small emitted wrapper, and the
+objection is just as dead, because a wrapper that holds a stream and cancels it
+is twenty lines in every gRPC language and ashc emits it once per contract from
+the same declarations it already reads. The consequence for step 2 is concrete:
+**ashc emits a session wrapper, not only a `.proto`**. Worth knowing before the
+Go client is written rather than after.
+
+The trade is also worth stating plainly, because it reads as a loss and is not.
+The stream adds an object the consumer must hold and removes a guess the server
+had to make. Under unary the consumer held nothing, which was the appeal, but it
+also meant a consumer had no way to say it was finished except to stop calling
+and let a timer notice. Holding a stream is how a client says "still mine", and
+closing it is how a client says "done". Those are things a contract's counterparty
+should be able to say.
+
+## The verdict: the quarter moved
+
+Step 1 said the bridge is a weekend and the session is a quarter, and split them
+because correct lifetimes meant moving off unary onto a stream and multi replica
+meant an instance that can be written down.
+
+**The streaming half was a day.** The proto change is one rpc and one message.
+The server got smaller. The client's new checks are the only part that took real
+thought, and only because measuring a death honestly means killing a real
+process. Five consecutive green runs, no flake, 1ms every time.
+
+So the quarter is smaller than step 1 priced it, and what is left of it is not
+bridge work at all. Affinity, partition tolerance, and an instance that outlives
+its connection are one piece of work, and it is Layer 3. **The session is no
+longer a quarter of transport work. It is a quarter of runtime work, and it is
+the same quarter Appendix III already keeps Layer 3 for.** The bridge does not
+need a quarter of its own.
+
+Appendix III's sequence holds, and step 1's correction to it survives intact
+with its answer filled in. The load bearing unknown was who ends an instance.
+The answer is the party that holds it, and gRPC will tell you the moment they
+stop. Emit the `.proto` and the session wrapper from ashc and drive it from Go
+next, let the store answer everything left in this file, and retire the custom
+wire after that.
