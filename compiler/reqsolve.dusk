@@ -41,7 +41,7 @@ func rmsg3(s1: string, s2: string, s3: string) -> string {
 // the descriptor atom table in exactly this enumeration order, which is what
 // keeps the static satisfiability check and the runtime evaluator reading
 // one atom list.
-export func req_collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<int64>) -> void {
+export func req_collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *Map<string, int64>) -> void {
     q: ReqNode = vec_get((*a).reqs, id)
     if q.kind == rk_atom() {
         key: string = rs_gkey(q.a)
@@ -58,7 +58,7 @@ export func req_collect_atoms(a: *Ast, id: int64, names: *Vector<int64>, idx: *M
 }
 
 // Evaluates one line under one assignment: bit i of mask is atom i.
-func eval_req(a: *Ast, id: int64, idx: *Map<int64>, pows: *Vector<int64>, mask: int64) -> bool {
+func eval_req(a: *Ast, id: int64, idx: *Map<string, int64>, pows: *Vector<int64>, mask: int64) -> bool {
     q: ReqNode = vec_get((*a).reqs, id)
     if q.kind == rk_atom() {
         i: int64 = unwrap_or(map_get(idx, rs_gkey(q.a)), 0)
@@ -94,7 +94,7 @@ func witness(a: *Ast, names: *Vector<int64>, pows: *Vector<int64>, mask: int64) 
 
 func solve_block(a: *Ast, cname: string, rb: ReqBlockNode, errors: *Vector<Located>) -> void {
     names: *Vector<int64> = alloc(vec_new())
-    idx: *Map<int64> = alloc(map_new())
+    idx: *Map<string, int64> = alloc(map_new())
     if rb.fulfill >= 0 { req_collect_atoms(a, rb.fulfill, names, idx) }
     if rb.partial >= 0 { req_collect_atoms(a, rb.partial, names, idx) }
     if rb.brk >= 0 { req_collect_atoms(a, rb.brk, names, idx) }

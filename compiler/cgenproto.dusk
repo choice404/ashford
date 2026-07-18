@@ -1,0 +1,526 @@
+// cgenproto: the gRPC surface emitter behind ashc emit-proto. Given a
+// checked file it renders the two artifacts a gRPC consumer builds against
+// with stock tooling: a .proto spelling every public contract as its own
+// typed service, one rpc per pledge with the contract's argument and result
+// types, and the Go session wrapper carrying the one thing protoc cannot
+// emit, the stream whose lifetime is the instance's. The shape hash in the
+// wrapper comes from the same shape_string and fnv1a64 calls the module
+// emitter makes, so a wrapper and the module it fronts can never disagree,
+// and both files are byte stable for a given source, a golden test surface
+// like the module C and the header.
+//
+// The signing rpc is the surface's one load bearing decision: Session takes
+// what sign takes and answers with a stream whose first event is the
+// signature. The stream stays open for the instance's life, so the
+// connection is the session, the property the C ABI gets free from the
+// process. The pledge rpcs are unary and typed, keyed by the instance id the
+// stream issued, because that is what protoc turns into a native call in a
+// language with no Ashford binding.
+//
+// Message names carry no contract prefix while the file declares one public
+// contract, matching the surface a single service file reads naturally; a
+// file with several public contracts prefixes every contract scoped message
+// with its contract's name so the shared file stays unambiguous.
+
+@paradigm procedural
+
+@import std.string
+@import std.vector
+@import std.map
+@import std.functional.maybe
+@import diag
+@import ast
+@import resolve
+@import ty
+@import tysigs
+@import tcstate
+@import hash
+@import cgenstate
+@import cgen
+
+// The proto3 scalar spelling an Ashford type crosses the bridge as, or the
+// empty string for a type the bridge surface does not lower.
+func proto_scalar(g: *Cg, tyid: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_int() { return "int64" }
+    if k == tyk_uint() { return "uint64" }
+    if k == tyk_float() { return "double" }
+    if k == tyk_bool() { return "bool" }
+    if k == tyk_str() { return "string" }
+    return ""
+}
+
+// The Ashford spelling that names a result message arm: Result<Bool, Int>
+// contributes the Bool and the Int of BoolIntResult.
+func ty_word(g: *Cg, tyid: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_int() { return "Int" }
+    if k == tyk_uint() { return "Uint" }
+    if k == tyk_float() { return "Float" }
+    if k == tyk_bool() { return "Bool" }
+    if k == tyk_str() { return "String" }
+    return ""
+}
+
+// snake_case to CamelCase, the rpc spelling of a pledge name.
+func camel_of(name: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut up: bool = true
+    mut i: int64 = 0
+    while i < str_len(name) {
+        c: int64 = name[i]
+        if c == 95 {
+            up = true
+        } else {
+            if up && c >= 97 && c <= 122 {
+                sb_push_char(b, c - 32)
+            } else {
+                sb_push_char(b, c)
+            }
+            up = false
+        }
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// The proto package segment from the root file's stem: lowercased, with
+// anything outside the identifier set as underscore.
+func pkg_of(stem: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut i: int64 = 0
+    while i < str_len(stem) {
+        c: int64 = stem[i]
+        if c >= 65 && c <= 90 {
+            sb_push_char(b, c + 32)
+        } else if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+            sb_push_char(b, c)
+        } else {
+            sb_push_char(b, 95)
+        }
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+func has_str(v: *Vector<string>, s: string) -> bool {
+    mut i: int64 = 0
+    while i < vec_len(v) {
+        if str_eq(vec_get(v, i), s) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// The contract scoped message prefix: the contract's name when the file
+// declares more than one public contract, empty otherwise.
+func proto_prefix(g: *Cg, cid: int64, many: bool) -> string {
+    if !many { return "" }
+    a: *Ast = (*g).ast
+    c: ContractNode = vec_get((*a).contracts, cid)
+    return ast_name(a, c.name)
+}
+
+// The result message name of one pledge's declared Result, or the empty
+// string when the return is outside the lowered subset, recorded as a build
+// error either way.
+func result_msg_of(g: *Cg, pl: PledgeNode, ret: int64) -> string {
+    tn: TyNode = ty_get((*g).ty, ret)
+    if tn.kind != tyk_result() {
+        cg_unsupported(g, pl.lo, pl.hi, "a pledge on the gRPC surface returning outside Result")
+        return ""
+    }
+    okw: string = ty_word(g, tn.a)
+    errw: string = ty_word(g, tn.b)
+    if str_len(okw) == 0 || str_len(errw) == 0 {
+        cg_unsupported(g, pl.lo, pl.hi, "a Result arm on the gRPC surface outside the scalar set")
+        return ""
+    }
+    return tmsg3(okw, errw, "Result")
+}
+
+// One contract's message block: the sign surface, the signature, the session
+// event, each distinct result message once per file, and one request message
+// per pledge.
+func emit_contract_messages(g: *Cg, cid: int64, many: bool, seen: *Vector<string>) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    ge: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = ge.pkg
+    prefix: string = proto_prefix(g, cid, many)
+
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
+
+    version: int64 = contract_version(g, c)
+    shape: string = shape_string(g, cid, vows, pls)
+    hex: string = hash_hex16(fnv1a64(shape))
+    free(shape)
+
+    cg_top(g, tmsg7("// contract ", cname, ", version ", int_to_string(version), ", shape 0x", hex, "."))
+    free(hex)
+
+    // The sign call carries the vow overrides and the shape check, the two
+    // things ash_contract_sign takes beside the contract name.
+    cg_top(g, "// The sign surface: one optional field per vow, and the shape check,")
+    cg_top(g, "// where 0 skips it and the wrapper's pinned hash enforces this build.")
+    cg_top(g, tmsg3("message ", tmsg2(prefix, "SignRequest"), " {"))
+    mut i: int64 = 0
+    while i < vec_len(vows) {
+        v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
+        vs: VowSigT = sig_vow(s, cid, v.name)
+        mut pt: string = proto_scalar(g, vs.ty)
+        if str_len(pt) == 0 {
+            cg_unsupported(g, v.lo, v.hi, "a vow on the gRPC surface outside the scalar set")
+            pt = "int64"
+        }
+        mut note: string = ";  // the vow; no default is declared, so unset refuses at sign"
+        if v.init >= 0 { note = ";  // the vow; unset takes the declared default" }
+        cg_top(g, tmsg7("  optional ", pt, " ", ast_name(a, v.name), " = ", int_to_string(i + 1), note))
+        i = i + 1
+    }
+    cg_top(g, tmsg3("  uint64 expected_hash = ", int_to_string(vec_len(vows) + 1), ";"))
+    cg_top(g, "}")
+    cg_top(g, "")
+
+    // The signature as the instance carries it: the id the pledge rpcs are
+    // keyed by, the vows that actually landed, and the hash and timestamp an
+    // in process host reads off the handle.
+    cg_top(g, "// The signature: the id the pledge rpcs are keyed by, the effective vows")
+    cg_top(g, "// after defaults and overrides, and the hash and timestamp an in process")
+    cg_top(g, "// host reads off the handle.")
+    cg_top(g, tmsg3("message ", tmsg2(prefix, "Signed"), " {"))
+    cg_top(g, "  uint64 instance_id = 1;")
+    mut j: int64 = 0
+    while j < vec_len(vows) {
+        v2: VowNode = vec_get((*a).vows, vec_get(vows, j).vid)
+        vs2: VowSigT = sig_vow(s, cid, v2.name)
+        mut pt2: string = proto_scalar(g, vs2.ty)
+        if str_len(pt2) == 0 { pt2 = "int64" }
+        cg_top(g, tmsg7("  ", pt2, " ", ast_name(a, v2.name), " = ", int_to_string(j + 2), ";"))
+        j = j + 1
+    }
+    cg_top(g, tmsg3("  uint64 shape_hash = ", int_to_string(vec_len(vows) + 2), ";"))
+    cg_top(g, tmsg3("  int64 signed_at = ", int_to_string(vec_len(vows) + 3), ";"))
+    cg_top(g, "}")
+    cg_top(g, "")
+
+    cg_top(g, "// What the session stream carries. Signed is the first event; the stream's")
+    cg_top(g, "// other job is holding the session open, and anything a server later needs")
+    cg_top(g, "// to push arrives as another arm.")
+    cg_top(g, tmsg3("message ", tmsg2(prefix, "SessionEvent"), " {"))
+    cg_top(g, "  oneof event {")
+    cg_top(g, tmsg3("    ", tmsg2(prefix, "Signed"), " signed = 1;"))
+    cg_top(g, "  }")
+    cg_top(g, "}")
+    cg_top(g, "")
+
+    // Each distinct declared Result once per file: the contract's own Err is
+    // a value on an OK rpc, never a transport error.
+    mut k: int64 = 0
+    while k < vec_len(pls) {
+        info: PlInfo = vec_get(pls, k)
+        pl: PledgeNode = vec_get((*a).pledges, info.pid)
+        pkey: string = info.key
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
+        rname: string = result_msg_of(g, pl, ps.ret)
+        if str_len(rname) > 0 && !has_str(seen, rname) {
+            vec_push(seen, rname)
+            tn: TyNode = ty_get((*g).ty, ps.ret)
+            cg_top(g, tmsg5("// Result<", ty_word(g, tn.a), ", ", ty_word(g, tn.b), ">: the contract's own Err is a value, not a"))
+            cg_top(g, "// transport error.")
+            cg_top(g, tmsg3("message ", rname, " {"))
+            cg_top(g, "  oneof result {")
+            mut okpt: string = proto_scalar(g, tn.a)
+            if str_len(okpt) == 0 { okpt = "int64" }
+            mut errpt: string = proto_scalar(g, tn.b)
+            if str_len(errpt) == 0 { errpt = "int64" }
+            cg_top(g, tmsg3(tmsg2("    ", okpt), " ok = 1;", ""))
+            cg_top(g, tmsg3(tmsg2("    ", errpt), " err = 2;", ""))
+            cg_top(g, "  }")
+            cg_top(g, "}")
+            cg_top(g, "")
+        }
+        k = k + 1
+    }
+
+    // One request message per pledge: the instance id the session issued,
+    // then the pledge's own parameters in declaration order.
+    mut m: int64 = 0
+    while m < vec_len(pls) {
+        info2: PlInfo = vec_get(pls, m)
+        pl2: PledgeNode = vec_get((*a).pledges, info2.pid)
+        pkey2: string = info2.key
+        ps2: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey2), no_pledge_sig())
+        camel: string = camel_of(ast_name(a, pl2.name))
+        cg_top(g, tmsg5("message ", prefix, camel, "Request", " {"))
+        cg_top(g, "  uint64 instance_id = 1;")
+        mut p: int64 = 0
+        while p < pl2.params_len {
+            f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, pl2.params_off + p))
+            mut ppt: string = ""
+            if p < ps2.params.len {
+                ppt = proto_scalar(g, sig_param(s, ps2.params, p))
+            }
+            if str_len(ppt) == 0 {
+                cg_unsupported(g, pl2.lo, pl2.hi, "a pledge parameter on the gRPC surface outside the scalar set")
+                ppt = "int64"
+            }
+            cg_top(g, tmsg7("  ", ppt, " ", ast_name(a, f.name), " = ", int_to_string(p + 2), ";"))
+            p = p + 1
+        }
+        cg_top(g, "}")
+        cg_top(g, "")
+        free(camel)
+        m = m + 1
+    }
+}
+
+// The lifecycle surface every contract shares: the runtime's own state
+// numbering and the partial result read.
+func emit_shared(g: *Cg) -> void {
+    cg_top(g, "// The lifecycle states, ASH_UNSIGNED through ASH_BROKEN, in the runtime's")
+    cg_top(g, "// own numbering.")
+    cg_top(g, "enum ContractState {")
+    cg_top(g, "  UNSIGNED = 0;")
+    cg_top(g, "  SIGNED = 1;")
+    cg_top(g, "  FULFILLED = 2;")
+    cg_top(g, "  PARTIAL = 3;")
+    cg_top(g, "  BROKEN = 4;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, "message PledgeError { string pledge = 1; int64 err = 2; }")
+    cg_top(g, "")
+    cg_top(g, "message PartialRequest { uint64 instance_id = 1; }")
+    cg_top(g, "")
+    cg_top(g, "// The partial surface, name lists in the runtime's insertion order.")
+    cg_top(g, "// repeated, not map, so the order Ashford pins as normative survives the")
+    cg_top(g, "// wire.")
+    cg_top(g, "message PartialReply {")
+    cg_top(g, "  ContractState state = 1;")
+    cg_top(g, "  repeated string fulfilled = 2;")
+    cg_top(g, "  repeated string pending = 3;")
+    cg_top(g, "  repeated string broken = 4;")
+    cg_top(g, "  repeated PledgeError errors = 5;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, "message BreakRequest { uint64 instance_id = 1; }")
+    cg_top(g, "message BreakReply {}")
+    cg_top(g, "")
+}
+
+// One contract's service: the session stream, one typed rpc per pledge, and
+// the shared lifecycle pair.
+func emit_service(g: *Cg, cid: int64, many: bool) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    ge: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = ge.pkg
+    prefix: string = proto_prefix(g, cid, many)
+
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
+
+    cg_top(g, tmsg3("service ", cname, " {"))
+    cg_top(g, "  // Signs, then holds. The first event carries the signature; the stream")
+    cg_top(g, "  // then stays open and empty for as long as the instance lives. Ending the")
+    cg_top(g, "  // stream, by close, by cancel, or by dying, ends the instance.")
+    cg_top(g, tmsg5("  rpc Session(", tmsg2(prefix, "SignRequest"), ") returns (stream ", tmsg2(prefix, "SessionEvent"), ");"))
+    mut i: int64 = 0
+    while i < vec_len(pls) {
+        info: PlInfo = vec_get(pls, i)
+        pl: PledgeNode = vec_get((*a).pledges, info.pid)
+        pkey: string = info.key
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
+        camel: string = camel_of(ast_name(a, pl.name))
+        mut rname: string = result_msg_of(g, pl, ps.ret)
+        if str_len(rname) == 0 { rname = "BoolIntResult" }
+        cg_top(g, tmsg7("  rpc ", camel, "(", tmsg3(prefix, camel, "Request"), ") returns (", rname, ");"))
+        free(camel)
+        i = i + 1
+    }
+    cg_top(g, "  rpc GetPartial(PartialRequest) returns (PartialReply);")
+    cg_top(g, "  rpc Break(BreakRequest) returns (BreakReply);")
+    cg_top(g, "}")
+}
+
+// Emits the whole .proto. The returned string is the file; the caller
+// discards it when errors arrived in the vector.
+export func cgen_proto(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>, stem: string) -> string {
+    g: *Cg = cg_new(a, r, s, t, errors)
+    cids: *Vector<int64> = alloc(vec_new())
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            // Internal contracts publish no descriptor, so the bridge names
+            // nothing about them, exactly like the module C and the header.
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            if !c.internal {
+                vec_push(cids, d.id)
+            }
+        }
+        i = i + 1
+    }
+    many: bool = vec_len(cids) > 1
+
+    cg_top(g, tmsg3("// ", stem, ".proto: generated by ashc emit-proto, do not edit."))
+    cg_top(g, "// Every pledge is its own typed rpc, so a consumer gets the contract's")
+    cg_top(g, "// argument and result types from protoc alone, with no generic Value")
+    cg_top(g, "// envelope and no language side dispatch on a pledge name string. The")
+    cg_top(g, "// session wrapper emitted beside this file carries the one thing protoc")
+    cg_top(g, "// cannot, the stream whose lifetime is the instance's.")
+    cg_top(g, "")
+    cg_top(g, "syntax = \"proto3\";")
+    pkg: string = pkg_of(stem)
+    cg_top(g, tmsg3("package ashford.", pkg, ";"))
+    free(pkg)
+    cg_top(g, "")
+    cg_top(g, "// The Go package the emitted session wrapper lives in; a consumer that")
+    cg_top(g, "// lays its module out differently overrides this with protoc's M flags.")
+    cg_top(g, tmsg3("option go_package = \"ashbridge/", stem, "pb\";"))
+    cg_top(g, "")
+
+    seen: *Vector<string> = alloc(vec_new())
+    mut j: int64 = 0
+    while j < vec_len(cids) {
+        emit_contract_messages(g, vec_get(cids, j), many, seen)
+        j = j + 1
+    }
+    emit_shared(g)
+    mut k: int64 = 0
+    while k < vec_len(cids) {
+        if k > 0 { cg_top(g, "") }
+        emit_service(g, vec_get(cids, k), many)
+        k = k + 1
+    }
+    out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
+    return out
+}
+
+// One contract's Go surface: the pinned shape hash, the session handle, the
+// opener, and the close.
+func emit_go_contract(g: *Cg, cid: int64, many: bool) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    ge: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = ge.pkg
+    prefix: string = proto_prefix(g, cid, many)
+
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
+    shape: string = shape_string(g, cid, vows, pls)
+    hex: string = hash_hex16(fnv1a64(shape))
+    free(shape)
+
+    cg_top(g, tmsg5("// ", cname, "ShapeHash is the contract's shape hash, the same value the", "", ""))
+    cg_top(g, "// compiled module registers. A SignRequest carrying it pins the wire to")
+    cg_top(g, "// this build; 0 skips the check.")
+    cg_top(g, tmsg7("const ", cname, "ShapeHash uint64 = 0x", hex, "", "", ""))
+    free(hex)
+    cg_top(g, "")
+    cg_top(g, tmsg5("// ", cname, "Session holds a signed instance open. The instance lives", "", ""))
+    cg_top(g, "// exactly as long as this handle: Close ends the stream, and the server")
+    cg_top(g, "// breaks and drops the instance.")
+    cg_top(g, tmsg3("type ", cname, "Session struct {"))
+    cg_top(g, tmsg3("	Signed *", tmsg2(prefix, "Signed"), ""))
+    cg_top(g, "	cancel context.CancelFunc")
+    cg_top(g, tmsg3("	stream grpc.ServerStreamingClient[", tmsg2(prefix, "SessionEvent"), "]"))
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, tmsg5("// Open", cname, "Session signs the contract and holds the session stream.", "", ""))
+    cg_top(g, "// The signature is read off the stream before this returns, so the caller")
+    cg_top(g, "// holds a live, addressable instance or an error, never a maybe.")
+    cg_top(g, tmsg7("func Open", cname, "Session(ctx context.Context, c ", cname, "Client, req *", tmsg2(prefix, "SignRequest"), ") ("))
+    cg_top(g, tmsg5("	*", cname, "Session, error,", "", ""))
+    cg_top(g, ") {")
+    cg_top(g, "	sctx, cancel := context.WithCancel(ctx)")
+    cg_top(g, "	stream, err := c.Session(sctx, req)")
+    cg_top(g, "	if err != nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, err")
+    cg_top(g, "	}")
+    cg_top(g, "	ev, err := stream.Recv()")
+    cg_top(g, "	if err != nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, err")
+    cg_top(g, "	}")
+    cg_top(g, "	signed := ev.GetSigned()")
+    cg_top(g, "	if signed == nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, fmt.Errorf(\"the session stream opened with %v, not the signature\", ev)")
+    cg_top(g, "	}")
+    cg_top(g, tmsg5("	return &", cname, "Session{Signed: signed, cancel: cancel, stream: stream}, nil", "", ""))
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, "// Close ends the session; the server breaks the instance and drops it.")
+    cg_top(g, tmsg3("func (s *", cname, "Session) Close() { s.cancel() }"))
+}
+
+// Emits the Go session wrapper. The returned string is the file; the caller
+// discards it when errors arrived in the vector.
+export func cgen_proto_go(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>, stem: string) -> string {
+    g: *Cg = cg_new(a, r, s, t, errors)
+    cids: *Vector<int64> = alloc(vec_new())
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            if !c.internal {
+                vec_push(cids, d.id)
+            }
+        }
+        i = i + 1
+    }
+    many: bool = vec_len(cids) > 1
+
+    cg_top(g, tmsg3("// Code generated by ashc emit-proto from ", stem, ".ash. DO NOT EDIT."))
+    cg_top(g, "//")
+    cg_top(g, "// The session wrapper. protoc gives a consumer every typed pledge call;")
+    cg_top(g, "// this file gives the one thing it cannot, the stream whose lifetime is")
+    cg_top(g, "// the instance's. Opening a session signs and reads the signature; the")
+    cg_top(g, "// handle's Close ends the stream, and the server breaks and drops the")
+    cg_top(g, "// instance. It lives in the same package as the protoc output, so the")
+    cg_top(g, "// two halves of the surface import as one.")
+    cg_top(g, tmsg3("package ", stem, "pb"))
+    cg_top(g, "")
+    cg_top(g, "import (")
+    cg_top(g, "	\"context\"")
+    cg_top(g, "	\"fmt\"")
+    cg_top(g, "")
+    cg_top(g, "	\"google.golang.org/grpc\"")
+    cg_top(g, ")")
+    cg_top(g, "")
+    mut j: int64 = 0
+    while j < vec_len(cids) {
+        if j > 0 { cg_top(g, "") }
+        emit_go_contract(g, vec_get(cids, j), many)
+        j = j + 1
+    }
+    out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
+    return out
+}

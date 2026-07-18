@@ -25,8 +25,8 @@ export struct Tc {
     res: *Resolved,
     sigs: *Sigs,
     ty: *TyArena,
-    scopes: *Vector<*Map<int64>>,
-    muts: *Vector<*Map<int64>>,
+    scopes: *Vector<*Map<string, int64>>,
+    muts: *Vector<*Map<string, int64>>,
     cur_cid: int64,
     cur_ret: int64,
     cur_lo: int64,
@@ -36,8 +36,8 @@ export struct Tc {
 }
 
 export func tc_new(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> *Tc {
-    scopes: *Vector<*Map<int64>> = alloc(vec_new())
-    muts: *Vector<*Map<int64>> = alloc(vec_new())
+    scopes: *Vector<*Map<string, int64>> = alloc(vec_new())
+    muts: *Vector<*Map<string, int64>> = alloc(vec_new())
     return alloc(Tc {
         ast: a, res: r, sigs: s, ty: t,
         scopes: scopes, muts: muts,
@@ -51,15 +51,15 @@ export func tc_emit(tc: *Tc, lo: int64, hi: int64, msg: string) -> void {
 }
 
 export func push_scope(tc: *Tc) -> void {
-    m: *Map<int64> = alloc(map_new())
-    u: *Map<int64> = alloc(map_new())
+    m: *Map<string, int64> = alloc(map_new())
+    u: *Map<string, int64> = alloc(map_new())
     vec_push((*tc).scopes, m)
     vec_push((*tc).muts, u)
 }
 
 export func pop_scope(tc: *Tc) -> void {
-    scopes: *Vector<*Map<int64>> = (*tc).scopes
-    muts: *Vector<*Map<int64>> = (*tc).muts
+    scopes: *Vector<*Map<string, int64>> = (*tc).scopes
+    muts: *Vector<*Map<string, int64>> = (*tc).muts
     n: int64 = vec_len(scopes) - 1
     (*scopes).len = n
     (*muts).len = n
@@ -68,11 +68,11 @@ export func pop_scope(tc: *Tc) -> void {
 // Declares a binding in the innermost scope, replacing any shadowed name.
 export func declare(tc: *Tc, name: int64, tyid: int64, is_mut: bool) -> void {
     key: string = rs_gkey(name)
-    scopes: *Vector<*Map<int64>> = (*tc).scopes
-    top: *Map<int64> = vec_get(scopes, vec_len(scopes) - 1)
+    scopes: *Vector<*Map<string, int64>> = (*tc).scopes
+    top: *Map<string, int64> = vec_get(scopes, vec_len(scopes) - 1)
     map_put(top, key, tyid)
-    muts: *Vector<*Map<int64>> = (*tc).muts
-    mtop: *Map<int64> = vec_get(muts, vec_len(muts) - 1)
+    muts: *Vector<*Map<string, int64>> = (*tc).muts
+    mtop: *Map<string, int64> = vec_get(muts, vec_len(muts) - 1)
     mut flag: int64 = 0
     if is_mut { flag = 1 }
     map_put(mtop, key, flag)
@@ -81,10 +81,10 @@ export func declare(tc: *Tc, name: int64, tyid: int64, is_mut: bool) -> void {
 // The type of a local, or -1 when no scope binds the name.
 export func lookup(tc: *Tc, name: int64) -> int64 {
     key: string = rs_gkey(name)
-    scopes: *Vector<*Map<int64>> = (*tc).scopes
+    scopes: *Vector<*Map<string, int64>> = (*tc).scopes
     mut i: int64 = vec_len(scopes) - 1
     while i >= 0 {
-        m: *Map<int64> = vec_get(scopes, i)
+        m: *Map<string, int64> = vec_get(scopes, i)
         if map_has(m, key) {
             return unwrap_or(map_get(m, key), -1)
         }
@@ -96,13 +96,13 @@ export func lookup(tc: *Tc, name: int64) -> int64 {
 // Whether the binding a lookup would find was declared let mut.
 export func lookup_mut(tc: *Tc, name: int64) -> bool {
     key: string = rs_gkey(name)
-    scopes: *Vector<*Map<int64>> = (*tc).scopes
-    muts: *Vector<*Map<int64>> = (*tc).muts
+    scopes: *Vector<*Map<string, int64>> = (*tc).scopes
+    muts: *Vector<*Map<string, int64>> = (*tc).muts
     mut i: int64 = vec_len(scopes) - 1
     while i >= 0 {
-        m: *Map<int64> = vec_get(scopes, i)
+        m: *Map<string, int64> = vec_get(scopes, i)
         if map_has(m, key) {
-            mm: *Map<int64> = vec_get(muts, i)
+            mm: *Map<string, int64> = vec_get(muts, i)
             return unwrap_or(map_get(mm, key), 0) == 1
         }
         i = i - 1

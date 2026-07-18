@@ -29,7 +29,7 @@ struct Cover {
     saw_none: bool,
     saw_ok: bool,
     saw_err: bool,
-    covered: *Map<int64>,
+    covered: *Map<string, int64>,
 }
 
 // The sum declaration behind a named type, or -1 when the name is not a
@@ -235,7 +235,7 @@ func check_exhaustive(tc: *Tc, st: int64, cv: *Cover, lo: int64, hi: int64) -> v
         mut i: int64 = 0
         while i < sum.variants_len {
             v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + i))
-            ctab: *Map<int64> = (*cv).covered
+            ctab: *Map<string, int64> = (*cv).covered
             if !map_has(ctab, rs_gkey(v.name)) {
                 tc_emit(tc, lo, hi, tmsg3("match is missing variant '", ast_name(a, v.name), "'"))
             }
@@ -253,7 +253,7 @@ export func check_match(tc: *Tc, e: ExprNode, want: int64) -> int64 {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
     st: int64 = infer_expr(tc, e.a, -1)
-    covered: *Map<int64> = alloc(map_new())
+    covered: *Map<string, int64> = alloc(map_new())
     cv: *Cover = alloc(Cover {
         catch_all: false,
         saw_true: false, saw_false: false,

@@ -7,9 +7,9 @@
 # table and the freeze, and test-determinism proves two builds of one source
 # emit byte identical module C.
 #
-# DUSK points at the dusk compiler. The PATH binary can lag the toolchain
-# repo; override with DUSK="cargo run --quiet --bin dusk --" run from the
-# cool-lang checkout, or with an absolute path to a newer build.
+# DUSK points at the dusk compiler. The compiler is written against dusk
+# 1.5's standard library, the two parameter map above all; point DUSK at a
+# 1.5.3 or newer binary when the installed one lags.
 
 DUSK    ?= dusk
 CC      ?= cc
@@ -55,7 +55,7 @@ MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -63,7 +63,7 @@ BIN_DEMO   := $(OUT)/main_demo
 # last. The stress and sanitizer variants of the store, network, and mesh gates
 # stay out and are run on their own, since each is minutes of load on ground the
 # functional gate beside it already covers.
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
 
 runtime: $(RT_SO)
 
@@ -361,6 +361,17 @@ test-header: $(ASHC) $(MODULE) $(RT_SO)
 	    -I runtime/include -I $(OUT) \
 	    tests/runtime/test_header.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_header
 	./$(OUT)/test_header
+
+# The proto gate: emit-proto must reproduce both pinned goldens byte for
+# byte, the .proto a stock protoc consumes and the Go session wrapper that
+# carries the stream whose lifetime is the instance's. The shape hash the
+# wrapper pins is the same value the module registers, so a drift between
+# the bridge surface and the compiled contract shows up here as a diff.
+test-proto: $(ASHC)
+	$(ASHC) emit-proto skeleton/payment.ash
+	diff tests/golden/payment.proto $(OUT)/payment.proto
+	diff tests/golden/payment_session.go $(OUT)/payment_session.go
+	@echo "[test-proto] ok"
 
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
@@ -689,6 +700,55 @@ test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
 	$$py interop/grpc/bridge_client.py --port 50251 --legacy-ttl 2.0; \
+	code=$$?; \
+	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	exit $$code
+
+# The step 2 gate: the same server, driven by a Go client built from nothing
+# but ashc's emitted artifacts. emit-proto writes the .proto and the session
+# wrapper, protoc and its Go plugins turn the .proto into typed stubs, and
+# the client walks the whole payment lifecycle against the Python server,
+# session stream, pinned shape hash, value Err, and the dead client's
+# instance collected in milliseconds. Two languages meet at one emitted
+# surface with no hand written stub between them. Out of the all gate like
+# the bridge gate: it needs protoc, the protoc-gen-go pair, and a Go
+# toolchain, and skips clean where any is absent.
+GO_DIR   := interop/grpc/go
+GOPB_DIR := $(GO_DIR)/paymentpb
+
+test-grpc-go: $(RT_SO) $(MODULE_PAY) $(ASHC)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-grpc-go] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	if ! command -v go >/dev/null 2>&1 || ! command -v protoc >/dev/null 2>&1 || \
+	   ! PATH="$$PATH:$$HOME/go/bin" command -v protoc-gen-go >/dev/null 2>&1 || \
+	   ! PATH="$$PATH:$$HOME/go/bin" command -v protoc-gen-go-grpc >/dev/null 2>&1; then \
+	    echo "[test-grpc-go] go or the protoc toolchain not found, skipping"; \
+	    exit 0; \
+	fi; \
+	$(ASHC) emit-proto skeleton/payment.ash || exit 1; \
+	mkdir -p $(GOPB_DIR) $(GRPC_GEN); \
+	PATH="$$PATH:$$HOME/go/bin" protoc -I $(OUT) \
+	    --go_out=$(GO_DIR) --go_opt=module=ashbridge \
+	    --go-grpc_out=$(GO_DIR) --go-grpc_opt=module=ashbridge \
+	    $(OUT)/payment.proto || exit 1; \
+	cp $(OUT)/payment_session.go $(GOPB_DIR)/ || exit 1; \
+	(cd $(GO_DIR) && go build -o ../../../$(OUT)/bridge_client_go ./client) || exit 1; \
+	$$py -m grpc_tools.protoc -I interop/grpc \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    $(GRPC_PROTO) || exit 1; \
+	$$py interop/grpc/bridge_server.py --port 50252 & \
+	srv=$$!; \
+	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
+	./$(OUT)/bridge_client_go -addr 127.0.0.1:50252; \
 	code=$$?; \
 	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
 	exit $$code

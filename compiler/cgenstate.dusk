@@ -48,7 +48,7 @@ export struct Cg {
     ty: *TyArena,
     out: *StringBuilder,
     body: *StringBuilder,
-    scopes: *Vector<*Map<CBind>>,
+    scopes: *Vector<*Map<string, CBind>>,
     tmp: int64,
     indent: int64,
     cur_cid: int64,
@@ -61,7 +61,7 @@ export struct Cg {
 export func cg_new(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> *Cg {
     out: *StringBuilder = alloc(sb_new())
     body: *StringBuilder = alloc(sb_new())
-    scopes: *Vector<*Map<CBind>> = alloc(vec_new())
+    scopes: *Vector<*Map<string, CBind>> = alloc(vec_new())
     return alloc(Cg {
         ast: a, res: r, sigs: s, ty: t,
         out: out, body: body, scopes: scopes,
@@ -111,27 +111,27 @@ export func cg_top(g: *Cg, s: string) -> void {
 }
 
 export func cg_push_scope(g: *Cg) -> void {
-    m: *Map<CBind> = alloc(map_new())
+    m: *Map<string, CBind> = alloc(map_new())
     vec_push((*g).scopes, m)
 }
 
 export func cg_pop_scope(g: *Cg) -> void {
-    scopes: *Vector<*Map<CBind>> = (*g).scopes
+    scopes: *Vector<*Map<string, CBind>> = (*g).scopes
     (*scopes).len = vec_len(scopes) - 1
 }
 
 export func cg_declare(g: *Cg, name: int64, cvar: string, tyid: int64) -> void {
-    scopes: *Vector<*Map<CBind>> = (*g).scopes
-    top: *Map<CBind> = vec_get(scopes, vec_len(scopes) - 1)
+    scopes: *Vector<*Map<string, CBind>> = (*g).scopes
+    top: *Map<string, CBind> = vec_get(scopes, vec_len(scopes) - 1)
     map_put(top, rs_gkey(name), CBind { cvar: cvar, ty: tyid, found: true })
 }
 
 export func cg_lookup(g: *Cg, name: int64) -> CBind {
     key: string = rs_gkey(name)
-    scopes: *Vector<*Map<CBind>> = (*g).scopes
+    scopes: *Vector<*Map<string, CBind>> = (*g).scopes
     mut i: int64 = vec_len(scopes) - 1
     while i >= 0 {
-        m: *Map<CBind> = vec_get(scopes, i)
+        m: *Map<string, CBind> = vec_get(scopes, i)
         if map_has(m, key) {
             return unwrap_or(map_get(m, key), CBind { cvar: "", ty: -1, found: false })
         }

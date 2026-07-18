@@ -57,7 +57,8 @@ func pledge_sig_text(g: *Cg, info: PlInfo) -> string {
     a: *Ast = (*g).ast
     s: *Sigs = (*g).sigs
     pl: PledgeNode = vec_get((*a).pledges, info.pid)
-    ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+    pkey: string = info.key
+    ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
     b: *StringBuilder = alloc(sb_new())
     sb_push_char(b, 40)
     mut i: int64 = 0
@@ -124,7 +125,8 @@ func emit_contract_header(g: *Cg, cid: int64) -> void {
     while j < vec_len(pls) {
         info: PlInfo = vec_get(pls, j)
         pl: PledgeNode = vec_get((*a).pledges, info.pid)
-        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, info.key), no_pledge_sig())
+        pkey: string = info.key
+        ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
         sig: string = sig_canon(s, ps.params, ps.ret)
         m: string = mangle_pledge(cname, ast_name(a, pl.name), fnv1a64(sig), version)
         free(sig)

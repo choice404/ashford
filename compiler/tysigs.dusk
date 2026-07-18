@@ -44,12 +44,12 @@ export struct Sigs {
     ty: *TyArena,
     plists: *Vector<int64>,
     fields: *Vector<FieldSig>,
-    recs: *Map<RecSig>,
-    variants: *Map<VariantSig>,
-    vows: *Map<VowSigT>,
-    pledges: *Map<PledgeSigT>,
-    clauses: *Map<ClauseSigT>,
-    provsigs: *Map<ClauseSigT>,
+    recs: *Map<string, RecSig>,
+    variants: *Map<string, VariantSig>,
+    vows: *Map<string, VowSigT>,
+    pledges: *Map<string, PledgeSigT>,
+    clauses: *Map<string, ClauseSigT>,
+    provsigs: *Map<string, ClauseSigT>,
     abi_pos: bool,
     cur_pkg: int64,
     errors: *Vector<Located>,
@@ -298,7 +298,7 @@ func collect_pledge(s: *Sigs, key: string, pid: int64, sub: int64) -> void {
     ret: int64 = lower_type(s, pl.ret, pl.lo, pl.hi)
     (*s).abi_pos = false
     check_pledge_ret(s, pl, ret)
-    tab: *Map<PledgeSigT> = (*s).pledges
+    tab: *Map<string, PledgeSigT> = (*s).pledges
     if !map_has(tab, key) {
         map_put(tab, key, PledgeSigT { params: params, ret: ret, sub: sub, found: true })
     }
@@ -323,7 +323,7 @@ func collect_schema(s: *Sigs, schid: int64) -> void {
     t: *TyArena = (*s).ty
     sc: SchemaNode = vec_get((*a).schemas, schid)
     key: string = rs_gkey(sc.name)
-    tab: *Map<RecSig> = (*s).recs
+    tab: *Map<string, RecSig> = (*s).recs
     if map_has(tab, key) { return }
     fields: *Vector<FieldSig> = (*s).fields
     off: int64 = vec_len(fields)
@@ -354,7 +354,7 @@ func collect_contract(s: *Sigs, cid: int64) -> void {
         } else if mkind == mk_vow() {
             v: VowNode = vec_get((*a).vows, mid)
             vkey: string = rs_mkey(cid, v.name)
-            vows: *Map<VowSigT> = (*s).vows
+            vows: *Map<string, VowSigT> = (*s).vows
             if !map_has(vows, vkey) {
                 (*s).abi_pos = true
                 vty: int64 = lower_type(s, v.ty, v.lo, v.hi)
@@ -367,7 +367,7 @@ func collect_contract(s: *Sigs, cid: int64) -> void {
         } else if mkind == mk_clause() {
             cl: ClauseNode = vec_get((*a).clauses, mid)
             ckey: string = rs_mkey(cid, cl.name)
-            clauses: *Map<ClauseSigT> = (*s).clauses
+            clauses: *Map<string, ClauseSigT> = (*s).clauses
             if !map_has(clauses, ckey) {
                 params: TyList = lower_params(s, cl.params_off, cl.params_len, cl.lo, cl.hi)
                 map_put(clauses, ckey, ClauseSigT { params: params, ret: lower_type(s, cl.ret, cl.lo, cl.hi), found: true })
@@ -396,12 +396,12 @@ func collect_contract(s: *Sigs, cid: int64) -> void {
 export func build_sigs(a: *Ast, r: *Resolved, t: *TyArena, errors: *Vector<Located>) -> *Sigs {
     plists: *Vector<int64> = alloc(vec_new())
     fields: *Vector<FieldSig> = alloc(vec_new())
-    recs: *Map<RecSig> = alloc(map_new())
-    variants: *Map<VariantSig> = alloc(map_new())
-    vows: *Map<VowSigT> = alloc(map_new())
-    pledges: *Map<PledgeSigT> = alloc(map_new())
-    clauses: *Map<ClauseSigT> = alloc(map_new())
-    provsigs: *Map<ClauseSigT> = alloc(map_new())
+    recs: *Map<string, RecSig> = alloc(map_new())
+    variants: *Map<string, VariantSig> = alloc(map_new())
+    vows: *Map<string, VowSigT> = alloc(map_new())
+    pledges: *Map<string, PledgeSigT> = alloc(map_new())
+    clauses: *Map<string, ClauseSigT> = alloc(map_new())
+    provsigs: *Map<string, ClauseSigT> = alloc(map_new())
     s: *Sigs = alloc(Sigs {
         ast: a, res: r, ty: t,
         plists: plists, fields: fields,
@@ -433,7 +433,7 @@ func collect_record(s: *Sigs, rid: int64) -> void {
     a: *Ast = (*s).ast
     rec: RecordNode = vec_get((*a).records, rid)
     key: string = rs_gkey(rec.name)
-    tab: *Map<RecSig> = (*s).recs
+    tab: *Map<string, RecSig> = (*s).recs
     if map_has(tab, key) { return }
     fields: *Vector<FieldSig> = (*s).fields
     off: int64 = vec_len(fields)
@@ -456,7 +456,7 @@ func collect_sum(s: *Sigs, sid: int64) -> void {
         vid: int64 = vec_get((*a).kids, sum.variants_off + i)
         v: VariantNode = vec_get((*a).variants, vid)
         key: string = rs_gkey(v.name)
-        tab: *Map<VariantSig> = (*s).variants
+        tab: *Map<string, VariantSig> = (*s).variants
         if !map_has(tab, key) {
             fields: *Vector<FieldSig> = (*s).fields
             off: int64 = vec_len(fields)
@@ -481,7 +481,7 @@ func collect_prov(s: *Sigs, pvid: int64) -> void {
     while i < pv.sigs_len {
         sig: ClauseSigNode = vec_get((*a).clause_sigs, vec_get((*a).kids, pv.sigs_off + i))
         key: string = sig_pkey(pvid, sig.name)
-        tab: *Map<ClauseSigT> = (*s).provsigs
+        tab: *Map<string, ClauseSigT> = (*s).provsigs
         if !map_has(tab, key) {
             (*s).abi_pos = true
             params: TyList = lower_params(s, sig.params_off, sig.params_len, pv.lo, pv.hi)
@@ -518,7 +518,7 @@ export func sig_prov_clause(s: *Sigs, pvid: int64, name: int64) -> ClauseSigT {
 // anonymous subcontract's pledge under the member key, or a pledge inside any
 // named subcontract, all fulfillable through the signed instance.
 export func find_pledge(s: *Sigs, cid: int64, name: int64) -> PledgeSigT {
-    tab: *Map<PledgeSigT> = (*s).pledges
+    tab: *Map<string, PledgeSigT> = (*s).pledges
     mkey: string = rs_mkey(cid, name)
     if map_has(tab, mkey) {
         return unwrap_or(map_get(tab, mkey), no_pledge_sig())

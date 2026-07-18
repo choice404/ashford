@@ -5,6 +5,70 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.5] the emitted surface
+
+The gRPC bridge surface comes out of the compiler. `ashc emit-proto` runs the
+same front end as `build` and writes two artifacts a consumer in any gRPC
+language builds against with stock tooling: the `.proto` spelling every public
+contract as its own typed service, and the Go session wrapper carrying the one
+thing protoc cannot write, the stream whose lifetime is the instance's. A Go
+client built from nothing but those artifacts walks the whole payment
+lifecycle against the Python bridge server, and the suite pins both files as
+goldens beside the module C and the header.
+
+- add `ashc emit-proto <file>`: one front end pass, two files under
+  `target/ashc-out`, `<stem>.proto` and `<stem>_session.go`, both byte stable
+  for a given source
+- spell the `.proto` as the streaming session surface: one typed rpc per
+  pledge in declaration order, `Session(SignRequest) returns (stream
+  SessionEvent)` with the signature as the first event, vows as optional
+  fields with the declared-default note, each distinct `Result` as a oneof
+  message emitted once, the partial surface as repeated names in the
+  runtime's insertion order, and no Debug rpc, because the instance table is
+  server internal and nothing shipped exposes it
+- pin the shape hash in the wrapper: `shape_string` and `fnv1a64` are the
+  same calls the module and header emitters make, so the
+  `PaymentServiceShapeHash` constant in the Go source and the hash the
+  compiled module registers cannot disagree, and a sign that pins it proves
+  the emitted surface and the loaded module describe one contract before the
+  first pledge runs
+- scope the bridge to the scalar set by name: a vow, a parameter, or a
+  `Result` arm outside Int, Uint, Float, Bool, and String is a named build
+  error, not a silent hole in the service
+- prefix contract scoped messages only when a file declares more than one
+  public contract, so the single contract file reads as its service and the
+  shared file stays unambiguous
+- stand the Go consumer up in `interop/grpc/go`: module `ashbridge`, a client
+  that imports protoc's output over the emitted proto plus the emitted
+  wrapper and asserts the Python walk check for check, the vow override, the
+  pending order, the value Err as err=41 on an OK rpc, the automatic break
+  keeping its payload and the explicit break zeroing it, a killed client's
+  instance collected in milliseconds, a quiet session resuming after three
+  times the old timer, and a lying shape hash refused as ABORTED, the
+  bridge's spelling of `ASH_ERR_VERSION`
+- gate it twice: `test-proto` diffs both emitted files against pinned goldens
+  inside the default suite, and `test-grpc-go` builds the Go client and runs
+  it against the bridge server, out of the all gate beside the other gRPC
+  gates and skipping clean where go, protoc, or the protoc-gen-go pair is
+  absent
+- move the compiler onto dusk 1.5: `std.map` is generic over its key now, so
+  every `Map<V>` spells `Map<string, V>`, and the map lookups whose key was a
+  struct field access hoist it into a typed local the type parameter pins to;
+  the Makefile and README name 1.5 as the floor
+
+### Notes
+
+The wire compatibility comment at the top of the hand written
+`payment_bridge.proto`, "the shape ashc emits in step 2", is now enforced by
+a passing gate: the Go client is generated from the emitted proto, the server
+from the hand one, and every call routes because package, service, and field
+numbers agree. The language coverage question closes with it. Any language
+protoc speaks gets the typed surface from the emitted proto, and the session
+wrapper is a per language template of about forty lines with one idea in it;
+Go's is written by the compiler, another language's is a morning. What the
+bridge still wants, the instance that outlives its connection, affinity, and
+partition tolerance, is one piece of work and it is Layer 3's.
+
 ## [v0.3.2] the whole suite
 
 Every layer the language carries now answers to one command. `make all` runs the

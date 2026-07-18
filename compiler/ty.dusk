@@ -24,7 +24,7 @@ export struct TyArena {
     kids: *Vector<int64>,
     canons: *Vector<int64>,
     interner: *Interner,
-    ids: *Map<int64>,
+    ids: *Map<string, int64>,
 }
 
 export func tyk_int() -> int64 { return 0 }
@@ -49,7 +49,7 @@ export func ty_arena_new() -> *TyArena {
     nodes: *Vector<TyNode> = alloc(vec_new())
     kids: *Vector<int64> = alloc(vec_new())
     canons: *Vector<int64> = alloc(vec_new())
-    ids: *Map<int64> = alloc(map_new())
+    ids: *Map<string, int64> = alloc(map_new())
     return alloc(TyArena {
         nodes: nodes,
         kids: kids,
@@ -154,7 +154,7 @@ export func ty_intern(t: *TyArena, n: TyNode) -> int64 {
     c: string = ty_canon(t, n)
     cid: int64 = intern_owned((*t).interner, c)
     key: string = intern_get((*t).interner, cid)
-    ids: *Map<int64> = (*t).ids
+    ids: *Map<string, int64> = (*t).ids
     if map_has(ids, key) {
         return unwrap_or(map_get(ids, key), -1)
     }

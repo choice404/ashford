@@ -78,7 +78,7 @@ func emit_ops(g: *Cg, cname: string, tag: string, ops: *Vector<int64>) -> void {
 // The postfix program of one source line, a post order walk of the ReqNode
 // tree. Atom indices come from the shared reqsolve enumeration, so the
 // program references the same atom table the satisfiability check saw.
-func build_postfix(a: *Ast, id: int64, idx: *Map<int64>, ops: *Vector<int64>) -> void {
+func build_postfix(a: *Ast, id: int64, idx: *Map<string, int64>, ops: *Vector<int64>) -> void {
     q: ReqNode = vec_get((*a).reqs, id)
     if q.kind == rk_atom() {
         i: int64 = unwrap_or(map_get(idx, rs_gkey(q.a)), 0)
@@ -166,7 +166,7 @@ func emit_source_block(g: *Cg, cid: int64, cname: string, rbid: int64, sub_ids: 
     a: *Ast = (*g).ast
     rb: ReqBlockNode = vec_get((*a).reqblocks, rbid)
     names: *Vector<int64> = alloc(vec_new())
-    idx: *Map<int64> = alloc(map_new())
+    idx: *Map<string, int64> = alloc(map_new())
     if rb.fulfill >= 0 { req_collect_atoms(a, rb.fulfill, names, idx) }
     if rb.partial >= 0 { req_collect_atoms(a, rb.partial, names, idx) }
     if rb.brk >= 0 { req_collect_atoms(a, rb.brk, names, idx) }

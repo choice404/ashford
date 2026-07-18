@@ -67,7 +67,7 @@ func check_args(tc: *Tc, params: TyList, off: int64, len: int64, lo: int64, hi: 
 func check_sign(tc: *Tc, cid: int64, cname: string, e: ExprNode) -> int64 {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
-    supplied: *Map<int64> = alloc(map_new())
+    supplied: *Map<string, int64> = alloc(map_new())
     mut i: int64 = 0
     while i < e.c {
         arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))

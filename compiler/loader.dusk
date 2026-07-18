@@ -63,8 +63,8 @@ struct Ld {
     files: *Vector<LdFile>,
     decl_pkg: *Vector<int64>,
     errors: *Vector<string>,
-    status: *Map<int64>,
-    pkgs: *Map<int64>,
+    status: *Map<string, int64>,
+    pkgs: *Map<string, int64>,
     npkgs: int64,
     rootdir: string,
     home: string,
@@ -162,7 +162,7 @@ func ash_home() -> string {
 // The package id of a directory, assigned in first encounter order so a
 // rebuild numbers the packages the same way.
 func pkg_of(ld: *Ld, dir: string) -> int64 {
-    tab: *Map<int64> = (*ld).pkgs
+    tab: *Map<string, int64> = (*ld).pkgs
     if map_has(tab, dir) {
         return unwrap_or(map_get(tab, dir), 0)
     }
@@ -316,7 +316,7 @@ func ld_error(ld: *Ld, path: string, src: string, n: int64, lo: int64, hi: int64
 struct LdTarget { found: bool, path: string }
 
 func resolve_import(ld: *Ld, imp: string) -> LdTarget {
-    status: *Map<int64> = (*ld).status
+    status: *Map<string, int64> = (*ld).status
     rel: string = import_rel(imp)
     c1: string = path_under((*ld).rootdir, rel)
     if map_has(status, c1) {
@@ -397,7 +397,7 @@ func load_file(ld: *Ld, path: string) -> void {
     // once and walked once; a fresh one resolves and loads depth first. The
     // status table makes a second sighting of a file free and a sighting of
     // a still loading file a cycle.
-    seen: *Map<int64> = alloc(map_new())
+    seen: *Map<string, int64> = alloc(map_new())
     mut ii: int64 = imp_lo
     while ii < imp_hi {
         imp: ImportNode = vec_get(imports, ii)
@@ -411,7 +411,8 @@ func load_file(ld: *Ld, path: string) -> void {
                 if !t.found {
                     ld_error(ld, path, s.text, s.len, imp.lo - base, imp.hi - base, lmsg3("cannot resolve import '", text, "'"))
                 } else {
-                    st: int64 = unwrap_or(map_get((*ld).status, t.path), 0)
+                    tpath: string = t.path
+                    st: int64 = unwrap_or(map_get((*ld).status, tpath), 0)
                     if st == 1 {
                         ld_error(ld, path, s.text, s.len, imp.lo - base, imp.hi - base, lmsg3("import cycle detected through '", text, "'"))
                     } else if st == 0 {
@@ -436,8 +437,8 @@ export func load_program(root_path: string) -> *Program {
     files: *Vector<LdFile> = alloc(vec_new())
     decl_pkg: *Vector<int64> = alloc(vec_new())
     errors: *Vector<string> = alloc(vec_new())
-    status: *Map<int64> = alloc(map_new())
-    pkgs: *Map<int64> = alloc(map_new())
+    status: *Map<string, int64> = alloc(map_new())
+    pkgs: *Map<string, int64> = alloc(map_new())
     ld: *Ld = alloc(Ld {
         ast: ast_new(),
         files: files,

@@ -53,11 +53,11 @@ export struct MEntry { kind: int64, id: int64, sub: int64, lo: int64, hi: int64 
 // imports the dotted paths by their text.
 export struct Resolved {
     ast: *Ast,
-    globals: *Map<GEntry>,
-    members: *Map<MEntry>,
-    sub_pledges: *Map<int64>,
-    incs: *Map<int64>,
-    imports: *Map<int64>,
+    globals: *Map<string, GEntry>,
+    members: *Map<string, MEntry>,
+    sub_pledges: *Map<string, int64>,
+    incs: *Map<string, int64>,
+    imports: *Map<string, int64>,
     decl_pkg: *Vector<int64>,
     errors: *Vector<Located>,
 }
@@ -181,7 +181,7 @@ func mk_word(kind: int64) -> string {
 func collect_imports(r: *Resolved) -> void {
     a: *Ast = (*r).ast
     imps: *Vector<ImportNode> = (*a).imports
-    tab: *Map<int64> = (*r).imports
+    tab: *Map<string, int64> = (*r).imports
     mut i: int64 = 0
     while i < vec_len(imps) {
         imp: ImportNode = vec_get(imps, i)
@@ -221,7 +221,7 @@ func declare_global(r: *Resolved, kind: int64, id: int64, pkg: int64, name: int6
         return
     }
     key: string = rs_gkey(name)
-    tab: *Map<GEntry> = (*r).globals
+    tab: *Map<string, GEntry> = (*r).globals
     if map_has(tab, key) {
         emit(r, lo, hi, msg5("duplicate ", gk_word(kind), " '", text, "'"))
         return
@@ -273,7 +273,7 @@ func declare_member(r: *Resolved, cid: int64, cname: string, kind: int64, id: in
         return
     }
     key: string = rs_mkey(cid, name)
-    tab: *Map<MEntry> = (*r).members
+    tab: *Map<string, MEntry> = (*r).members
     if map_has(tab, key) {
         emit(r, lo, hi, msg7("duplicate ", mk_word(kind), " '", text, "' in contract '", cname, "'"))
         return
@@ -299,7 +299,7 @@ func collect_sub(r: *Resolved, cid: int64, cname: string, subid: int64) -> void 
             ptext: string = ast_name(a, pl.name)
             if str_len(ptext) > 0 {
                 key: string = rs_skey(subid, pl.name)
-                tab: *Map<int64> = (*r).sub_pledges
+                tab: *Map<string, int64> = (*r).sub_pledges
                 if map_has(tab, key) {
                     emit(r, pl.lo, pl.hi, msg5("duplicate pledge '", ptext, "' in subcontract '", sname, "'"))
                 } else {
@@ -367,7 +367,7 @@ func collect_members(r: *Resolved, cid: int64) -> void {
 // matches is the type checker's question; the name being there settles this
 // pass. provided maps each contributed clause name to the provisional clause
 // that brought it, for the conflict message.
-func resolve_incorporate(r: *Resolved, cid: int64, cname: string, cpkg: int64, incid: int64, provided: *Map<string>) -> void {
+func resolve_incorporate(r: *Resolved, cid: int64, cname: string, cpkg: int64, incid: int64, provided: *Map<string, string>) -> void {
     a: *Ast = (*r).ast
     inc: IncNode = vec_get((*a).incs, incid)
     text: string = ast_name(a, inc.name)
@@ -393,7 +393,7 @@ func resolve_incorporate(r: *Resolved, cid: int64, cname: string, cpkg: int64, i
         }
     }
     ikey: string = rs_ikey(cid, g.id)
-    itab: *Map<int64> = (*r).incs
+    itab: *Map<string, int64> = (*r).incs
     if map_has(itab, ikey) {
         emit(r, inc.lo, inc.hi, msg5("duplicate incorporate of '", text, "' in contract '", cname, "'"))
         return
@@ -426,7 +426,7 @@ func resolve_incorporates(r: *Resolved, cid: int64) -> void {
     c: ContractNode = vec_get((*a).contracts, cid)
     cname: string = ast_name(a, c.name)
     cg: GEntry = rs_global(r, c.name)
-    provided: *Map<string> = alloc(map_new())
+    provided: *Map<string, string> = alloc(map_new())
     mut i: int64 = 0
     while i < c.members_len {
         mkind: int64 = vec_get((*a).kids, c.members_off + i)
@@ -444,7 +444,7 @@ func named_sub_pledge(r: *Resolved, cid: int64, name: int64) -> bool {
     a: *Ast = (*r).ast
     c: ContractNode = vec_get((*a).contracts, cid)
     kids: *Vector<int64> = (*a).kids
-    tab: *Map<int64> = (*r).sub_pledges
+    tab: *Map<string, int64> = (*r).sub_pledges
     mut i: int64 = 0
     while i < c.members_len {
         mkind: int64 = vec_get(kids, c.members_off + i)
@@ -468,7 +468,7 @@ func named_sub_pledge(r: *Resolved, cid: int64, name: int64) -> bool {
 // the policy can test. Every named atom counts toward the contract limit
 // whether it resolved or not, since the limit bounds the satisfiability
 // enumeration over the names as written.
-func resolve_req_atom(r: *Resolved, cid: int64, q: ReqNode, seen: *Map<int64>) -> void {
+func resolve_req_atom(r: *Resolved, cid: int64, q: ReqNode, seen: *Map<string, int64>) -> void {
     a: *Ast = (*r).ast
     text: string = ast_name(a, q.a)
     if str_len(text) == 0 {
@@ -496,7 +496,7 @@ func resolve_req_atom(r: *Resolved, cid: int64, q: ReqNode, seen: *Map<int64>) -
     emit(r, q.lo, q.hi, msg3("requirements name '", text, "' is not a subcontract or a pledge"))
 }
 
-func resolve_req_expr(r: *Resolved, cid: int64, id: int64, seen: *Map<int64>) -> void {
+func resolve_req_expr(r: *Resolved, cid: int64, id: int64, seen: *Map<string, int64>) -> void {
     a: *Ast = (*r).ast
     q: ReqNode = vec_get((*a).reqs, id)
     if q.kind == rk_atom() {
@@ -525,7 +525,7 @@ func resolve_requirements(r: *Resolved, cid: int64) -> void {
             if !done {
                 done = true
                 rb: ReqBlockNode = vec_get((*a).reqblocks, vec_get((*a).kids, c.members_off + i + 1))
-                seen: *Map<int64> = alloc(map_new())
+                seen: *Map<string, int64> = alloc(map_new())
                 if rb.fulfill >= 0 {
                     resolve_req_expr(r, cid, rb.fulfill, seen)
                 }
@@ -551,11 +551,11 @@ func resolve_requirements(r: *Resolved, cid: int64) -> void {
 // declaration order; an empty vector reads as one package, the single file
 // case.
 export func resolve_file(a: *Ast, decl_pkg: *Vector<int64>) -> *Resolved {
-    globals: *Map<GEntry> = alloc(map_new())
-    members: *Map<MEntry> = alloc(map_new())
-    sub_pledges: *Map<int64> = alloc(map_new())
-    incs: *Map<int64> = alloc(map_new())
-    imports: *Map<int64> = alloc(map_new())
+    globals: *Map<string, GEntry> = alloc(map_new())
+    members: *Map<string, MEntry> = alloc(map_new())
+    sub_pledges: *Map<string, int64> = alloc(map_new())
+    incs: *Map<string, int64> = alloc(map_new())
+    imports: *Map<string, int64> = alloc(map_new())
     errors: *Vector<Located> = alloc(vec_new())
     r: *Resolved = alloc(Resolved {
         ast: a,

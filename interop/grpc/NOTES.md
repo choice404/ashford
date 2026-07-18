@@ -414,3 +414,73 @@ The answer is the party that holds it, and gRPC will tell you the moment they
 stop. Emit the `.proto` and the session wrapper from ashc and drive it from Go
 next, let the store answer everything left in this file, and retire the custom
 wire after that.
+
+# The gRPC bridge, step 2: the surface out of the compiler
+
+Steps 1 and 1b proved the shape by hand: a hand written `.proto` for one
+contract, a hand written session object in one language. Step 2 makes ashc
+write both, and proves the emitted surface with the consumer the whole
+exercise was aimed at, a Go client that has never heard of Ashford.
+
+## What ashc emits
+
+`ashc emit-proto skeleton/payment.ash` runs the same front end as `build` and
+writes two files. `payment.proto` is the step 1b surface exactly: one typed
+rpc per pledge, the streaming `Session` whose lifetime is the instance's, the
+Result oneof, the partial surface with its repeated name lists, and no Debug
+rpc, because the instance table is server internal and nothing shipped should
+expose it. `payment_session.go` is the wrapper step 1b said protoc cannot
+write: open, first event, handle, Close, about forty lines, in the same Go
+package as protoc's own output so the two halves import as one.
+
+The wrapper also pins the shape hash. `shape_string` and `fnv1a64` are the
+same calls the module emitter and the header emitter make, so the constant in
+the Go source and the hash the compiled module registers cannot disagree. A
+Go client that signs with `paymentpb.PaymentServiceShapeHash` and gets a
+signature back has proven the emitted surface and the loaded module describe
+the same contract, end to end, before the first pledge runs.
+
+Both files are byte stable and pinned as goldens, the same discipline the
+module C and the header live under. `make test-proto` diffs them on every
+run of the suite.
+
+## The Go walk
+
+`make test-grpc-go` builds a client from nothing but the emitted artifacts,
+protoc's output over the emitted `.proto` plus the emitted wrapper, and runs
+the whole payment lifecycle against the Python server from step 1b. Every
+assertion the Python client makes, the Go client makes, minus the Debug
+counts: where Python counts rows, Go reads the row's own fate, present until
+its stream ends, NOT_FOUND after. The vow override lands, half a subcontract
+moves nothing, the value Err crosses as err=41 on an OK rpc, the automatic
+break keeps its payload and the explicit break zeroes it, a killed client's
+instance is collected in milliseconds, and a session quiet for three times
+the old timer resumes on latches set before the silence.
+
+Two things surfaced that the Python walk could not have said:
+
+- **The wire compatibility claim is now a fact, not a comment.** The hand
+  written proto said "the shape ashc emits in step 2" at the top. The Go
+  client is generated from the emitted proto and the server from the hand
+  one, and every call routes: same package, same service, same field
+  numbers. The comment is now enforced by a passing gate.
+- **A lying hash is ABORTED.** Shape skew at sign is ASH_ERR_VERSION in the
+  runtime, and the bridge's status table maps it to ABORTED, not
+  INVALID_ARGUMENT. Fair: it is not a malformed request, it is two builds
+  disagreeing about the world. The wrapper's pinned constant is what makes
+  the honest path the easy one.
+
+## What the language coverage objection is now
+
+Step 1b closed with "emit the .proto and the session wrapper from ashc and
+drive it from Go". Both are done. The objection Appendix III kept open, that
+the bridge only spoke languages someone hand wrote a binding for, is dead:
+any language protoc speaks gets the typed surface from the emitted proto,
+and the session wrapper is a per language template of about forty lines with
+exactly one idea in it. Go's is written by the compiler today; another
+language's is a morning, not a milestone.
+
+What remains is what 1b already said remains: the instance that outlives its
+connection, affinity, and partition tolerance are one piece of work and it
+is Layer 3. The surface is out of the compiler; the store is the rest of the
+quarter.

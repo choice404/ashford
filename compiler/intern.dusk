@@ -14,12 +14,12 @@
 
 export struct Interner {
     vals: *Vector<string>,
-    ids: *Map<int64>,
+    ids: *Map<string, int64>,
 }
 
 export func intern_new() -> *Interner {
     vals: *Vector<string> = alloc(vec_new())
-    ids: *Map<int64> = alloc(map_new())
+    ids: *Map<string, int64> = alloc(map_new())
     return alloc(Interner { vals: vals, ids: ids })
 }
 
@@ -29,7 +29,7 @@ func str_copy(s: string) -> string {
 
 // Interns a borrowed string, copying it only when it is new to the table.
 export func intern_id(i: *Interner, s: string) -> int64 {
-    ids: *Map<int64> = (*i).ids
+    ids: *Map<string, int64> = (*i).ids
     vals: *Vector<string> = (*i).vals
     if map_has(ids, s) {
         return unwrap_or(map_get(ids, s), -1)
@@ -43,7 +43,7 @@ export func intern_id(i: *Interner, s: string) -> int64 {
 
 // Interns a string the caller already owns; the table takes ownership.
 export func intern_owned(i: *Interner, s: string) -> int64 {
-    ids: *Map<int64> = (*i).ids
+    ids: *Map<string, int64> = (*i).ids
     vals: *Vector<string> = (*i).vals
     if map_has(ids, s) {
         return unwrap_or(map_get(ids, s), -1)

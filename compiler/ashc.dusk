@@ -41,10 +41,11 @@
 @import reqsolve
 @import cgen
 @import cgenhdr
+@import cgenproto
 @import cgenbin
 
 func version_string() -> string {
-    return "ashc 0.2.4"
+    return "ashc 0.3.5"
 }
 
 func usage() -> void {
@@ -57,6 +58,7 @@ func usage() -> void {
     printerr("  build <file>  emit the module C and link it into a shared library")
     printerr("  build --bin <file>  link a standalone executable around the Main contract")
     printerr("  emit-header <file>  write the C header naming the module's hashes and symbols")
+    printerr("  emit-proto <file>   write the gRPC .proto and the Go session wrapper")
 }
 
 // Runs the lexer on the file at path, printing one line per token to stdout
@@ -467,6 +469,79 @@ func cmd_emit_header(path: string) -> int32 {
     return 0
 }
 
+// The gRPC surface: the .proto spelling every public contract as a typed
+// service, and the Go session wrapper beside it. Two files, one front end
+// pass, both byte stable for a given source.
+func cmd_emit_proto(path: string) -> int32 {
+    prog: *Program = load_program(path)
+    ld_print_errors(prog)
+    if !(*prog).ok { return 1 }
+    tree: *Ast = (*prog).ast
+    res: *Resolved = resolve_file(tree, (*prog).decl_pkg)
+    if emit_pass_errors(prog, rs_errors(res)) > 0 { return 1 }
+    terrs: *Vector<Located> = typeck_file(tree, res)
+    reqsolve_file(tree, res, terrs)
+    if emit_pass_errors(prog, terrs) > 0 { return 1 }
+
+    t: *TyArena = ty_arena_new()
+    scratch: *Vector<Located> = alloc(vec_new())
+    sigs: *Sigs = build_sigs(tree, res, t, scratch)
+    gerrs: *Vector<Located> = alloc(vec_new())
+    stem: string = stem_of(path)
+    ptext: string = cgen_proto(tree, res, sigs, t, gerrs, stem)
+    // The wrapper walks the same surface, so a source the proto refuses
+    // would only say every refusal twice; one emitter's verdict is the pass's.
+    mut gtext: string = ""
+    if vec_len(gerrs) == 0 {
+        gtext = cgen_proto_go(tree, res, sigs, t, gerrs, stem)
+    }
+    if emit_pass_errors(prog, gerrs) > 0 {
+        free(ptext)
+        free(gtext)
+        free(stem)
+        return 1
+    }
+
+    out: string = out_dir()
+    if !make_out_dir(out) {
+        free(ptext)
+        free(gtext)
+        free(stem)
+        return 1
+    }
+    base: string = join2(out, "/")
+    pname: string = join2(stem, ".proto")
+    ppath: string = join2(base, pname)
+    gname: string = join2(stem, "_session.go")
+    gpath: string = join2(base, gname)
+    free(pname)
+    free(gname)
+    free(base)
+    free(stem)
+
+    perr := write_file(ppath, ptext)
+    free(ptext)
+    if perr.exists() {
+        printerr("ashc: could not write the proto")
+        free(ppath)
+        free(gpath)
+        free(gtext)
+        return 1
+    }
+    gerr := write_file(gpath, gtext)
+    free(gtext)
+    if gerr.exists() {
+        printerr("ashc: could not write the session wrapper")
+        free(ppath)
+        free(gpath)
+        return 1
+    }
+    free(ppath)
+    free(gpath)
+    printerr("[ashc] wrote the proto and the session wrapper")
+    return 0
+}
+
 func main(argc: int32, argv: string[]) -> int32 {
     if argv.len < 2 {
         printerr("ashc: no command given")
@@ -525,6 +600,14 @@ func main(argc: int32, argv: string[]) -> int32 {
             return 1
         }
         return cmd_emit_header(argv[2])
+    }
+    if str_eq(cmd, "emit-proto") {
+        if argv.len < 3 {
+            printerr("ashc: emit-proto needs a file argument")
+            usage()
+            return 1
+        }
+        return cmd_emit_proto(argv[2])
     }
     printerr("ashc: unknown command")
     usage()

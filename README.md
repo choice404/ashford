@@ -87,6 +87,7 @@ target/dusk-out/ashc version
 target/dusk-out/ashc build skeleton/hello.ash
 target/dusk-out/ashc build --bin skeleton/main_demo.ash
 target/dusk-out/ashc emit-header skeleton/hello.ash
+target/dusk-out/ashc emit-proto skeleton/payment.ash
 ```
 
 `build` reads the source, emits the module C into `target/ashc-out/`, and links it with cc into a loadable `.ash.so`. Run it from the repository root, since it hands cc the relative include path, or set `ASH_ROOT` to a checkout and run `ashc` from anywhere: `ASH_ROOT` points cc at the runtime headers and `libashrt`, and `ASH_HOME` at the standard library for imports.
@@ -101,7 +102,9 @@ make test-bin
 
 `emit-header` writes `target/ashc-out/hello.ash.h`, which spells the shape hash and every mangled pledge name as defines, so a C host resolves and signs against generated names instead of hardcoded strings. `make test-header` pins the header against its golden and compiles a host with it.
 
-The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 0.6.0 predates `std.os` and cannot build `ashc`; point `DUSK` at a newer build when the installed one lags.
+`emit-proto` writes the contract's gRPC surface: `target/ashc-out/payment.proto`, where every pledge is its own typed rpc and signing is a stream whose lifetime is the instance's, and `payment_session.go`, the session wrapper protoc cannot write. A consumer in any gRPC language builds against the `.proto` with stock tooling; `make test-proto` pins both files against their goldens, and `make test-grpc-go` drives the whole payment lifecycle from a Go client built from nothing but the emitted artifacts.
+
+The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 1.5 predates the two parameter `std.map` the compiler is written against; point `DUSK` at a current build when the installed one lags.
 
 ```sh
 make smoke DUSK=~/projects/cool-lang/target/release/dusk
