@@ -492,12 +492,14 @@ func cmd_emit_proto(path: string) -> int32 {
     // The wrapper walks the same surface, so a source the proto refuses
     // would only say every refusal twice; one emitter's verdict is the pass's.
     mut gtext: string = ""
+    mut have_g: bool = false
     if vec_len(gerrs) == 0 {
         gtext = cgen_proto_go(tree, res, sigs, t, gerrs, stem)
+        have_g = true
     }
     if emit_pass_errors(prog, gerrs) > 0 {
         free(ptext)
-        free(gtext)
+        if have_g { free(gtext) }
         free(stem)
         return 1
     }

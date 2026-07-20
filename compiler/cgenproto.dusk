@@ -50,8 +50,10 @@ func proto_scalar(g: *Cg, tyid: int64) -> string {
     return ""
 }
 
-// The Ashford spelling that names a result message arm: Result<Bool, Int>
-// contributes the Bool and the Int of BoolIntResult.
+// The Ashford spelling that names a result message arm or a wrapper:
+// Result<Bool, Int> contributes the Bool and the Int of BoolIntResult, a
+// declared record or sum contributes its own name, Unit is Unit, and the
+// containers compose, Option<Int> naming IntOption and List<Int> IntList.
 func ty_word(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
     if k == tyk_int() { return "Int" }
@@ -59,6 +61,24 @@ func ty_word(g: *Cg, tyid: int64) -> string {
     if k == tyk_float() { return "Float" }
     if k == tyk_bool() { return "Bool" }
     if k == tyk_str() { return "String" }
+    if k == tyk_unit() { return "Unit" }
+    if k == tyk_named() {
+        cn: CNamed = cg_named(g, tyid)
+        if cn.kind == gk_record() || cn.kind == gk_sum() {
+            return ast_name((*g).ast, cn.name)
+        }
+        return ""
+    }
+    if k == tyk_option() {
+        iw: string = ty_word(g, ty_get((*g).ty, tyid).a)
+        if str_len(iw) == 0 { return "" }
+        return tmsg2(iw, "Option")
+    }
+    if k == tyk_list() {
+        iw: string = ty_word(g, ty_get((*g).ty, tyid).a)
+        if str_len(iw) == 0 { return "" }
+        return tmsg2(iw, "List")
+    }
     return ""
 }
 
@@ -78,6 +98,49 @@ func camel_of(name: string) -> string {
                 sb_push_char(b, c)
             }
             up = false
+        }
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// CamelCase to snake_case, the oneof field spelling of a sum's arm.
+func snake_of(name: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut i: int64 = 0
+    while i < str_len(name) {
+        c: int64 = name[i]
+        if c >= 65 && c <= 90 {
+            if i > 0 { sb_push_char(b, 95) }
+            sb_push_char(b, c + 32)
+        } else {
+            sb_push_char(b, c)
+        }
+        i = i + 1
+    }
+    out: string = substring(sb_cstr(b), 0, sb_size(b))
+    sb_free(b)
+    free(b)
+    return out
+}
+
+// CamelCase to SCREAMING_SNAKE, the enum value spelling proto reserves for
+// its shared value namespace.
+func scream_of(name: string) -> string {
+    b: *StringBuilder = alloc(sb_new())
+    mut i: int64 = 0
+    while i < str_len(name) {
+        c: int64 = name[i]
+        if c >= 65 && c <= 90 {
+            if i > 0 { sb_push_char(b, 95) }
+            sb_push_char(b, c)
+        } else if c >= 97 && c <= 122 {
+            sb_push_char(b, c - 32)
+        } else {
+            sb_push_char(b, c)
         }
         i = i + 1
     }
@@ -118,6 +181,28 @@ func has_str(v: *Vector<string>, s: string) -> bool {
     return false
 }
 
+// The request message name of one pledge. A pledge spelled sign is a legal
+// contract member, so its message steps aside from the session surface's
+// SignRequest under the one reserved disambiguation; every other pledge is
+// <prefix><Camel>Request.
+func req_msg_name(prefix: string, camel: string) -> string {
+    if str_eq(camel, "Sign") {
+        return tmsg3(prefix, camel, "PledgeRequest")
+    }
+    return tmsg3(prefix, camel, "Request")
+}
+
+// Whether a pledge's rpc spelling takes a name the session surface owns,
+// recorded as a build error: the service already carries Session,
+// GetPartial, and Break.
+func rpc_name_taken(g: *Cg, pl: PledgeNode, camel: string) -> bool {
+    if str_eq(camel, "Session") || str_eq(camel, "GetPartial") || str_eq(camel, "Break") {
+        cg_err(g, pl.lo, pl.hi, tmsg2("codegen: a pledge's rpc spelling collides with the session surface: ", camel))
+        return true
+    }
+    return false
+}
+
 // The contract scoped message prefix: the contract's name when the file
 // declares more than one public contract, empty otherwise.
 func proto_prefix(g: *Cg, cid: int64, many: bool) -> string {
@@ -127,22 +212,279 @@ func proto_prefix(g: *Cg, cid: int64, many: bool) -> string {
     return ast_name(a, c.name)
 }
 
-// The result message name of one pledge's declared Result, or the empty
-// string when the return is outside the lowered subset, recorded as a build
-// error either way.
-func result_msg_of(g: *Cg, pl: PledgeNode, ret: int64) -> string {
+// The rpc return message name of one pledge, spelled without emitting or
+// recording anything: a declared Result names its oneof message, a declared
+// Option names its wrapper. The empty string for a return outside the
+// bridged set; the message pass is where that becomes a named build error.
+func ret_name_of(g: *Cg, ret: int64) -> string {
     tn: TyNode = ty_get((*g).ty, ret)
+    if tn.kind == tyk_result() {
+        okw: string = ty_word(g, tn.a)
+        errw: string = ty_word(g, tn.b)
+        if str_len(okw) == 0 || str_len(errw) == 0 { return "" }
+        return tmsg3(okw, errw, "Result")
+    }
+    if tn.kind == tyk_option() {
+        return ty_word(g, ret)
+    }
+    return ""
+}
+
+// Whether a named type is a sum whose every arm is bare, the shape that
+// crosses as a proto enum and whose fields track presence with optional.
+func sum_is_plain(g: *Cg, tyid: int64) -> bool {
+    a: *Ast = (*g).ast
+    if ty_get((*g).ty, tyid).kind != tyk_named() { return false }
+    cn: CNamed = cg_named(g, tyid)
+    if cn.kind != gk_sum() { return false }
+    sum: SumNode = vec_get((*a).sums, cn.id)
+    mut i: int64 = 0
+    while i < sum.variants_len {
+        v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + i))
+        if v.fields_len > 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The proto spelling of a type in a field or oneof arm position, with the
+// definition it needs emitted once per file: a record or a sum by its
+// declared name, Unit as the empty message, Option and List as their
+// wrapper messages, a scalar as itself. The empty string, and a named build
+// error, for a type outside the bridged set.
+func ensure_type(g: *Cg, tyid: int64, seen: *Vector<string>, lo: int64, hi: int64) -> string {
+    ps: string = proto_scalar(g, tyid)
+    if str_len(ps) > 0 { return ps }
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_unit() {
+        if !has_str(seen, "Unit") {
+            vec_push(seen, "Unit")
+            cg_top(g, "// The Ok of a pledge that answers with nothing; the message is the value.")
+            cg_top(g, "message Unit {}")
+            cg_top(g, "")
+        }
+        return "Unit"
+    }
+    if k == tyk_named() {
+        cn: CNamed = cg_named(g, tyid)
+        if cn.kind == gk_record() { return ensure_record(g, cn.name, seen, lo, hi) }
+        if cn.kind == gk_sum() { return ensure_sum(g, cn, seen, lo, hi) }
+    }
+    if k == tyk_option() {
+        inner: int64 = ty_get((*g).ty, tyid).a
+        w: string = ty_word(g, tyid)
+        if str_len(w) > 0 && !has_str(seen, w) {
+            ispell: string = ensure_type(g, inner, seen, lo, hi)
+            if str_len(ispell) == 0 { return "" }
+            vec_push(seen, w)
+            cg_top(g, tmsg3("// Option<", ty_word(g, inner), "> as a message: an unset value is None."))
+            cg_top(g, tmsg3("message ", w, " {"))
+            if str_len(proto_scalar(g, inner)) > 0 || sum_is_plain(g, inner) {
+                cg_top(g, tmsg3("  optional ", ispell, " value = 1;"))
+            } else {
+                cg_top(g, tmsg3("  ", ispell, " value = 1;"))
+            }
+            cg_top(g, "}")
+            cg_top(g, "")
+        }
+        if str_len(w) > 0 { return w }
+    }
+    if k == tyk_list() {
+        elem: int64 = ty_get((*g).ty, tyid).a
+        lw: string = ty_word(g, tyid)
+        if str_len(lw) > 0 && !has_str(seen, lw) {
+            espell: string = ensure_type(g, elem, seen, lo, hi)
+            if str_len(espell) == 0 { return "" }
+            vec_push(seen, lw)
+            cg_top(g, tmsg3("// List<", ty_word(g, elem), "> as a message, so a list can ride a oneof arm."))
+            cg_top(g, tmsg3("message ", lw, " {"))
+            cg_top(g, tmsg3("  repeated ", espell, " values = 1;"))
+            cg_top(g, "}")
+            cg_top(g, "")
+        }
+        if str_len(lw) > 0 { return lw }
+    }
+    cg_unsupported(g, lo, hi, tmsg2("a type on the gRPC surface outside the bridged set: ", ty_render((*g).ty, tyid)))
+    return ""
+}
+
+// One message field: the label a container needs, the spelling, the name,
+// and the number. A List field is repeated in place, an Option field is
+// optional where proto tracks presence by label and plain where a message
+// carries presence itself. The empty string when the type is refused.
+func field_line(g: *Cg, fname: string, tyid: int64, num: int64, seen: *Vector<string>, lo: int64, hi: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_list() {
+        e: string = ensure_type(g, ty_get((*g).ty, tyid).a, seen, lo, hi)
+        if str_len(e) == 0 { return "" }
+        return tmsg7("  repeated ", e, " ", fname, " = ", int_to_string(num), ";")
+    }
+    if k == tyk_option() {
+        inner: int64 = ty_get((*g).ty, tyid).a
+        e: string = ensure_type(g, inner, seen, lo, hi)
+        if str_len(e) == 0 { return "" }
+        if str_len(proto_scalar(g, inner)) > 0 || sum_is_plain(g, inner) {
+            return tmsg7("  optional ", e, " ", fname, " = ", int_to_string(num), ";")
+        }
+        return tmsg7("  ", e, " ", fname, " = ", int_to_string(num), ";")
+    }
+    s: string = ensure_type(g, tyid, seen, lo, hi)
+    if str_len(s) == 0 { return "" }
+    return tmsg7("  ", s, " ", fname, " = ", int_to_string(num), ";")
+}
+
+// A declared record as a message, its fields in declaration order, emitted
+// once per file under its own name.
+func ensure_record(g: *Cg, name: int64, seen: *Vector<string>, lo: int64, hi: int64) -> string {
+    a: *Ast = (*g).ast
+    rname: string = ast_name(a, name)
+    if has_str(seen, rname) { return rname }
+    rs: RecSig = sig_rec((*g).sigs, name)
+    if !rs.found {
+        cg_unsupported(g, lo, hi, tmsg2("an undeclared record on the gRPC surface: ", rname))
+        return ""
+    }
+    vec_push(seen, rname)
+    lines: *Vector<string> = alloc(vec_new())
+    mut ok: bool = true
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*g).sigs, rs.off, i)
+        line: string = field_line(g, ast_name(a, f.name), f.ty, i + 1, seen, lo, hi)
+        if str_len(line) == 0 { ok = false }
+        vec_push(lines, line)
+        i = i + 1
+    }
+    if !ok { return "" }
+    cg_top(g, tmsg3("// The declared record ", rname, ", fields in declaration order."))
+    cg_top(g, tmsg3("message ", rname, " {"))
+    mut j: int64 = 0
+    while j < vec_len(lines) {
+        cg_top(g, vec_get(lines, j))
+        j = j + 1
+    }
+    cg_top(g, "}")
+    cg_top(g, "")
+    return rname
+}
+
+// A declared sum, emitted once per file. Every arm bare is the enum shape,
+// numbered in declared arm order, the ABI's own tag space. An arm with
+// fields makes the sum a message whose oneof carries one message per arm,
+// the payload messages first, the oneof numbered in the same arm order.
+func ensure_sum(g: *Cg, cn: CNamed, seen: *Vector<string>, lo: int64, hi: int64) -> string {
+    a: *Ast = (*g).ast
+    sname: string = ast_name(a, cn.name)
+    if has_str(seen, sname) { return sname }
+    sum: SumNode = vec_get((*a).sums, cn.id)
+    mut plain: bool = true
+    mut i: int64 = 0
+    while i < sum.variants_len {
+        v: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + i))
+        if v.fields_len > 0 { plain = false }
+        i = i + 1
+    }
+    vec_push(seen, sname)
+    if plain {
+        cg_top(g, tmsg3("// The declared sum ", sname, ": every arm is bare, so it crosses as an"))
+        cg_top(g, "// enum whose numbering is the declared arm order, the ABI's own tag space.")
+        cg_top(g, tmsg3("enum ", sname, " {"))
+        sprefix: string = scream_of(sname)
+        mut j: int64 = 0
+        while j < sum.variants_len {
+            v2: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + j))
+            cg_top(g, tmsg7("  ", sprefix, "_", scream_of(ast_name(a, v2.name)), " = ", int_to_string(j), ";"))
+            j = j + 1
+        }
+        cg_top(g, "}")
+        cg_top(g, "")
+        free(sprefix)
+        return sname
+    }
+    mut k: int64 = 0
+    mut ok: bool = true
+    while k < sum.variants_len {
+        v3: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + k))
+        aname: string = ast_name(a, v3.name)
+        amsg: string = tmsg2(sname, aname)
+        if !has_str(seen, amsg) {
+            vec_push(seen, amsg)
+            vs: VariantSig = sig_variant((*g).sigs, v3.name)
+            alines: *Vector<string> = alloc(vec_new())
+            mut p: int64 = 0
+            while p < vs.len {
+                f: FieldSig = sig_field((*g).sigs, vs.off, p)
+                line: string = field_line(g, ast_name(a, f.name), f.ty, p + 1, seen, lo, hi)
+                if str_len(line) == 0 { ok = false }
+                vec_push(alines, line)
+                p = p + 1
+            }
+            if vec_len(alines) == 0 {
+                cg_top(g, tmsg3("message ", amsg, " {}"))
+            } else {
+                cg_top(g, tmsg3("message ", amsg, " {"))
+                mut q: int64 = 0
+                while q < vec_len(alines) {
+                    cg_top(g, vec_get(alines, q))
+                    q = q + 1
+                }
+                cg_top(g, "}")
+            }
+            cg_top(g, "")
+        }
+        k = k + 1
+    }
+    if !ok { return "" }
+    cg_top(g, tmsg3("// The declared sum ", sname, ": an arm carries fields, so it crosses as a"))
+    cg_top(g, "// message whose oneof numbering is the declared arm order, the ABI's tag space.")
+    cg_top(g, tmsg3("message ", sname, " {"))
+    cg_top(g, "  oneof arm {")
+    mut m: int64 = 0
+    while m < sum.variants_len {
+        v4: VariantNode = vec_get((*a).variants, vec_get((*a).kids, sum.variants_off + m))
+        aname2: string = ast_name(a, v4.name)
+        field: string = snake_of(aname2)
+        cg_top(g, tmsg7("    ", tmsg2(sname, aname2), " ", field, " = ", int_to_string(m + 1), ";"))
+        free(field)
+        m = m + 1
+    }
+    cg_top(g, "  }")
+    cg_top(g, "}")
+    cg_top(g, "")
+    return sname
+}
+
+// The rpc return of one pledge, its message emitted as needed: a declared
+// Result becomes its oneof message once per distinct shape, arms ensured
+// first so a container arm rides as its wrapper; a declared Option becomes
+// its wrapper directly. Anything else is a named build error.
+func ret_msg_of(g: *Cg, pl: PledgeNode, ret: int64, seen: *Vector<string>) -> string {
+    tn: TyNode = ty_get((*g).ty, ret)
+    if tn.kind == tyk_option() {
+        return ensure_type(g, ret, seen, pl.lo, pl.hi)
+    }
     if tn.kind != tyk_result() {
-        cg_unsupported(g, pl.lo, pl.hi, "a pledge on the gRPC surface returning outside Result")
+        cg_unsupported(g, pl.lo, pl.hi, "a pledge on the gRPC surface returning outside Result and Option")
         return ""
     }
-    okw: string = ty_word(g, tn.a)
-    errw: string = ty_word(g, tn.b)
-    if str_len(okw) == 0 || str_len(errw) == 0 {
-        cg_unsupported(g, pl.lo, pl.hi, "a Result arm on the gRPC surface outside the scalar set")
-        return ""
+    okspell: string = ensure_type(g, tn.a, seen, pl.lo, pl.hi)
+    errspell: string = ensure_type(g, tn.b, seen, pl.lo, pl.hi)
+    if str_len(okspell) == 0 || str_len(errspell) == 0 { return "" }
+    rname: string = ret_name_of(g, ret)
+    if str_len(rname) == 0 { return "" }
+    if !has_str(seen, rname) {
+        vec_push(seen, rname)
+        cg_top(g, tmsg5("// Result<", ty_render((*g).ty, tn.a), ", ", ty_render((*g).ty, tn.b), ">: the contract's own Err is a value, not a"))
+        cg_top(g, "// transport error.")
+        cg_top(g, tmsg3("message ", rname, " {"))
+        cg_top(g, "  oneof result {")
+        cg_top(g, tmsg3(tmsg2("    ", okspell), " ok = 1;", ""))
+        cg_top(g, tmsg3(tmsg2("    ", errspell), " err = 2;", ""))
+        cg_top(g, "  }")
+        cg_top(g, "}")
+        cg_top(g, "")
     }
-    return tmsg3(okw, errw, "Result")
+    return rname
 }
 
 // One contract's message block: the sign surface, the signature, the session
@@ -226,37 +568,26 @@ func emit_contract_messages(g: *Cg, cid: int64, many: bool, seen: *Vector<string
     cg_top(g, "}")
     cg_top(g, "")
 
-    // Each distinct declared Result once per file: the contract's own Err is
-    // a value on an OK rpc, never a transport error.
+    // Each pledge's return, each distinct shape once per file: a declared
+    // Result as its oneof message, arms ensured first so a declared type or
+    // a container arrives under its own definition, a declared Option as
+    // its wrapper. The contract's own Err is a value on an OK rpc, never a
+    // transport error.
     mut k: int64 = 0
     while k < vec_len(pls) {
         info: PlInfo = vec_get(pls, k)
         pl: PledgeNode = vec_get((*a).pledges, info.pid)
         pkey: string = info.key
         ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
-        rname: string = result_msg_of(g, pl, ps.ret)
-        if str_len(rname) > 0 && !has_str(seen, rname) {
-            vec_push(seen, rname)
-            tn: TyNode = ty_get((*g).ty, ps.ret)
-            cg_top(g, tmsg5("// Result<", ty_word(g, tn.a), ", ", ty_word(g, tn.b), ">: the contract's own Err is a value, not a"))
-            cg_top(g, "// transport error.")
-            cg_top(g, tmsg3("message ", rname, " {"))
-            cg_top(g, "  oneof result {")
-            mut okpt: string = proto_scalar(g, tn.a)
-            if str_len(okpt) == 0 { okpt = "int64" }
-            mut errpt: string = proto_scalar(g, tn.b)
-            if str_len(errpt) == 0 { errpt = "int64" }
-            cg_top(g, tmsg3(tmsg2("    ", okpt), " ok = 1;", ""))
-            cg_top(g, tmsg3(tmsg2("    ", errpt), " err = 2;", ""))
-            cg_top(g, "  }")
-            cg_top(g, "}")
-            cg_top(g, "")
-        }
+        // The name lives on inside seen, so the loop must not free it.
+        ret_msg_of(g, pl, ps.ret, seen)
         k = k + 1
     }
 
     // One request message per pledge: the instance id the session issued,
-    // then the pledge's own parameters in declaration order.
+    // then the pledge's own parameters in declaration order, the lines built
+    // before the header so a parameter's type definition lands above the
+    // message that uses it.
     mut m: int64 = 0
     while m < vec_len(pls) {
         info2: PlInfo = vec_get(pls, m)
@@ -264,21 +595,26 @@ func emit_contract_messages(g: *Cg, cid: int64, many: bool, seen: *Vector<string
         pkey2: string = info2.key
         ps2: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey2), no_pledge_sig())
         camel: string = camel_of(ast_name(a, pl2.name))
-        cg_top(g, tmsg5("message ", prefix, camel, "Request", " {"))
-        cg_top(g, "  uint64 instance_id = 1;")
+        rpc_name_taken(g, pl2, camel)
+        plines: *Vector<string> = alloc(vec_new())
         mut p: int64 = 0
         while p < pl2.params_len {
             f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, pl2.params_off + p))
-            mut ppt: string = ""
+            mut line: string = ""
             if p < ps2.params.len {
-                ppt = proto_scalar(g, sig_param(s, ps2.params, p))
+                line = field_line(g, ast_name(a, f.name), sig_param(s, ps2.params, p), p + 2, seen, pl2.lo, pl2.hi)
             }
-            if str_len(ppt) == 0 {
-                cg_unsupported(g, pl2.lo, pl2.hi, "a pledge parameter on the gRPC surface outside the scalar set")
-                ppt = "int64"
+            if str_len(line) > 0 {
+                vec_push(plines, line)
             }
-            cg_top(g, tmsg7("  ", ppt, " ", ast_name(a, f.name), " = ", int_to_string(p + 2), ";"))
             p = p + 1
+        }
+        cg_top(g, tmsg3("message ", req_msg_name(prefix, camel), " {"))
+        cg_top(g, "  uint64 instance_id = 1;")
+        mut q: int64 = 0
+        while q < vec_len(plines) {
+            cg_top(g, vec_get(plines, q))
+            q = q + 1
         }
         cg_top(g, "}")
         cg_top(g, "")
@@ -349,9 +685,12 @@ func emit_service(g: *Cg, cid: int64, many: bool) -> void {
         pkey: string = info.key
         ps: PledgeSigT = unwrap_or(map_get((*s).pledges, pkey), no_pledge_sig())
         camel: string = camel_of(ast_name(a, pl.name))
-        mut rname: string = result_msg_of(g, pl, ps.ret)
+        // The message pass already ensured and named this shape, and already
+        // recorded the refusal when there is one; a bare fallback keeps the
+        // service block well formed under errors the caller will not write.
+        mut rname: string = ret_name_of(g, ps.ret)
         if str_len(rname) == 0 { rname = "BoolIntResult" }
-        cg_top(g, tmsg7("  rpc ", camel, "(", tmsg3(prefix, camel, "Request"), ") returns (", rname, ");"))
+        cg_top(g, tmsg7("  rpc ", camel, "(", req_msg_name(prefix, camel), ") returns (", rname, ");"))
         free(camel)
         i = i + 1
     }

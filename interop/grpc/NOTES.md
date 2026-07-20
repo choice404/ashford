@@ -484,3 +484,27 @@ What remains is what 1b already said remains: the instance that outlives its
 connection, affinity, and partition tolerance are one piece of work and it
 is Layer 3. The surface is out of the compiler; the store is the rest of the
 quarter.
+
+## The type set, filled in
+
+Step 2 shipped with the scalar set and the walk that needed nothing more.
+The declared types cross now: a record is a message with its fields in
+declaration order; a sum whose arms are all bare is an enum numbered in
+declared arm order, the ABI's own tag space; a sum with a payload arm is a
+message whose oneof carries one message per arm in the same order; Unit is
+the empty message; Option and List ride oneof arms as wrapper messages and
+sit in fields as optional and repeated. A pledge may answer a bare Option,
+the shape the stdlib's min_of and index_of already have, and it crosses as
+the wrapper directly.
+
+Two names earned rules. A pledge spelled sign, which the stdlib has, would
+take the session surface's SignRequest, so its request message alone steps
+aside to SignPledgeRequest; a pledge whose rpc spelling would take Session,
+GetPartial, or Break is refused by name. Map and tuple stay named refusals,
+the gauntlet's snapshot pledge being the standing proof, a nonzero exit
+that writes nothing rather than a service with a hole in it.
+
+Every skeleton and the whole stdlib emit and pass protoc now, the gauntlet
+excepted by design. The goldens pin the walk: hello's enum Err, ledger's
+Unit, main_demo's payload sum under two services, std_user's four contracts
+with the prefix rule, the wrappers, and the reserved spelling.

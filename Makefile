@@ -362,15 +362,34 @@ test-header: $(ASHC) $(MODULE) $(RT_SO)
 	    tests/runtime/test_header.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_header
 	./$(OUT)/test_header
 
-# The proto gate: emit-proto must reproduce both pinned goldens byte for
+# The proto gate: emit-proto must reproduce every pinned golden byte for
 # byte, the .proto a stock protoc consumes and the Go session wrapper that
 # carries the stream whose lifetime is the instance's. The shape hash the
 # wrapper pins is the same value the module registers, so a drift between
-# the bridge surface and the compiled contract shows up here as a diff.
+# the bridge surface and the compiled contract shows up here as a diff. The
+# goldens walk the bridged type set: payment is the scalar walk, hello an
+# enum sum in the Err arm, ledger Unit and a bare sum, main_demo a payload
+# sum and a repeated parameter under two services, and std_user the
+# multi-contract prefix rule, Option and List wrappers, and the reserved
+# SignPledgeRequest disambiguation, with its wrapper pinning four session
+# types out of one file. The gauntlet's Map stays a named refusal, proven
+# here as a nonzero exit that writes nothing.
 test-proto: $(ASHC)
 	$(ASHC) emit-proto skeleton/payment.ash
 	diff tests/golden/payment.proto $(OUT)/payment.proto
 	diff tests/golden/payment_session.go $(OUT)/payment_session.go
+	$(ASHC) emit-proto skeleton/hello.ash
+	diff tests/golden/hello.proto $(OUT)/hello.proto
+	$(ASHC) emit-proto skeleton/ledger.ash
+	diff tests/golden/ledger.proto $(OUT)/ledger.proto
+	$(ASHC) emit-proto skeleton/main_demo.ash
+	diff tests/golden/main_demo.proto $(OUT)/main_demo.proto
+	$(ASHC) emit-proto skeleton/std_user.ash
+	diff tests/golden/std_user.proto $(OUT)/std_user.proto
+	diff tests/golden/std_user_session.go $(OUT)/std_user_session.go
+	rm -f $(OUT)/lang.proto
+	! $(ASHC) emit-proto skeleton/lang.ash 2>/dev/null
+	test ! -f $(OUT)/lang.proto
 	@echo "[test-proto] ok"
 
 # The determinism gate: two builds of the same source must emit byte

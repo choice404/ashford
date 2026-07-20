@@ -5,6 +5,57 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.6] the bridged type set
+
+The declared types cross the bridge. emit-proto covered the scalar walk;
+now a contract's records, sums, Unit, Option, and List arrive on the wire
+under their own definitions, every skeleton and the whole standard library
+emit and pass protoc, and the goldens pin one example of each shape.
+
+- lower a declared record to a message, its fields in declaration order,
+  emitted once per file under its own name
+- lower a sum by its arms: every arm bare is an enum numbered in declared
+  arm order, the ABI's own tag space, its values prefixed with the sum's
+  name for proto's shared value namespace; an arm with fields makes the sum
+  a message whose oneof carries one message per arm, the payload messages
+  first, the oneof numbered in the same arm order
+- lower Unit to the empty message, the Ok of a pledge that answers with
+  nothing
+- lower Option and List by position: repeated and optional in a field, a
+  wrapper message on a oneof arm, where proto allows no label; an Option
+  over a message tracks presence intrinsically and over a scalar or an enum
+  takes the optional label
+- take a bare Option as a pledge's return, the shape the stdlib's min_of
+  and index_of declare, crossing as the wrapper directly
+- reserve two spellings: a pledge named sign keeps its rpc and moves its
+  request message alone to SignPledgeRequest, stepping aside from the
+  session surface; a pledge whose rpc spelling would take Session,
+  GetPartial, or Break is refused by name
+- keep Map and tuple as named refusals that write nothing, the gauntlet's
+  snapshot pledge standing as the proof in the gate
+- name the refused type in the error, the checker's own spelling, so the
+  refusal reads as the type it refused rather than a category
+- widen the proto gate: goldens for hello's enum Err, ledger's Unit and
+  bare sum, main_demo's payload sum and repeated parameter under two
+  services, and std_user's four contracts exercising the prefix rule, the
+  wrappers, and the reserved spelling, with the multi-contract session
+  wrapper pinned beside the payment pair
+
+### Notes
+
+The emitter's dedupe set owns the heap strings it holds; the message pass
+borrows the name it gets back and must not free it, which is the kind of
+sentence a garbage collected language never writes. The service
+pass names shapes through a pure spelling function and emits nothing, so a
+refusal is recorded exactly once, in the message pass, and the emitted
+service block stays well formed even on a path the caller never writes. The
+one type left outside the set with a real user is Map, the gauntlet's
+snapshot; proto's own map type carries no deterministic order, and Ashford
+pins map iteration as insertion ordered, so a faithful lowering is a
+repeated entry message and a decision about whether order survives the
+wire, which is Appendix III's map-ordering question and stays open on
+purpose.
+
 ## [v0.3.5] the emitted surface
 
 The gRPC bridge surface comes out of the compiler. `ashc emit-proto` runs the
