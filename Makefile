@@ -55,7 +55,7 @@ MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-park test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -63,7 +63,7 @@ BIN_DEMO   := $(OUT)/main_demo
 # last. The stress and sanitizer variants of the store, network, and mesh gates
 # stay out and are run on their own, since each is minutes of load on ground the
 # functional gate beside it already covers.
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-park test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
 
 runtime: $(RT_SO)
 
@@ -275,6 +275,21 @@ test-store-python: $(RT_SO) $(MODULE_LEDGER)
 	else \
 	    echo "[test-store-python] python3 not found, skipping"; \
 	fi
+
+# The parked instance gate under ASan and LSan: an instance's durable state
+# written into a store row and stood back up in a fresh runtime, the vows,
+# the latches, the Err payloads, and the transactional fates all crossing.
+# A partial payment resumes with its override and runs to fulfilled, an
+# automatic break resumes with its payload readable, and a store backed
+# Ledger resumes against its own dsn vow, reads the committed balance, and
+# refuses to rerun its closed episode. The refusals hold: park mid
+# transaction, park with a walk in the air, park after the caller's own
+# break, resume of an unparked key, a lying hash, and a bare runtime.
+test-park: $(MODULE_PAY) $(MODULE_LEDGER) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_park.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_park
+	./$(OUT)/test_park
 
 # The threading gate under ASan: the pool, the per-instance serialization,
 # out-of-order waits, and the break race, with every allocation watched.

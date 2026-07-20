@@ -5,6 +5,67 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.8] the instance written down
+
+A signature outlives its process. `ash_instance_park` writes an instance's
+durable state into one store row, and `ash_instance_resume` stands it back
+up against a fresh runtime: the vows, the latches, the Err payloads, and
+the transactional fates all cross, so a partial walk resumes where it
+stood, a broken record resumes readable, and a store backed contract
+reopens its own dsn and reads what it committed. This is the piece the
+bridge notes kept for Layer 3: an instance that can be written down is the
+answer to affinity, to partition tolerance, and to the orphan as scheduled
+work, one primitive under all three.
+
+- write the park row into the runtime's own ash_park table in whatever
+  database the caller names, created on first use, one INSERT OR REPLACE
+  per key, so a key parked twice holds the later instance
+- encode the vow values and the Err payloads with the wire codec's
+  canonical form, the same bytes the network trusts, so the park format
+  inherits the codec's goldens and a parked value round trips exactly
+- replay on resume exactly as sign builds: the contract found by the
+  recorded name, the dispatch resolved fresh, the vows decoded onto the new
+  instance and checked against their declared types, the latches byte for
+  byte, each present payload decoded onto the instance heap the partial
+  surface expects, and a store backed contract reopening its dsn vow and
+  reconciling its schemas in the same call
+- hold the skew line: the recorded version and shape hash must match the
+  registered module's, and a nonzero expected_hash must agree, else
+  ASH_ERR_VERSION, sign's own rule; an unparked key or an unregistered
+  contract is ASH_ERR_NAME; a row that will not decode against the
+  descriptor is ASH_ERR_TYPE
+- park between walks only: an unwaited future, an open transactional
+  episode, a remote proxy, an unsigned instance, and an instance the caller
+  already ended with an explicit break each refuse ASH_ERR_STATE, while an
+  automatic break parks with its errors readable, which is what an
+  automatic break keeps its heap for
+- keep a resumed episode closed: TXN_DONE replays as done, so a committed
+  transactional subcontract can never run twice however many times the
+  instance crosses the table, and a recorded TXN_OPEN is corruption by
+  construction, a row park refuses to write
+- gate it in the default suite: test-park drives the payment round trip
+  through two runtimes to fulfilled, the broken record with its payload,
+  the future and transaction refusals, the lying hash, the bare runtime,
+  and the Ledger resuming onto its own database, all under ASan and LSan
+  to zero leaks
+- pin the model in docs/database.md: the parked instance section beside the
+  lifecycle it extends
+
+### Notes
+
+The park's one design sentence: a park is a state between walks, never a
+snapshot of one mid flight. Everything the row cannot carry, a buffered
+transaction, a future in the air, a connection, is refused at park rather
+than approximated at resume, so a resumed instance is exactly a signed one
+with its latches set and nothing else pretending. The explicit break stays
+the one true ending: it reclaims the heap the vows and payloads live on,
+so there is nothing left to write down and park says ASH_ERR_STATE, while
+the automatic break, whose whole purpose is keeping the errors readable,
+parks them readable. The bridge inherits the next step, a Session that
+parks on disconnect and resumes on reattach, and the mesh inherits the one
+after, an instance that moves between nodes; both are consumers of this
+primitive, not new ones.
+
 ## [v0.3.7] the second wrapper
 
 The session wrapper claim, that another language's is a morning rather than

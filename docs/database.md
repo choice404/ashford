@@ -98,6 +98,14 @@ Unsigned -> Signed -> Fulfilled
 
 `sign` opens the connection to the bound `dsn`, reconciles every declared schema with the live database, and locks the vows. A connection that will not open, a `dsn` that will not parse, or a schema that will not reconcile fails the sign, the first two with `ASH_ERR_STORE` and the last with `ASH_ERR_TYPE`, and nothing is left half open. Fulfilling a pledge runs it against the connection, inside a transaction when the pledge belongs to a transactional subcontract and in autocommit otherwise. `break` rolls back any open transaction, closes the connection, and reclaims the instance's heap, in that order, so no uncommitted write survives a break and no connection outlives its instance. A partially fulfilled contract reports exactly which pledges landed and which broke, and a transactional subcontract in that report is all committed or all rolled back, never half.
 
+## The parked instance
+
+An instance's durable state fits in one row, and the runtime will write it there and stand it back up. `ash_instance_park(c, dsn, key)` puts the contract's name, version, and shape hash, the lifecycle state and the signing time, every vow value, every pledge latch with the `Err` payload it carries, and the fate of every transactional episode into the runtime's own `ash_park` table in the database behind `dsn`, created on first use, one `INSERT OR REPLACE` per key. The value blobs are the wire codec's canonical encoding, the same bytes the network trusts, so the park format inherits the codec's goldens. Parking is a write, not an ending: the caller still holds a live signature.
+
+`ash_instance_resume(rt, dsn, key, expected_hash, out)` reads the row back and signs its state up against the current runtime: the contract is found by the recorded name, the vows decode onto the new instance, the latches and payloads replay, a store-backed contract reopens its `dsn` vow and reconciles its schemas exactly as sign does, and the recorded state and signing time land unchanged. The recorded version and shape hash must match the registered module's, and a nonzero `expected_hash` must agree too, the same skew rule sign runs; a key nobody parked, or a contract this runtime does not register, is `ASH_ERR_NAME`.
+
+A park is a state between walks, never a snapshot of one mid flight. An unwaited future, an open transactional episode, a remote proxy's signature, or an instance the caller already ended with an explicit break each refuse with `ASH_ERR_STATE`; an automatically broken instance parks with its errors readable, because keeping them readable is what the automatic break is for. A resumed `TXN_DONE` stays done, so a committed episode can never run twice, no matter how many times the instance crosses the table.
+
 ## Failure
 
 Storage adds one status, the store layer's single genuinely new failure, numbered after the network's:

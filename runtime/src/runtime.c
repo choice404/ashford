@@ -61,6 +61,7 @@
 
 #include <ash/ash.h>
 #include <ash/ash_store.h>
+#include <ash/ash_wire.h>
 
 #include "ash_net.h"
 #include "ash_remote.h"
@@ -2158,6 +2159,402 @@ AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
     AshStatus st = ash_future_wait(f, out);
     future_release(f);
     return st;
+}
+
+/* ---- the parked instance ---- */
+
+/* The park row's schema, one table the runtime owns in whatever database the
+ * caller names. The blobs are the wire codec's canonical encoding, the same
+ * bytes the network trusts, so a parked value round trips exactly and the
+ * codec's goldens stand guard over the park format for free. */
+static const char* PARK_DDL =
+    "CREATE TABLE IF NOT EXISTS ash_park ("
+    "pkey TEXT PRIMARY KEY, contract TEXT, version INTEGER, "
+    "shape_hash INTEGER, state INTEGER, signed_at INTEGER, "
+    "vows BLOB, latches BLOB, errs BLOB, subtxn BLOB)";
+
+/* Whether a stored Err payload is present: an explicit break zeroes the
+ * struct, and a pledge that never broke never wrote one, so all zero is the
+ * absent spelling here exactly as it is on the partial surface. */
+static int park_err_present(const AshValue* v) {
+    static const AshValue zero;
+    return memcmp(v, &zero, sizeof(AshValue)) != 0;
+}
+
+/* Encodes n values back to back into one malloc'd buffer, the sequential
+ * form both blobs share: the decoder walks by each value's own consumed
+ * count, so no frame or count rides in the bytes. */
+static AshStatus park_encode_values(const AshValue* vals, size_t n,
+                                    uint8_t** buf_out, size_t* len_out) {
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t need = 0;
+        /* The sizing call: a NULL buffer answers ASH_ERR_OOM with *need set,
+         * the codec's own size protocol, so only another status is a fault. */
+        AshStatus st = ash_wire_encode_value(&vals[i], NULL, 0, &need);
+        if (st != ASH_OK && st != ASH_ERR_OOM) return st;
+        total += need;
+    }
+    uint8_t* buf = malloc(total ? total : 1);
+    if (!buf) return ASH_ERR_OOM;
+    size_t off = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t need = 0;
+        AshStatus st = ash_wire_encode_value(&vals[i], buf + off, total - off,
+                                             &need);
+        if (st != ASH_OK) {
+            free(buf);
+            return st;
+        }
+        off += need;
+    }
+    *buf_out = buf;
+    *len_out = total;
+    return ASH_OK;
+}
+
+/* The Err payload blob: per pledge one presence byte, then the encoded value
+ * when present. Sized first, then written, the codec's own two pass shape. */
+static AshStatus park_encode_errs(const AshContract* c,
+                                  uint8_t** buf_out, size_t* len_out) {
+    uint32_t n = c->desc->npledges;
+    size_t total = n;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!park_err_present(&c->pledge_err[i])) continue;
+        size_t need = 0;
+        AshStatus st = ash_wire_encode_value(&c->pledge_err[i], NULL, 0, &need);
+        if (st != ASH_OK && st != ASH_ERR_OOM) return st;
+        total += need;
+    }
+    uint8_t* buf = malloc(total ? total : 1);
+    if (!buf) return ASH_ERR_OOM;
+    size_t off = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        int present = park_err_present(&c->pledge_err[i]);
+        buf[off++] = (uint8_t)(present ? 1 : 0);
+        if (!present) continue;
+        size_t need = 0;
+        AshStatus st = ash_wire_encode_value(&c->pledge_err[i], buf + off,
+                                             total - off, &need);
+        if (st != ASH_OK) {
+            free(buf);
+            return st;
+        }
+        off += need;
+    }
+    *buf_out = buf;
+    *len_out = total;
+    return ASH_OK;
+}
+
+static AshValue park_str_param(const uint8_t* p, size_t n) {
+    AshValue v;
+    memset(&v, 0, sizeof(v));
+    v.ty = ASH_TY_STRING;
+    v.as.s.ptr = (uint8_t*)(n ? p : (const uint8_t*)"");
+    v.as.s.len = n;
+    return v;
+}
+
+static AshValue park_int_param(int64_t i) {
+    AshValue v;
+    memset(&v, 0, sizeof(v));
+    v.ty = ASH_TY_INT;
+    v.as.i = i;
+    return v;
+}
+
+AshStatus ash_instance_park(AshContract* c, const char* dsn, const char* key) {
+    if (!c || !dsn || !key) return ASH_ERR_TYPE;
+    if (c->conn) return ASH_ERR_STATE;
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_OK;
+    if (c->state == ASH_UNSIGNED) st = ASH_ERR_STATE;
+    /* An explicit break reclaimed the instance heap the vows and payloads
+     * live on; the latches still read, but there is nothing left to write
+     * down. An automatic break keeps that heap on purpose and parks fine. */
+    if (st == ASH_OK && c->desc->npledges > 0 && !c->owned) st = ASH_ERR_STATE;
+    /* A park is a state between walks: an unwaited future is a walk still in
+     * the air, and an open transactional episode holds buffered writes no row
+     * can carry. Both refuse rather than guess. */
+    if (st == ASH_OK) {
+        for (struct AshFuture* f = c->futures; f; f = f->next) {
+            if (!f->waited) {
+                st = ASH_ERR_STATE;
+                break;
+            }
+        }
+    }
+    if (st == ASH_OK && c->sub_txn) {
+        for (uint32_t i = 0; i < c->desc->nsubs; i++) {
+            if (c->sub_txn[i] == TXN_OPEN) {
+                st = ASH_ERR_STATE;
+                break;
+            }
+        }
+    }
+    uint8_t* vows_buf = NULL;
+    size_t vows_len = 0;
+    uint8_t* errs_buf = NULL;
+    size_t errs_len = 0;
+    if (st == ASH_OK && c->desc->nvows > 0) {
+        st = park_encode_values(c->vow_vals, c->desc->nvows,
+                                &vows_buf, &vows_len);
+    }
+    if (st == ASH_OK && c->desc->npledges > 0) {
+        st = park_encode_errs(c, &errs_buf, &errs_len);
+    }
+    AshStore* s = NULL;
+    if (st == ASH_OK) st = ash_store_open(dsn, &s);
+    if (st == ASH_OK) st = ash_store_exec(s, PARK_DDL);
+    if (st == ASH_OK) {
+        AshValue params[10];
+        params[0] = park_str_param((const uint8_t*)key, strlen(key));
+        params[1] = park_str_param((const uint8_t*)c->desc->name,
+                                   strlen(c->desc->name));
+        params[2] = park_int_param((int64_t)c->desc->version);
+        params[3] = park_int_param((int64_t)c->desc->shape_hash);
+        params[4] = park_int_param((int64_t)c->state);
+        params[5] = park_int_param(c->signed_at);
+        params[6] = park_str_param(vows_buf, vows_len);
+        params[7] = park_str_param(c->pledge_state, c->desc->npledges);
+        params[8] = park_str_param(errs_buf, errs_len);
+        params[9] = park_str_param(c->sub_txn, c->desc->nsubs);
+        st = ash_store_exec_params(s,
+            "INSERT OR REPLACE INTO ash_park "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params, 10, NULL);
+    }
+    ash_store_close(s);
+    free(vows_buf);
+    free(errs_buf);
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+/* The malloc arena the resume query reads its row into: one chunk per
+ * allocation on a list, freed wholesale once every byte the row carried has
+ * been decoded onto the new instance. */
+typedef struct ParkChunk {
+    struct ParkChunk* next;
+} ParkChunk;
+
+static uint8_t* park_arena_bytes(void* ctx, uint64_t n) {
+    ParkChunk** head = (ParkChunk**)ctx;
+    ParkChunk* ch = malloc(sizeof(ParkChunk) + (size_t)n);
+    if (!ch) return NULL;
+    ch->next = *head;
+    *head = ch;
+    return (uint8_t*)(ch + 1);
+}
+
+static void park_arena_free(ParkChunk* head) {
+    while (head) {
+        ParkChunk* next = head->next;
+        free(head);
+        head = next;
+    }
+}
+
+AshStatus ash_instance_resume(AshRuntime* rt, const char* dsn, const char* key,
+                              uint64_t expected_hash, AshContract** out) {
+    if (!rt || !dsn || !key || !out) return ASH_ERR_TYPE;
+    *out = NULL;
+
+    AshStore* s = NULL;
+    AshStatus st = ash_store_open(dsn, &s);
+    if (st != ASH_OK) return st;
+    st = ash_store_exec(s, PARK_DDL);
+    ParkChunk* arena = NULL;
+    AshValue rows;
+    memset(&rows, 0, sizeof(rows));
+    if (st == ASH_OK) {
+        AshValue kv = park_str_param((const uint8_t*)key, strlen(key));
+        static const uint32_t cols[9] = {
+            ASH_TY_STRING, ASH_TY_INT, ASH_TY_UINT, ASH_TY_INT, ASH_TY_INT,
+            ASH_TY_STRING, ASH_TY_STRING, ASH_TY_STRING, ASH_TY_STRING
+        };
+        AshStoreAlloc alloc = { park_arena_bytes, &arena };
+        st = ash_store_query(s,
+            "SELECT contract, version, shape_hash, state, signed_at, "
+            "vows, latches, errs, subtxn FROM ash_park WHERE pkey = ?1",
+            &kv, 1, cols, NULL, 9, &alloc, &rows);
+    }
+    ash_store_close(s);
+    if (st != ASH_OK) {
+        park_arena_free(arena);
+        return st;
+    }
+    if (rows.as.list.len == 0) {
+        park_arena_free(arena);
+        return ASH_ERR_NAME;
+    }
+    const AshValue* f = (const AshValue*)((const AshValue*)rows.as.list.data)[0]
+                            .as.list.data;
+    const AshString rname   = f[0].as.s;
+    const int64_t   rver    = f[1].as.i;
+    const uint64_t  rshape  = f[2].as.u;
+    const int64_t   rstate  = f[3].as.i;
+    const int64_t   rsigned = f[4].as.i;
+    const AshString bvows   = f[5].as.s;
+    const AshString blatch  = f[6].as.s;
+    const AshString berrs   = f[7].as.s;
+    const AshString bsubtxn = f[8].as.s;
+
+    if (rstate < (int64_t)ASH_SIGNED || rstate > (int64_t)ASH_BROKEN) {
+        park_arena_free(arena);
+        return ASH_ERR_TYPE;
+    }
+    char* name = malloc(rname.len + 1);
+    if (!name) {
+        park_arena_free(arena);
+        return ASH_ERR_OOM;
+    }
+    memcpy(name, rname.ptr, rname.len);
+    name[rname.len] = 0;
+
+    pthread_mutex_lock(&rt->lock);
+    const AshContractDesc* desc = find_desc(rt, name);
+    free(name);
+    if (!desc) {
+        pthread_mutex_unlock(&rt->lock);
+        park_arena_free(arena);
+        return ASH_ERR_NAME;
+    }
+    /* The row must describe the module this runtime registered, and a caller
+     * pinning a hash must agree with both, the same skew rule sign runs. */
+    if ((int64_t)desc->version != rver || desc->shape_hash != rshape ||
+        (expected_hash != 0 && expected_hash != desc->shape_hash)) {
+        pthread_mutex_unlock(&rt->lock);
+        park_arena_free(arena);
+        return ASH_ERR_VERSION;
+    }
+    AshPledgeFn* fns = NULL;
+    st = resolve_dispatch(rt, desc, &fns);
+    pthread_mutex_unlock(&rt->lock);
+    if (st != ASH_OK) {
+        park_arena_free(arena);
+        return st;
+    }
+
+    AshContract* c = calloc(1, sizeof(AshContract));
+    if (!c) {
+        free(fns);
+        park_arena_free(arena);
+        return ASH_ERR_OOM;
+    }
+    if (mutex_init_recursive(&c->mu) != 0) {
+        free(c);
+        free(fns);
+        park_arena_free(arena);
+        return ASH_ERR_OOM;
+    }
+    c->rt = rt;
+    c->desc = desc;
+    if (desc->npledges > 0) {
+        c->fns = (AshPledgeFn*)ash_bytes(c, desc->npledges * sizeof(AshPledgeFn));
+        if (!c->fns) st = ASH_ERR_OOM;
+        else memcpy(c->fns, fns, desc->npledges * sizeof(AshPledgeFn));
+    }
+    free(fns);
+
+    /* The vows decode straight onto the new instance in declaration order,
+     * each checked against its declared type, and the blob must hold exactly
+     * the declared count, no more and no less. */
+    if (st == ASH_OK && desc->nvows > 0) {
+        c->vow_vals = (AshValue*)ash_bytes(c, desc->nvows * sizeof(AshValue));
+        if (!c->vow_vals) st = ASH_ERR_OOM;
+        else memset(c->vow_vals, 0, desc->nvows * sizeof(AshValue));
+        size_t off = 0;
+        for (uint32_t i = 0; st == ASH_OK && i < desc->nvows; i++) {
+            size_t used = 0;
+            st = ash_wire_decode_value(c, bvows.ptr + off, bvows.len - off,
+                                       &c->vow_vals[i], &used);
+            if (st == ASH_OK && c->vow_vals[i].ty != desc->vows[i].ty) {
+                st = ASH_ERR_TYPE;
+            }
+            off += used;
+        }
+        if (st == ASH_OK && off != bvows.len) st = ASH_ERR_TYPE;
+    } else if (st == ASH_OK && bvows.len != 0) {
+        st = ASH_ERR_TYPE;
+    }
+
+    /* The latches replay byte for byte, then each present Err payload decodes
+     * onto the instance heap, the home the partial surface expects. */
+    if (st == ASH_OK && desc->npledges > 0) {
+        c->pledge_state = calloc(desc->npledges, sizeof(uint8_t));
+        c->pledge_err = calloc(desc->npledges, sizeof(AshValue));
+        if (!c->pledge_state || !c->pledge_err) st = ASH_ERR_OOM;
+        if (st == ASH_OK && blatch.len != desc->npledges) st = ASH_ERR_TYPE;
+        for (uint32_t i = 0; st == ASH_OK && i < desc->npledges; i++) {
+            if (blatch.ptr[i] > PLEDGE_BROKEN) st = ASH_ERR_TYPE;
+            else c->pledge_state[i] = blatch.ptr[i];
+        }
+        size_t off = 0;
+        for (uint32_t i = 0; st == ASH_OK && i < desc->npledges; i++) {
+            if (off >= berrs.len) {
+                st = ASH_ERR_TYPE;
+                break;
+            }
+            uint8_t present = berrs.ptr[off++];
+            if (present > 1) {
+                st = ASH_ERR_TYPE;
+            } else if (present == 1) {
+                size_t used = 0;
+                st = ash_wire_decode_value(c, berrs.ptr + off, berrs.len - off,
+                                           &c->pledge_err[i], &used);
+                off += used;
+            }
+        }
+        if (st == ASH_OK && off != berrs.len) st = ASH_ERR_TYPE;
+    }
+
+    /* The transactional fates replay too: TXN_DONE stays done, so a resumed
+     * episode can never run twice, and a recorded TXN_OPEN is a row park
+     * refused to write, so reading one is corruption, not state. */
+    if (st == ASH_OK && desc->nsubs > 0) {
+        c->sub_txn = calloc(desc->nsubs, sizeof(uint8_t));
+        if (!c->sub_txn) st = ASH_ERR_OOM;
+        if (st == ASH_OK && bsubtxn.len != desc->nsubs) st = ASH_ERR_TYPE;
+        for (uint32_t i = 0; st == ASH_OK && i < desc->nsubs; i++) {
+            if (bsubtxn.ptr[i] == TXN_OPEN || bsubtxn.ptr[i] > TXN_DONE) {
+                st = ASH_ERR_TYPE;
+            } else {
+                c->sub_txn[i] = bsubtxn.ptr[i];
+            }
+        }
+    }
+
+    if (st == ASH_OK) st = store_sign_reconcile(c);
+    if (st == ASH_OK) {
+        c->state = (AshContractState)rstate;
+        c->shape_hash = desc->shape_hash;
+        c->signed_at = rsigned;
+        pthread_mutex_lock(&rt->lock);
+        if (rt->ninstances == ASH_MAX_INSTANCES) {
+            st = ASH_ERR_OOM;
+        } else {
+            rt->instances[rt->ninstances++] = c;
+        }
+        pthread_mutex_unlock(&rt->lock);
+    }
+    park_arena_free(arena);
+    if (st != ASH_OK) {
+        if (c->store) {
+            ash_store_close(c->store);
+            c->store = NULL;
+        }
+        contract_free_owned(c);
+        free(c->pledge_state);
+        free(c->pledge_err);
+        free(c->sub_txn);
+        pthread_mutex_destroy(&c->mu);
+        free(c);
+        return st;
+    }
+    *out = c;
+    return ASH_OK;
 }
 
 /* ---- allocation helpers ---- */

@@ -262,6 +262,46 @@ size_t ash_partial_nerrors(AshContract* c);
 AshStatus ash_partial_error(AshContract* c, size_t i,
                             const char** pledge_name, const AshValue** err);
 
+/* ---- the parked instance ---- */
+
+/* Writes the instance's durable state under key into the store behind dsn:
+ * the contract's name, version, and shape hash, the lifecycle state and the
+ * signing time, every vow value, every pledge latch with the Err payload it
+ * carries, and the fate of every transactional episode. The row is one
+ * INSERT OR REPLACE into the runtime's own ash_park table, created on first
+ * use, so a key parked twice holds the later instance. The instance itself
+ * is untouched: parking is a write, not an ending, and the caller still
+ * holds a live signature it may keep driving or break.
+ *
+ * A park is a state between walks, never a snapshot of one mid flight: an
+ * instance with an unwaited future, an open transactional episode, or a
+ * remote proxy's signature is ASH_ERR_STATE. An unsigned instance is
+ * ASH_ERR_STATE, and so is one the caller already ended: an explicit break
+ * reclaimed the heap the vows and payloads live on, so there is nothing
+ * left to write down, while an automatically broken instance keeps that
+ * heap and parks with its errors readable. A NULL argument is ASH_ERR_TYPE;
+ * a backend that will not take the row is ASH_ERR_STORE. */
+AshStatus ash_instance_park(AshContract* c, const char* dsn, const char* key);
+
+/* Reads the row key names out of the store behind dsn and stands the
+ * instance back up against this runtime: the contract is found by the
+ * recorded name, the vows decode onto the new instance, the latches and
+ * their Err payloads replay, a store backed contract reopens its dsn vow and
+ * reconciles its schemas exactly as sign does, and the recorded state and
+ * signing time land unchanged, so the partial surface reads what the parked
+ * instance read. The new signature is as live as any: pledges still pending
+ * fulfill on latches set before the park, and a broken or fulfilled record
+ * resumes readable with further fulfillment refused the way it always is.
+ *
+ * The recorded version and shape hash must match the registered module's,
+ * and a nonzero expected_hash must match as well, else ASH_ERR_VERSION, the
+ * same skew rule sign enforces. A key with no row, or a recorded contract
+ * this runtime does not register, is ASH_ERR_NAME; a row whose payload will
+ * not decode against the descriptor is ASH_ERR_TYPE; NULL arguments are
+ * ASH_ERR_TYPE; a backend failure is ASH_ERR_STORE. */
+AshStatus ash_instance_resume(AshRuntime* rt, const char* dsn, const char* key,
+                              uint64_t expected_hash, AshContract** out);
+
 /* ---- pledges ---- */
 
 /* Binds a host implementation to a pledge, the way an abstract pledge gets a
