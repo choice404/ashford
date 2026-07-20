@@ -58,7 +58,7 @@ func usage() -> void {
     printerr("  build <file>  emit the module C and link it into a shared library")
     printerr("  build --bin <file>  link a standalone executable around the Main contract")
     printerr("  emit-header <file>  write the C header naming the module's hashes and symbols")
-    printerr("  emit-proto <file>   write the gRPC .proto and the Go session wrapper")
+    printerr("  emit-proto <file>   write the gRPC .proto and the Go and TypeScript session wrappers")
 }
 
 // Runs the lexer on the file at path, printing one line per token to stdout
@@ -492,14 +492,19 @@ func cmd_emit_proto(path: string) -> int32 {
     // The wrapper walks the same surface, so a source the proto refuses
     // would only say every refusal twice; one emitter's verdict is the pass's.
     mut gtext: string = ""
+    mut ttext: string = ""
     mut have_g: bool = false
     if vec_len(gerrs) == 0 {
         gtext = cgen_proto_go(tree, res, sigs, t, gerrs, stem)
+        ttext = cgen_proto_ts(tree, res, sigs, t, gerrs, stem)
         have_g = true
     }
     if emit_pass_errors(prog, gerrs) > 0 {
         free(ptext)
-        if have_g { free(gtext) }
+        if have_g {
+            free(gtext)
+            free(ttext)
+        }
         free(stem)
         return 1
     }
@@ -508,6 +513,7 @@ func cmd_emit_proto(path: string) -> int32 {
     if !make_out_dir(out) {
         free(ptext)
         free(gtext)
+        free(ttext)
         free(stem)
         return 1
     }
@@ -516,8 +522,11 @@ func cmd_emit_proto(path: string) -> int32 {
     ppath: string = join2(base, pname)
     gname: string = join2(stem, "_session.go")
     gpath: string = join2(base, gname)
+    tname: string = join2(stem, "_session.ts")
+    tpath: string = join2(base, tname)
     free(pname)
     free(gname)
+    free(tname)
     free(base)
     free(stem)
 
@@ -527,7 +536,9 @@ func cmd_emit_proto(path: string) -> int32 {
         printerr("ashc: could not write the proto")
         free(ppath)
         free(gpath)
+        free(tpath)
         free(gtext)
+        free(ttext)
         return 1
     }
     gerr := write_file(gpath, gtext)
@@ -536,11 +547,23 @@ func cmd_emit_proto(path: string) -> int32 {
         printerr("ashc: could not write the session wrapper")
         free(ppath)
         free(gpath)
+        free(tpath)
+        free(ttext)
+        return 1
+    }
+    terr := write_file(tpath, ttext)
+    free(ttext)
+    if terr.exists() {
+        printerr("ashc: could not write the session wrapper")
+        free(ppath)
+        free(gpath)
+        free(tpath)
         return 1
     }
     free(ppath)
     free(gpath)
-    printerr("[ashc] wrote the proto and the session wrapper")
+    free(tpath)
+    printerr("[ashc] wrote the proto and the session wrappers")
     return 0
 }
 

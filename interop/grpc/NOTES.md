@@ -508,3 +508,25 @@ Every skeleton and the whole stdlib emit and pass protoc now, the gauntlet
 excepted by design. The goldens pin the walk: hello's enum Err, ledger's
 Unit, main_demo's payload sum under two services, std_user's four contracts
 with the prefix rule, the wrappers, and the reserved spelling.
+
+## The second wrapper
+
+The step 2 close said another language's session wrapper is a morning, not a
+milestone. The TypeScript wrapper is that morning, spent. ashc emits it
+beside the Go one, and it makes the opposite tooling choice on purpose: the
+Go consumer runs protoc and gets compiled stubs, the Node consumer loads
+the emitted .proto through @grpc/proto-loader at runtime and gets its
+session surface from the wrapper's structural interfaces. No protoc, no
+generated stub, no native code, and node runs the .ts directly under type
+stripping, so there is no compiler in the loop either. Two npm packages
+and two emitted files are the whole diet, which is the marketplace-safe
+shape the editor middleware appendix asked for.
+
+The walk is the Go walk, check for check: the pinned hash at sign, the
+value Err on an OK rpc, the two breaks and what each leaves readable, the
+lying hash as ABORTED, the killed child collected in milliseconds, the
+quiet session resuming. One loader lesson worth writing down: keepCase,
+longs as String, oneofs on. The wire's own snake_case and decimal strings
+for every 64 bit integer are the wrapper's interface spellings, and the
+oneof's discriminator is how a result says which arm it is, the same
+WhichOneof the Python client leans on.

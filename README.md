@@ -102,7 +102,7 @@ make test-bin
 
 `emit-header` writes `target/ashc-out/hello.ash.h`, which spells the shape hash and every mangled pledge name as defines, so a C host resolves and signs against generated names instead of hardcoded strings. `make test-header` pins the header against its golden and compiles a host with it.
 
-`emit-proto` writes the contract's gRPC surface: `target/ashc-out/payment.proto`, where every pledge is its own typed rpc and signing is a stream whose lifetime is the instance's, and `payment_session.go`, the session wrapper protoc cannot write. A consumer in any gRPC language builds against the `.proto` with stock tooling; `make test-proto` pins both files against their goldens, and `make test-grpc-go` drives the whole payment lifecycle from a Go client built from nothing but the emitted artifacts.
+`emit-proto` writes the contract's gRPC surface: `target/ashc-out/payment.proto`, where every pledge is its own typed rpc and signing is a stream whose lifetime is the instance's, and the session wrappers protoc cannot write, `payment_session.go` for a Go module and `payment_session.ts` for a Node host over `@grpc/proto-loader`, no protoc step and no native code, the shape an editor extension ships. A consumer in any gRPC language builds against the `.proto` with stock tooling; `make test-proto` pins the emitted files against their goldens, and `make test-grpc-go` and `make test-grpc-node` each drive the whole payment lifecycle from a client built from nothing but the emitted artifacts.
 
 The Makefile finds the dusk compiler as `dusk` on your path. A dusk older than 1.5 predates the two parameter `std.map` the compiler is written against; point `DUSK` at a current build when the installed one lags.
 

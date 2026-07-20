@@ -5,6 +5,54 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.7] the second wrapper
+
+The session wrapper claim, that another language's is a morning rather than
+a milestone, is now a shipped fact. `ashc emit-proto` writes a TypeScript
+session wrapper beside the Go one, and a Node client built from nothing but
+the emitted artifacts walks the whole payment lifecycle against the bridge
+server. The two consumers make opposite tooling choices on purpose: Go runs
+protoc and compiles stubs, Node loads the emitted `.proto` at runtime
+through `@grpc/proto-loader` and takes its session surface from the
+wrapper's structural interfaces, no protoc step, no generated stub, no
+native code, the marketplace-safe shape an editor extension ships.
+
+- emit `<stem>_session.ts` as emit-proto's third artifact: the pinned shape
+  hash as a bigint, structural interfaces for the sign surface and the
+  signature with the vows typed by their loader spellings, the session
+  handle, and the opener that reads the signature off the stream before the
+  promise settles
+- keep the syntax inside the erasable set, so node runs the wrapper
+  directly under type stripping with no compiler in the loop
+- import nothing in the wrapper: the one surface it needs from grpc-js, the
+  stream a session opens, is spelled structurally
+- spell every 64 bit integer as a decimal string and every field in the
+  wire's own snake_case, the loader under keepCase, longs as String, and
+  oneofs on, with the oneof discriminator carrying which arm a result took
+- name the interfaces with the contract's name always, wrapper local and
+  independent of the proto prefix rule, so a file of many contracts stays
+  unambiguous
+- stand the Node consumer up in interop/grpc/node: two npm dependencies,
+  the emitted pair under gen, and a client that asserts the Go walk check
+  for check, the pinned hash at sign, the value Err as err=41 on an OK rpc,
+  the automatic break keeping its payload and the explicit break zeroing
+  it, a lying hash refused as ABORTED, a killed child's instance collected
+  in milliseconds, and a quiet session resuming on latches set before the
+  silence
+- gate it beside the others: test-grpc-node runs the same server under the
+  Node client, out of the all gate with the other gRPC gates and skipping
+  clean where node, npm, or grpcio is absent, and test-proto pins the two
+  TypeScript goldens beside the Go and proto ones
+
+### Notes
+
+The wrapper is the counterexample to its own tooling: where the Go path is
+emit, generate, compile, link, the Node path is emit and run. Both end at
+the same server making the same promises, which is the point of a surface
+out of the compiler. The editor middleware assessment in the usability
+notes now has its VSCode half proven rather than argued, an extension's
+whole diet being two npm packages and two emitted files.
+
 ## [v0.3.6] the bridged type set
 
 The declared types cross the bridge. emit-proto covered the scalar walk;

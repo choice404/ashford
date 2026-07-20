@@ -55,7 +55,7 @@ MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -384,9 +384,11 @@ test-proto: $(ASHC)
 	diff tests/golden/ledger.proto $(OUT)/ledger.proto
 	$(ASHC) emit-proto skeleton/main_demo.ash
 	diff tests/golden/main_demo.proto $(OUT)/main_demo.proto
+	diff tests/golden/payment_session.ts $(OUT)/payment_session.ts
 	$(ASHC) emit-proto skeleton/std_user.ash
 	diff tests/golden/std_user.proto $(OUT)/std_user.proto
 	diff tests/golden/std_user_session.go $(OUT)/std_user_session.go
+	diff tests/golden/std_user_session.ts $(OUT)/std_user_session.ts
 	rm -f $(OUT)/lang.proto
 	! $(ASHC) emit-proto skeleton/lang.ash 2>/dev/null
 	test ! -f $(OUT)/lang.proto
@@ -768,6 +770,49 @@ test-grpc-go: $(RT_SO) $(MODULE_PAY) $(ASHC)
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
 	./$(OUT)/bridge_client_go -addr 127.0.0.1:50252; \
+	code=$$?; \
+	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	exit $$code
+
+# The Node twin of the Go gate: the same server, driven by a client whose
+# whole diet is two npm packages and the emitted artifacts. The .proto rides
+# in through @grpc/proto-loader at runtime, no protoc and no generated stub,
+# and the session rides in through the emitted TypeScript wrapper, which
+# node runs directly under type stripping. This is the editor extension
+# path from the usability notes, proven end to end: no native code crosses
+# the marketplace boundary. Out of the all gate like the other gRPC gates,
+# skipping clean where node, npm, or grpcio is absent.
+NODE_DIR := interop/grpc/node
+
+test-grpc-node: $(RT_SO) $(MODULE_PAY) $(ASHC)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-grpc-node] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then \
+	    echo "[test-grpc-node] node or npm not found, skipping"; \
+	    exit 0; \
+	fi; \
+	$(ASHC) emit-proto skeleton/payment.ash || exit 1; \
+	mkdir -p $(NODE_DIR)/gen $(GRPC_GEN); \
+	cp $(OUT)/payment.proto $(OUT)/payment_session.ts $(NODE_DIR)/gen/ || exit 1; \
+	if [ ! -d $(NODE_DIR)/node_modules ]; then \
+	    (cd $(NODE_DIR) && npm install --no-audit --no-fund) || exit 1; \
+	fi; \
+	$$py -m grpc_tools.protoc -I interop/grpc \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    $(GRPC_PROTO) || exit 1; \
+	$$py interop/grpc/bridge_server.py --port 50254 & \
+	srv=$$!; \
+	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
+	node $(NODE_DIR)/client.mjs --addr 127.0.0.1:50254; \
 	code=$$?; \
 	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
 	exit $$code

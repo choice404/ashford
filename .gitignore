@@ -1,2 +1,4 @@
 target/
 interop/grpc/go/paymentpb/
+interop/grpc/node/node_modules/
+interop/grpc/node/gen/

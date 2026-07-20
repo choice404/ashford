@@ -863,3 +863,162 @@ export func cgen_proto_go(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: 
     out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
     return out
 }
+
+// The TypeScript spelling a vow or signature field crosses the loader as:
+// grpc-js under longs: String carries every 64 bit integer as a decimal
+// string, a Float is a number, a Bool a boolean, a String a string.
+func ts_scalar(g: *Cg, tyid: int64) -> string {
+    k: int64 = ty_get((*g).ty, tyid).kind
+    if k == tyk_int() { return "string" }
+    if k == tyk_uint() { return "string" }
+    if k == tyk_float() { return "number" }
+    if k == tyk_bool() { return "boolean" }
+    if k == tyk_str() { return "string" }
+    return ""
+}
+
+// One contract's TypeScript surface: the pinned shape hash, the structural
+// interfaces the loader's objects satisfy, the session handle, and the
+// opener. The interfaces are wrapper local and always carry the contract's
+// name, so a file of many contracts stays unambiguous without leaning on
+// the proto prefix rule.
+func emit_ts_contract(g: *Cg, cid: int64) -> void {
+    a: *Ast = (*g).ast
+    s: *Sigs = (*g).sigs
+    c: ContractNode = vec_get((*a).contracts, cid)
+    cname: string = ast_name(a, c.name)
+    ge: GEntry = rs_global((*g).res, c.name)
+    (*s).cur_pkg = ge.pkg
+
+    vows: *Vector<VowInfo> = alloc(vec_new())
+    pls: *Vector<PlInfo> = alloc(vec_new())
+    sub_ids: *Vector<int64> = alloc(vec_new())
+    sub_names: *Vector<int64> = alloc(vec_new())
+    collect(g, cid, vows, pls, sub_ids, sub_names)
+    shape: string = shape_string(g, cid, vows, pls)
+    hex: string = hash_hex16(fnv1a64(shape))
+    free(shape)
+
+    cg_top(g, tmsg5("// ", cname, "ShapeHash is the contract's shape hash, the same value the", "", ""))
+    cg_top(g, "// compiled module registers. Sending its decimal spelling as expected_hash")
+    cg_top(g, "// pins the wire to this build; leaving the field unset skips the check.")
+    cg_top(g, tmsg7("export const ", cname, "ShapeHash: bigint = 0x", hex, "n;", "", ""))
+    free(hex)
+    cg_top(g, "")
+    cg_top(g, tmsg3("export interface ", cname, "SignRequest {"))
+    mut i: int64 = 0
+    while i < vec_len(vows) {
+        v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
+        vs: VowSigT = sig_vow(s, cid, v.name)
+        mut tt: string = ts_scalar(g, vs.ty)
+        if str_len(tt) == 0 { tt = "string" }
+        mut note: string = "  // the vow; no default is declared, so unset refuses at sign"
+        if v.init >= 0 { note = "  // the vow; unset takes the declared default" }
+        cg_top(g, tmsg7("  ", ast_name(a, v.name), "?: ", tt, ";", note, ""))
+        i = i + 1
+    }
+    cg_top(g, "  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, tmsg3("export interface ", cname, "Signed {"))
+    cg_top(g, "  instance_id: string;")
+    mut j: int64 = 0
+    while j < vec_len(vows) {
+        v2: VowNode = vec_get((*a).vows, vec_get(vows, j).vid)
+        vs2: VowSigT = sig_vow(s, cid, v2.name)
+        mut tt2: string = ts_scalar(g, vs2.ty)
+        if str_len(tt2) == 0 { tt2 = "string" }
+        cg_top(g, tmsg5("  ", ast_name(a, v2.name), ": ", tt2, ";"))
+        j = j + 1
+    }
+    cg_top(g, "  shape_hash: string;")
+    cg_top(g, "  signed_at: string;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, tmsg5("// ", cname, "Session holds a signed instance open. The instance lives", "", ""))
+    cg_top(g, "// exactly as long as this handle: close ends the stream, and the server")
+    cg_top(g, "// breaks and drops the instance.")
+    cg_top(g, tmsg3("export interface ", cname, "Session {"))
+    cg_top(g, tmsg5("  signed: ", cname, "Signed;", "", ""))
+    cg_top(g, "  close(): void;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, tmsg5("// open", cname, "Session signs the contract and holds the session stream.", "", ""))
+    cg_top(g, "// The signature is read off the stream before the promise settles, so the")
+    cg_top(g, "// caller holds a live, addressable instance or an error, never a maybe.")
+    cg_top(g, tmsg5("export function open", cname, "Session(", "", ""))
+    cg_top(g, tmsg5("  client: { Session(req: ", cname, "SignRequest): SessionStream },", "", ""))
+    cg_top(g, tmsg5("  req: ", cname, "SignRequest,", "", ""))
+    cg_top(g, tmsg5("): Promise<", cname, "Session> {", "", ""))
+    cg_top(g, "  return new Promise((resolve, reject) => {")
+    cg_top(g, "    const stream = client.Session(req);")
+    cg_top(g, "    let opened = false;")
+    cg_top(g, "    stream.on(\"data\", (ev) => {")
+    cg_top(g, "      if (opened) { return; }")
+    cg_top(g, tmsg5("      const signed = (ev as { signed?: ", cname, "Signed }).signed;", "", ""))
+    cg_top(g, "      if (!signed) {")
+    cg_top(g, "        stream.cancel();")
+    cg_top(g, "        reject(new Error(\"the session stream opened without the signature\"));")
+    cg_top(g, "        return;")
+    cg_top(g, "      }")
+    cg_top(g, "      opened = true;")
+    cg_top(g, "      resolve({ signed, close: () => stream.cancel() });")
+    cg_top(g, "    });")
+    cg_top(g, "    stream.on(\"error\", (err) => {")
+    cg_top(g, "      // After the signature the stream's end is the session's end, the")
+    cg_top(g, "      // cancel the close asked for; before it, the sign itself refused.")
+    cg_top(g, "      if (!opened) { reject(err); }")
+    cg_top(g, "    });")
+    cg_top(g, "  });")
+    cg_top(g, "}")
+}
+
+// Emits the TypeScript session wrapper. The returned string is the file;
+// the caller discards it when errors arrived in the vector.
+export func cgen_proto_ts(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>, stem: string) -> string {
+    g: *Cg = cg_new(a, r, s, t, errors)
+    cids: *Vector<int64> = alloc(vec_new())
+    decls: *Vector<DeclNode> = (*a).decls
+    mut i: int64 = 0
+    while i < vec_len(decls) {
+        d: DeclNode = vec_get(decls, i)
+        if d.kind == dk_contract() {
+            c: ContractNode = vec_get((*a).contracts, d.id)
+            if !c.internal {
+                vec_push(cids, d.id)
+            }
+        }
+        i = i + 1
+    }
+
+    cg_top(g, tmsg3("// Code generated by ashc emit-proto from ", stem, ".ash. DO NOT EDIT."))
+    cg_top(g, "//")
+    cg_top(g, "// The session wrapper for TypeScript over @grpc/grpc-js and")
+    cg_top(g, "// @grpc/proto-loader: load the .proto beside this file at runtime, take")
+    cg_top(g, "// the service client it yields, and open a session here. protoc's typed")
+    cg_top(g, "// stubs fit where a build step is welcome; this wrapper leans on the")
+    cg_top(g, "// loader instead, so a host like an editor extension ships no native")
+    cg_top(g, "// code and no generated stubs. Load with keepCase: true, longs: String,")
+    cg_top(g, "// and oneofs: true: the field names keep the wire's own snake_case, and")
+    cg_top(g, "// every 64 bit integer, the instance id and the hash first among them,")
+    cg_top(g, "// crosses as a decimal string, which is how the interfaces below spell")
+    cg_top(g, "// them. The syntax stays inside the erasable set, so node runs this")
+    cg_top(g, "// file directly under type stripping, no compiler in the loop.")
+    cg_top(g, "")
+    cg_top(g, "// The shape of the call a session opens, the one surface the wrapper")
+    cg_top(g, "// needs from grpc-js, spelled structurally so nothing is imported.")
+    cg_top(g, "export interface SessionStream {")
+    cg_top(g, "  on(event: \"data\", listener: (ev: unknown) => void): unknown;")
+    cg_top(g, "  on(event: \"error\", listener: (err: Error) => void): unknown;")
+    cg_top(g, "  cancel(): void;")
+    cg_top(g, "}")
+    cg_top(g, "")
+    mut j: int64 = 0
+    while j < vec_len(cids) {
+        if j > 0 { cg_top(g, "") }
+        emit_ts_contract(g, vec_get(cids, j))
+        j = j + 1
+    }
+    out: string = substring(sb_cstr((*g).out), 0, sb_size((*g).out))
+    return out
+}
