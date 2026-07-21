@@ -54,7 +54,7 @@ Contextual keywords, ordinary identifiers except in the positions named:
 
 - `fulfill` and `partial` are labels inside a `requirements` block.
 - `abi`, `symbol`, and `version` are attribute keys.
-- `sign`, `status`, and `partial` are builtin contract methods.
+- `sign`, `resume`, `status`, `park`, and `partial` are builtin contract methods.
 
 One carve out: after `.` any keyword is accepted as a member name. That is what lets `payment.break()` parse while `break` stays a hard keyword for loop control.
 
@@ -307,11 +307,17 @@ let result = payment.validate_card(my_card)
 ```
 
 - `Contract.sign(...)` takes named vow overrides. Every vow without a default must appear. It returns the signed instance.
+- `Contract.resume(dsn, key)` takes two positional `String` arguments and stands a parked instance back up, the signed instance the answer the way sign's is. A key nobody parked, a contract the runtime does not register, and a version or shape skew each fault the enclosing body with the runtime's own status.
 - `instance.pledge_name(args)` fulfills that pledge and returns exactly the pledge's declared type.
 - `instance.pledge_name` with no call is a first class pledge value of the matching `PledgeType`, bound to that instance.
+- `instance.vow_name` reads a locked vow through the instance, typed as the vow's declared type, an independent copy the way every read is. A vow is read, never called.
 - `instance.break()` tears the contract down and returns `Unit`. Every later fulfillment on it returns the broken contract error.
-- `instance.status()` returns the contract state. `instance.partial()` returns the `PartialResult`.
+- `instance.status()` returns the state's canonical spelling as a `String`: `"Unsigned"`, `"Signed"`, `"Fulfilled"`, `"Partial"`, or `"Broken"`.
+- `instance.park(dsn, key)` writes the instance's durable state into the store behind `dsn` under `key` and returns `Unit`; parking is a write, not an ending, and the instance stays live. A park mid walk, an open transactional episode or an unwaited future, faults the body, the same refusals the C surface answers.
+- `instance.partial()` returns the `PartialResult`, a builtin record every program carries without declaring it: `state: String`, `fulfilled: List<String>`, `pending: List<String>`, `broken: List<String>`, the name lists in the runtime's insertion order. It is an ordinary record value, its fields read like any record's, and the copy is independent the way every read is. The `Err` payloads stay on the C surface, where `ash_partial_error` hands them over, because their types vary per pledge and a record field carries one. Declaring your own `PartialResult` collides with the builtin and is an error.
 - A clause is called by bare name, `format_message(msg)`, and only from inside its own contract.
+
+The member spellings `sign`, `resume`, `break`, `status`, `park`, and `partial` belong to the lifecycle; a pledge under one of those names is unreachable through an instance and its own spelling should step aside.
 
 There is no dynamic `fulfill(name, args)` form in the language. Dispatch by name lives in the runtime C API for foreign hosts, where nothing is statically checked anyway.
 

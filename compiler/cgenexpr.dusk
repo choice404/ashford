@@ -508,6 +508,24 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
         }
     }
     if ty_get((*g).ty, base.ty).kind == tyk_contract() {
+        // A vow read through the instance: ash_vow_ref borrows the locked
+        // value, and the read deep copies it home so the value survives the
+        // callee's break the way value semantics promise.
+        cid: int64 = cg_contract_of(g, base.ty)
+        if cid >= 0 {
+            vs: VowSigT = sig_vow((*g).sigs, cid, e.b)
+            if vs.found {
+                p: string = cg_tmp(g)
+                head: string = tmsg7("const AshValue* ", p, " = ash_vow_ref((AshContract*)", base.cvar, ".as.box, \"", ast_name(a, e.b), "\");")
+                cg_line(g, head)
+                cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_NAME;"))
+                home: string = new_value(g)
+                st: string = cg_tmp(g)
+                cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, ", p, ", &", home, ");"))
+                cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+                return CVal { cvar: home, ty: vs.ty }
+            }
+        }
         cg_unsupported(g, e.lo, e.hi, "a first class pledge value in a pledge body")
         return bad_val(g)
     }
@@ -759,6 +777,71 @@ func gen_break_call(g: *Cg, base: CVal) -> CVal {
     return CVal { cvar: v, ty: ty_unit((*g).ty) }
 }
 
+// instance.status(). The runtime hands the state's canonical spelling as a
+// String borrowing static bytes, so nothing allocates and nothing frees.
+func gen_status_call(g: *Cg, base: CVal) -> CVal {
+    v: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshValue ", v, " = ash_state_value((const AshContract*)", base.cvar, ".as.box);", "", ""))
+    return CVal { cvar: v, ty: ty_str((*g).ty) }
+}
+
+// instance.park(dsn, key). The two String values ride the value argument
+// spelling of park, and the status takes the thunk's exit convention like
+// every runtime helper; the answer is Unit.
+func gen_park_call(g: *Cg, base: CVal, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    arg0: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b))
+    arg1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+    d: CVal = gen_expr(g, arg0.expr, ty_str(t))
+    k: CVal = gen_expr(g, arg1.expr, ty_str(t))
+    st: string = cg_tmp(g)
+    head: string = tmsg7("AshStatus ", st, " = ash_instance_park_v((AshContract*)", base.cvar, ".as.box, &", d.cvar, ", &")
+    cg_line(g, tmsg3(head, k.cvar, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    v: string = new_value(g)
+    return CVal { cvar: v, ty: ty_unit(t) }
+}
+
+// instance.partial(). The runtime folds the instance's requirements into a
+// PartialResult record allocated on the enclosing instance, the status takes
+// the thunk's exit convention like every runtime helper, and the fresh value
+// carries the record the checker named.
+func gen_partial_call(g: *Cg, base: CVal) -> CVal {
+    v: string = new_value(g)
+    st: string = cg_tmp(g)
+    cg_line(g, tmsg7("AshStatus ", st, " = ash_partial_value((AshContract*)", base.cvar, ".as.box, cc, &", v, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    return CVal { cvar: v, ty: ty_named((*g).ty, "PartialResult") }
+}
+
+// Contract.resume(dsn, key): the parked row stood back up on this runtime,
+// the resumed instance the value the way sign's instance is.
+func gen_resume(g: *Cg, scid: int64, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    c: ContractNode = vec_get((*a).contracts, scid)
+    cname: string = ast_name(a, c.name)
+    if c.internal {
+        cg_unsupported(g, e.lo, e.hi, tmsg3("resuming the internal contract '", cname, "' in a pledge body"))
+        return bad_val(g)
+    }
+    arg0: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b))
+    arg1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+    d: CVal = gen_expr(g, arg0.expr, ty_str(t))
+    k: CVal = gen_expr(g, arg1.expr, ty_str(t))
+    ins: string = cg_tmp(g)
+    cg_line(g, tmsg3("AshContract* ", ins, " = NULL;"))
+    st: string = cg_tmp(g)
+    head: string = tmsg7("AshStatus ", st, " = ash_instance_resume_v(ash_instance_runtime(cc), &", d.cvar, ", &", k.cvar, ", 0, &")
+    cg_line(g, tmsg3(head, ins, ");"))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    v: string = new_value(g)
+    set_ty(g, v, "ASH_TY_INSTANCE")
+    cg_line(g, tmsg5(v, ".as.box = ", ins, ";", ""))
+    return CVal { cvar: v, ty: ty_contract(t, cname) }
+}
+
 // The schema of the given name in the contract: its declaration index, the one
 // the emitted AshSchemaDesc array shares, and its arena id. (-1, -1) when the
 // contract declares no such schema, which the checker already reported.
@@ -885,6 +968,9 @@ func gen_call(g: *Cg, e: ExprNode) -> CVal {
                     if str_eq(ast_name(a, cn.b), "sign") {
                         return gen_sign(g, ge2.id, e)
                     }
+                    if str_eq(ast_name(a, cn.b), "resume") {
+                        return gen_resume(g, ge2.id, e)
+                    }
                     cg_unsupported(g, e.lo, e.hi, "this call on a contract name in a pledge body")
                     return bad_val(g)
                 }
@@ -901,6 +987,15 @@ func gen_call(g: *Cg, e: ExprNode) -> CVal {
         if ty_get((*g).ty, base.ty).kind == tyk_contract() {
             if str_eq(ast_name(a, cn.b), "break") {
                 return gen_break_call(g, base)
+            }
+            if str_eq(ast_name(a, cn.b), "status") {
+                return gen_status_call(g, base)
+            }
+            if str_eq(ast_name(a, cn.b), "park") {
+                return gen_park_call(g, base, e)
+            }
+            if str_eq(ast_name(a, cn.b), "partial") {
+                return gen_partial_call(g, base)
             }
             return gen_pledge_call(g, base, cn.b, e)
         }

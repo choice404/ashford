@@ -262,6 +262,14 @@ size_t ash_partial_nerrors(AshContract* c);
 AshStatus ash_partial_error(AshContract* c, size_t i,
                             const char** pledge_name, const AshValue** err);
 
+/* Builds the current partial surface as a record value on owner: state,
+ * fulfilled item names, pending item names, and broken item names. The state
+ * string borrows static runtime bytes, while every item name is copied onto
+ * owner so the record can outlive the read instance. NULL arguments are
+ * ASH_ERR_TYPE, and allocation failure is ASH_ERR_OOM. On error out is left
+ * as a zeroed Unit value. */
+AshStatus ash_partial_value(AshContract* c, AshContract* owner, AshValue* out);
+
 /* ---- the parked instance ---- */
 
 /* Writes the instance's durable state under key into the store behind dsn:
@@ -301,6 +309,24 @@ AshStatus ash_instance_park(AshContract* c, const char* dsn, const char* key);
  * ASH_ERR_TYPE; a backend failure is ASH_ERR_STORE. */
 AshStatus ash_instance_resume(AshRuntime* rt, const char* dsn, const char* key,
                               uint64_t expected_hash, AshContract** out);
+
+/* The value argument spellings of park and resume, for a caller whose dsn
+ * and key are already String values, which is what a compiled pledge body
+ * holds. Both take ASH_TY_STRING values, refuse anything else with
+ * ASH_ERR_TYPE, and otherwise follow the C string forms exactly. */
+AshStatus ash_instance_park_v(AshContract* c, const AshValue* dsn,
+                              const AshValue* key);
+AshStatus ash_instance_resume_v(AshRuntime* rt, const AshValue* dsn,
+                                const AshValue* key, uint64_t expected_hash,
+                                AshContract** out);
+
+/* The canonical spelling of one lifecycle state: Unsigned, Signed,
+ * Fulfilled, Partial, or Broken, static storage the caller never frees.
+ * ash_state_value wraps the current state of an instance as a String value
+ * borrowing those static bytes, the language's instance.status() seen from
+ * C. */
+const char* ash_state_name(AshContractState s);
+AshValue    ash_state_value(const AshContract* c);
 
 /* ---- pledges ---- */
 

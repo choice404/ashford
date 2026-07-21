@@ -51,11 +51,12 @@ MODULE_NETPAY := $(OUT)/libnet_payment.ash.so
 MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 MODULE_LEDGER := $(OUT)/libledger.ash.so
+MODULE_LIFE := $(OUT)/liblifecycle.ash.so
 MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-park test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -63,7 +64,7 @@ BIN_DEMO   := $(OUT)/main_demo
 # last. The stress and sanitizer variants of the store, network, and mesh gates
 # stay out and are run on their own, since each is minutes of load on ground the
 # functional gate beside it already covers.
-all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-park test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
+all: smoke test-runtime test-wire test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-python test-park test-lifecycle test-net test-net2 test-net-python test-mesh-serve test-mesh-pair test-mesh-python tsan
 
 runtime: $(RT_SO)
 
@@ -105,6 +106,9 @@ $(MODULE_LEDGER): $(ASHC) skeleton/ledger.ash lib/ashstd/store.ash runtime/inclu
 
 $(MODULE_CALC): $(ASHC) skeleton/mesh_calc.ash runtime/include/ash/ash_abi.h
 	$(ASHC) build skeleton/mesh_calc.ash
+
+$(MODULE_LIFE): $(ASHC) skeleton/lifecycle.ash runtime/include/ash/ash_abi.h
+	$(ASHC) build skeleton/lifecycle.ash
 
 $(BIN_DEMO): $(ASHC) skeleton/main_demo.ash $(RT_SO) runtime/include/ash/ash_abi.h
 	$(ASHC) build --bin skeleton/main_demo.ash
@@ -275,6 +279,18 @@ test-store-python: $(RT_SO) $(MODULE_LEDGER)
 	else \
 	    echo "[test-store-python] python3 not found, skipping"; \
 	fi
+
+# The instance surface gate under ASan and LSan: the compiled lifecycle
+# module walks sign, status(), the vow read through an instance, park,
+# break, and resume entirely inside the language and answers the stations
+# as one string; the host signs Driver, points park_dsn at a temp file, and
+# asserts the answer plus the two fault paths, a dead dsn as ASH_ERR_STORE
+# and an unparked key as ASH_ERR_NAME, riding the thunk's exit convention.
+test-lifecycle: $(MODULE_LIFE) $(SQLITE_OBJ)
+	@mkdir -p $(OUT)
+	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
+	    tests/runtime/test_lifecycle.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_lifecycle
+	./$(OUT)/test_lifecycle
 
 # The parked instance gate under ASan and LSan: an instance's durable state
 # written into a store row and stood back up in a fresh runtime, the vows,

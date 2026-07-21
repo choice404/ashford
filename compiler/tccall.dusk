@@ -61,6 +61,31 @@ func check_args(tc: *Tc, params: TyList, off: int64, len: int64, lo: int64, hi: 
     }
 }
 
+// Two positional String arguments, the shape park and resume share: the dsn
+// naming the database and the key naming the row.
+func check_two_strings(tc: *Tc, e: ExprNode, name: string) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    if e.c != 2 {
+        head: string = tmsg3("'", name, "' takes a dsn and a key, got ")
+        tc_emit(tc, e.lo, e.hi, tmsg_count(head, e.c, " arguments"))
+    }
+    mut i: int64 = 0
+    while i < e.c {
+        arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
+        ae: ExprNode = vec_get((*a).exprs, arg.expr)
+        if arg.label >= 0 {
+            tc_emit(tc, ae.lo, ae.hi, "named arguments are used only with sign")
+        }
+        at: int64 = infer_expr(tc, arg.expr, ty_str(t))
+        if !compat(t, ty_str(t), at) {
+            head2: string = tmsg_count("argument ", i + 1, tmsg3(" of '", name, "' expects "))
+            tc_emit(tc, ae.lo, ae.hi, tmsg_types(tc, head2, ty_str(t), ", got ", at))
+        }
+        i = i + 1
+    }
+}
+
 // Contract.sign(named vow overrides): every argument is labeled with a vow
 // name, appears once, matches the vow type, and every vow without a default
 // is supplied. Returns the signed instance type.
@@ -169,14 +194,27 @@ func call_on_instance(tc: *Tc, bt: int64, mname: int64, e: ExprNode) -> int64 {
         walk_args(tc, e.b, e.c)
         return ty_unit(t)
     }
-    if str_eq(mtext, "status") || str_eq(mtext, "partial") {
+    if str_eq(mtext, "status") {
+        if e.c != 0 {
+            tc_emit(tc, e.lo, e.hi, "status takes no arguments")
+        }
         walk_args(tc, e.b, e.c)
-        tc_emit(tc, e.lo, e.hi, tmsg3("not yet supported: ", mtext, "() on an instance"))
-        return ty_unknown(t)
+        return ty_str(t)
     }
-    if str_eq(mtext, "sign") {
+    if str_eq(mtext, "park") {
+        check_two_strings(tc, e, "park")
+        return ty_unit(t)
+    }
+    if str_eq(mtext, "partial") {
+        if e.c != 0 {
+            tc_emit(tc, e.lo, e.hi, "partial takes no arguments")
+        }
         walk_args(tc, e.b, e.c)
-        tc_emit(tc, e.lo, e.hi, "sign is called on the contract name, not an instance")
+        return ty_named(t, "PartialResult")
+    }
+    if str_eq(mtext, "sign") || str_eq(mtext, "resume") {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg3("", mtext, " is called on the contract name, not an instance"))
         return ty_unknown(t)
     }
     ps: PledgeSigT = find_pledge((*tc).sigs, cid, mname)
@@ -191,7 +229,7 @@ func call_on_instance(tc: *Tc, bt: int64, mname: int64, e: ExprNode) -> int64 {
         return ty_unknown(t)
     }
     if m.kind == mk_vow() {
-        tc_emit(tc, e.lo, e.hi, "not yet supported: reading a vow through an instance")
+        tc_emit(tc, e.lo, e.hi, tmsg3("the vow '", mtext, "' is read through the instance, not called"))
         return ty_unknown(t)
     }
     tc_emit(tc, e.lo, e.hi, tmsg5("contract '", cname, "' has no pledge '", mtext, "'"))
@@ -208,13 +246,18 @@ func member_with_base(tc: *Tc, e: ExprNode, bt: int64) -> int64 {
         cname: string = ty_name_of(t, bt)
         cid: int64 = contract_id_of(tc, bt)
         if cid < 0 { return ty_unknown(t) }
-        if str_eq(mtext, "break") || str_eq(mtext, "sign") {
+        if str_eq(mtext, "break") || str_eq(mtext, "sign") ||
+           str_eq(mtext, "status") || str_eq(mtext, "park") ||
+           str_eq(mtext, "resume") || str_eq(mtext, "partial") {
             tc_emit(tc, e.lo, e.hi, tmsg3("'", mtext, "' must be called"))
             return ty_unknown(t)
         }
-        if str_eq(mtext, "status") || str_eq(mtext, "partial") {
-            tc_emit(tc, e.lo, e.hi, tmsg3("not yet supported: ", mtext, "() on an instance"))
-            return ty_unknown(t)
+        // A vow read through the instance: the value the sign locked, typed
+        // as the vow's declared type.
+        mv: MEntry = rs_member((*tc).res, cid, e.b)
+        if mv.kind == mk_vow() {
+            vs2: VowSigT = sig_vow((*tc).sigs, cid, e.b)
+            return vs2.ty
         }
         ps: PledgeSigT = find_pledge((*tc).sigs, cid, e.b)
         if ps.found {
@@ -229,10 +272,6 @@ func member_with_base(tc: *Tc, e: ExprNode, bt: int64) -> int64 {
         m: MEntry = rs_member((*tc).res, cid, e.b)
         if m.kind == mk_clause() {
             tc_emit(tc, e.lo, e.hi, tmsg3("clause '", mtext, "' is called by bare name inside its own contract"))
-            return ty_unknown(t)
-        }
-        if m.kind == mk_vow() {
-            tc_emit(tc, e.lo, e.hi, "not yet supported: reading a vow through an instance")
             return ty_unknown(t)
         }
         tc_emit(tc, e.lo, e.hi, tmsg5("contract '", cname, "' has no pledge '", mtext, "'"))
@@ -308,11 +347,11 @@ export func infer_member(tc: *Tc, e: ExprNode) -> int64 {
         be: ExprNode = vec_get((*a).exprs, e.a)
         cname: string = ast_name(a, be.a)
         mtext: string = ast_name(a, e.b)
-        if str_eq(mtext, "sign") {
-            tc_emit(tc, e.lo, e.hi, "'sign' must be called")
+        if str_eq(mtext, "sign") || str_eq(mtext, "resume") {
+            tc_emit(tc, e.lo, e.hi, tmsg3("'", mtext, "' must be called"))
             return ty_unknown(t)
         }
-        tc_emit(tc, e.lo, e.hi, tmsg3("only sign is named on the contract '", cname, "'"))
+        tc_emit(tc, e.lo, e.hi, tmsg3("only sign and resume are named on the contract '", cname, "'"))
         return ty_unknown(t)
     }
     bt: int64 = infer_expr(tc, e.a, -1)
@@ -546,8 +585,16 @@ export func infer_call(tc: *Tc, e: ExprNode) -> int64 {
                 check_internal_sign(tc, scid, be.a, cname, e.lo, e.hi)
                 return check_sign(tc, scid, cname, e)
             }
+            if str_eq(mtext, "resume") {
+                // Resume stands a parked instance back up, so it wears the
+                // sign rules: an internal contract never resumes in a body,
+                // and the answer is the signed instance type.
+                check_internal_sign(tc, scid, be.a, cname, e.lo, e.hi)
+                check_two_strings(tc, e, "resume")
+                return ty_contract(t, cname)
+            }
             walk_args(tc, e.b, e.c)
-            tc_emit(tc, e.lo, e.hi, tmsg3("only sign is called on the contract '", cname, "'"))
+            tc_emit(tc, e.lo, e.hi, tmsg3("only sign and resume are called on the contract '", cname, "'"))
             return ty_unknown(t)
         }
         bt: int64 = infer_expr(tc, cn.a, -1)

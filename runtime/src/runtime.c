@@ -2161,6 +2161,72 @@ AshStatus ash_pledge_fulfill_sync(AshContract* c, const char* pledge_name,
     return st;
 }
 
+static AshStatus partial_names_value(AshContract* c, AshContract* owner,
+                                     AshItemState k, AshValue* out) {
+    size_t n = partial_scan(c, k, 0, NULL);
+    AshValue* data = NULL;
+    if (n > 0) {
+        data = (AshValue*)ash_bytes(owner, (uint64_t)n * sizeof(AshValue));
+        if (!data) return ASH_ERR_OOM;
+        memset(data, 0, n * sizeof(AshValue));
+        for (size_t i = 0; i < n; i++) {
+            const char* name = NULL;
+            partial_scan(c, k, i, &name);
+            if (!name) return ASH_ERR_NAME;
+            AshValue s = ash_string_copy(owner, (const uint8_t*)name,
+                                         strlen(name));
+            if (!s.as.s.ptr && s.as.s.len == 0 && name[0]) {
+                return ASH_ERR_OOM;
+            }
+            data[i] = s;
+        }
+    }
+    memset(out, 0, sizeof(*out));
+    out->ty = ASH_TY_LIST;
+    out->as.list.data = data;
+    out->as.list.len = n;
+    out->as.list.cap = n;
+    out->as.list.elem_ty = ASH_TY_STRING;
+    return ASH_OK;
+}
+
+AshStatus ash_partial_value(AshContract* c, AshContract* owner,
+                            AshValue* out) {
+    if (!c || !owner || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (c->conn) return ASH_ERR_STATE;
+
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_OK;
+    AshValue record;
+    memset(&record, 0, sizeof(record));
+    AshValue* fields = (AshValue*)ash_bytes(owner, 4 * sizeof(AshValue));
+    if (!fields) {
+        st = ASH_ERR_OOM;
+    } else {
+        memset(fields, 0, 4 * sizeof(AshValue));
+        fields[0] = ash_state_value(c);
+        st = partial_names_value(c, owner, ASH_ITEM_FULFILLED, &fields[1]);
+        if (st == ASH_OK) {
+            st = partial_names_value(c, owner, ASH_ITEM_PENDING, &fields[2]);
+        }
+        if (st == ASH_OK) {
+            st = partial_names_value(c, owner, ASH_ITEM_BROKEN, &fields[3]);
+        }
+        if (st == ASH_OK) {
+            record.ty = ASH_TY_RECORD;
+            record.as.list.data = fields;
+            record.as.list.len = 4;
+            record.as.list.cap = 4;
+            record.as.list.elem_ty = 0;
+            *out = record;
+        }
+    }
+    if (st != ASH_OK) memset(out, 0, sizeof(*out));
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
 /* ---- the parked instance ---- */
 
 /* The park row's schema, one table the runtime owns in whatever database the
@@ -2555,6 +2621,72 @@ AshStatus ash_instance_resume(AshRuntime* rt, const char* dsn, const char* key,
     }
     *out = c;
     return ASH_OK;
+}
+
+/* The canonical state spellings, the strings instance.status() answers in
+ * the language and any host may print. Static storage, never freed. */
+const char* ash_state_name(AshContractState s) {
+    switch (s) {
+    case ASH_UNSIGNED:  return "Unsigned";
+    case ASH_SIGNED:    return "Signed";
+    case ASH_FULFILLED: return "Fulfilled";
+    case ASH_PARTIAL:   return "Partial";
+    case ASH_BROKEN:    return "Broken";
+    }
+    return "Unknown";
+}
+
+AshValue ash_state_value(const AshContract* c) {
+    const char* n = ash_state_name(ash_contract_state(c));
+    AshValue v;
+    memset(&v, 0, sizeof(v));
+    v.ty = ASH_TY_STRING;
+    v.as.s.ptr = (uint8_t*)n;
+    v.as.s.len = strlen(n);
+    return v;
+}
+
+/* The NUL terminated copy of a String value the park calls take their dsn
+ * and key through when the caller holds values rather than C strings, the
+ * compiled thunk's own case. Plain heap, freed by the wrapper. */
+static char* park_cstr(const AshValue* v) {
+    if (!v || v->ty != ASH_TY_STRING) return NULL;
+    char* p = malloc((size_t)v->as.s.len + 1);
+    if (!p) return NULL;
+    if (v->as.s.len) memcpy(p, v->as.s.ptr, (size_t)v->as.s.len);
+    p[v->as.s.len] = 0;
+    return p;
+}
+
+AshStatus ash_instance_park_v(AshContract* c, const AshValue* dsn,
+                              const AshValue* key) {
+    if (!c || !dsn || !key || dsn->ty != ASH_TY_STRING ||
+        key->ty != ASH_TY_STRING) {
+        return ASH_ERR_TYPE;
+    }
+    char* d = park_cstr(dsn);
+    char* k = park_cstr(key);
+    AshStatus st = (d && k) ? ash_instance_park(c, d, k) : ASH_ERR_OOM;
+    free(d);
+    free(k);
+    return st;
+}
+
+AshStatus ash_instance_resume_v(AshRuntime* rt, const AshValue* dsn,
+                                const AshValue* key, uint64_t expected_hash,
+                                AshContract** out) {
+    if (!rt || !dsn || !key || !out || dsn->ty != ASH_TY_STRING ||
+        key->ty != ASH_TY_STRING) {
+        return ASH_ERR_TYPE;
+    }
+    char* d = park_cstr(dsn);
+    char* k = park_cstr(key);
+    AshStatus st = (d && k)
+        ? ash_instance_resume(rt, d, k, expected_hash, out)
+        : ASH_ERR_OOM;
+    free(d);
+    free(k);
+    return st;
 }
 
 /* ---- allocation helpers ---- */

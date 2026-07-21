@@ -430,6 +430,43 @@ func load_file(ld: *Ld, path: string) -> void {
     }
 }
 
+// Injects the builtin records the surface names but no file declares, as one
+// last declaration appended to the merged tree so resolve, typeck, and cgen
+// see them exactly as if a file had written them. PartialResult is the record
+// instance.partial() answers: the instance's state and the three name lists
+// the requirements policy sorts its pledges into. The nodes are built the way
+// the parser builds a record, with a String field and three List<String>
+// fields sharing one String type node, and the declaration takes a package
+// slot in decl_pkg beside every real one so the two vectors stay the same
+// length. A user file that also declares PartialResult draws an ordinary
+// duplicate from resolve, since the injected declaration is a real one.
+func inject_builtins(ld: *Ld) -> void {
+    a: *Ast = (*ld).ast
+    // The field types: a bare String, and List<String> for the name lists.
+    // The list argument slice holds the one String type node and is shared by
+    // the three list fields, since a type node is read only, never mutated.
+    str_ty: int64 = ast_type(a, tk_named(), ast_intern(a, "String"), 0, 0)
+    list_args: *Vector<int64> = alloc(vec_new())
+    vec_push(list_args, str_ty)
+    loff, llen := ast_kids(a, list_args)
+    list_ty: int64 = ast_type(a, tk_named(), ast_intern(a, "List"), loff, llen)
+    // The fields in declaration order: state, then fulfilled, pending, broken.
+    fields: *Vector<int64> = alloc(vec_new())
+    vec_push(fields, ast_field(a, ast_intern(a, "state"), str_ty))
+    vec_push(fields, ast_field(a, ast_intern(a, "fulfilled"), list_ty))
+    vec_push(fields, ast_field(a, ast_intern(a, "pending"), list_ty))
+    vec_push(fields, ast_field(a, ast_intern(a, "broken"), list_ty))
+    foff, flen := ast_kids(a, fields)
+    // The record carries no source span, so its diagnostics fall back to the
+    // first file at offset zero the way ld_emit already handles a span that
+    // lands in no file.
+    rid: int64 = ast_record(a, RecordNode { name: ast_intern(a, "PartialResult"), lo: 0, hi: 0, fields_off: foff, fields_len: flen })
+    ast_decl(a, dk_record(), rid)
+    // The builtin belongs to the root package, the one every single file
+    // program shares, so decl_pkg keeps one entry per declaration.
+    vec_push((*ld).decl_pkg, 0)
+}
+
 // Loads the whole program rooted at root_path. The returned Program owns the
 // merged tree; when ok is false the errors were already rendered and the
 // tree must not be checked.
@@ -453,6 +490,10 @@ export func load_program(root_path: string) -> *Program {
         ok: true,
     })
     load_file(ld, root_path)
+    // The tree is merged and no pass has run yet, so the builtin records join
+    // it here as a last declaration and flow into resolve exactly as a file's
+    // own declarations do.
+    inject_builtins(ld)
     return alloc(Program {
         ast: (*ld).ast,
         files: (*ld).files,

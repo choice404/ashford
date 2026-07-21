@@ -266,6 +266,8 @@ const AshValue*  ash_vow_ref(AshContract* c, const char* name);
 AshStatus        ash_contract_break(AshContract* c);
 ```
 
+The state's canonical spelling, the string the language's `instance.status()` answers, reads through `ash_state_name(AshContractState)`, static storage never freed, and `ash_state_value(const AshContract*)` wraps the instance's current state as a `String` value borrowing those bytes. The whole partial surface reads as one value through `ash_partial_value(c, owner, out)`, the record behind the language's `instance.partial()`: the state and the three name lists built on owner's heap in one consistent snapshot. An instance's durable state crosses processes through `ash_instance_park` and `ash_instance_resume` in `ash.h`, with `_v` spellings taking the dsn and key as `String` values, the form a compiled pledge body holds.
+
 ## Binding host implementations
 
 An abstract pledge, a declaration with no body, compiles to a descriptor entry whose `fn` is NULL. The host supplies the implementation:

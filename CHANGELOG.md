@@ -5,6 +5,72 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.3.9] the instance surface
+
+The lifecycle reads and writes from inside the language. An instance
+answers its state, hands back its locked vows, parks itself, and stands
+back up, all in the surface syntax, so the walk a C host drives through
+five ABI calls is a pledge body's dozen lines. The compiled thunk and the
+foreign host now hold the same instrument panel.
+
+- add `instance.status()`: the state's canonical spelling as a String,
+  Unsigned, Signed, Fulfilled, Partial, or Broken, borrowed from static
+  storage so nothing allocates and nothing frees
+- add the vow read through an instance: `instance.vow_name` types as the
+  vow's declared type and answers an independent deep copy, so the value
+  survives the callee's break the way value semantics promise; a vow is
+  read, never called, and calling one says so
+- add `instance.park(dsn, key)`: the durable state into the store row from
+  inside the language, Unit on success, the C surface's own refusals riding
+  the thunk's exit convention, a dead dsn as ASH_ERR_STORE, a walk in the
+  air or an open episode as ASH_ERR_STATE
+- add `Contract.resume(dsn, key)`: the parked row stood back up on the
+  running runtime, the signed instance the answer the way sign's is, an
+  unparked key as ASH_ERR_NAME and a skew as ASH_ERR_VERSION; an internal
+  contract refuses resume exactly as it refuses sign
+- reserve the lifecycle member spellings: sign, resume, break, status,
+  park, and partial name the builtins on an instance, and the checker walks
+  a pledge under one of those names past them never
+- carry the surface on four ABI additions: ash_state_name and
+  ash_state_value for the canonical spellings, and the _v forms of park and
+  resume taking their dsn and key as String values, the shape a compiled
+  body holds, so the emitted C needs no string handling of its own
+- add instance.partial(): the whole partial surface as one value, the
+  builtin record PartialResult every program carries without declaring it,
+  state as the canonical String and fulfilled, pending, and broken as
+  List<String> in the runtime's insertion order, its fields reading like
+  any record's; the Err payloads stay on the C surface where
+  ash_partial_error hands them over, because their types vary per pledge
+  and a record field carries one
+- inject the builtin record in the loader, after the merge and before the
+  resolver, so every later pass treats PartialResult as an ordinary
+  declared record with no special case, and a program declaring its own
+  collides the way any duplicate does
+- build the record in the runtime through ash_partial_value(c, owner,
+  out), one consistent snapshot under the instance lock, the state
+  borrowing its static spelling and every name copied onto owner so the
+  record outlives the instance it read
+- gate it in the default suite: the lifecycle skeleton walks sign,
+  status(), the vow read, park, break, resume, and the partial panel
+  entirely inside the language and answers the stations as strings the
+  host asserts, plus the two fault paths, under ASan and LSan
+- spell the surface in docs/grammar.md beside sign and break, and the ABI
+  additions in docs/abi.md beside the state enum
+
+### Notes
+
+status() answers a String rather than a declared sum on purpose: the five
+spellings are stable, they match what every log and every bridge already
+prints, and a match over them reads plainly. PartialResult is the
+language's first builtin record, and it arrives as a declaration the
+loader writes rather than a type the checker special cases, which is why
+it cost a page and not a subsystem: resolve, the type checker, codegen,
+and even the gRPC emitter handle it exactly as they would a record the
+program declared. The park and resume spellings complete the thought
+v0.3.8 started: the primitive lived in the ABI, and now the language that
+owns the contracts owns their persistence too, so a pledge body can hand
+its own instance to tomorrow, and read the whole panel while it decides.
+
 ## [v0.3.8] the instance written down
 
 A signature outlives its process. `ash_instance_park` writes an instance's

@@ -45,7 +45,7 @@
 @import cgenbin
 
 func version_string() -> string {
-    return "ashc 0.3.5"
+    return "ashc 0.3.9"
 }
 
 func usage() -> void {
