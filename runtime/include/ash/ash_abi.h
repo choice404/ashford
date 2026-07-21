@@ -110,7 +110,8 @@ typedef enum AshStatus {
     ASH_ERR_DEADLOCK,
     ASH_ERR_OOM,
     ASH_ERR_LOAD,      /* dlopen or registrar failure on a module */
-    ASH_ERR_NET,       /* the connection carrying this operation failed */
+    ASH_ERR_NET,       /* reserved; the status numbers are pinned and this
+                        * position holds so every later value keeps its number */
     ASH_ERR_STORE      /* the backend could not complete a store operation */
 } AshStatus;
 

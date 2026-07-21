@@ -5,6 +5,57 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.5.0] the one wire
+
+Ashford keeps no wire of its own. Inside one process the languages share
+memory through libashrt, and across processes they share gRPC, which every
+language, proxy, and load balancer already speaks: the compiler emits the
+surface, ordinary host code serves it, and stock tooling builds the
+clients. The runtime's own TCP transport, the daemon, and the mesh serve
+and connect surface retire, and the cross process story is the bridge,
+whole: the streaming session, the typed pledge rpcs, the value Err beside
+the status code, the pinned shape hash, and the park store that lets a
+session survive its stream, its client, and its server.
+
+- retire the transport: mesh.c, ashd.c, net.c, and the internal net headers
+  leave the tree, and runtime.c drops its remote proxy path whole, the
+  connection struct, the proxy fields on the instance, the remote branches
+  in sign, state, break, fulfill, the partial reads, the vow read, and the
+  park guard, 1383 lines gone with the threading and lock order untouched
+- retire the serve and connect API: AshServer, ash_runtime_connect,
+  ash_runtime_connect_all, ash_runtime_serve, and ash_server_stop leave
+  ash.h, and the exported surface of libashrt drops from 106 symbols to 64
+  with no local host call removed
+- hold the ABI lines that are pinned: the AshStatus numbers stand,
+  ASH_ERR_NET keeping its slot as a reserved status, and AshRuntimeConfig
+  keeps its layout, handshake_ms a reserved field a host leaves zero
+- keep the canonical value encoding: wire.c and its golden gate stay, the
+  park row's format and the proof it round trips exactly
+- retire the network and mesh gates, harnesses, skeletons, and the Python
+  connect and serve surface with the transport they drove; the default
+  suite tightens to the surfaces the language ships and runs in a third of
+  the time
+- write the bridge down as the normative cross process surface in
+  docs/bridge.md: the emitted artifacts, the session as a stream, business
+  beside transport with the status table, the type set, park and resume,
+  and what the bridge does not do; the README, the spec, the tutorial, and
+  the ABI doc tell the two role story straight
+
+### Notes
+
+The two roles were always the design: a local glue that puts many languages
+in one address space with no serialization, and a bridge that puts many
+processes on the wire the world already runs. A transport of Ashford's own
+sat between those roles and belonged to neither, and every question it
+answered, sessions, liveness, affinity, partition, the bridge now answers
+better, on infrastructure nobody has to trust twice. What the transport
+proved stays proven and stays in the tree where it still earns its keep:
+the canonical value encoding is the park format, discovery by mangled name
+and shape hash is how every host finds a contract, and the token posture
+lives on in the bridge's own policy seam. The pitch is one sentence now:
+Ashford is how the languages in one program keep promises to each other,
+and how those programs keep the same promises to each other over gRPC.
+
 ## [v0.4.0] the session that survives
 
 The bridge spends the parked instance. A park enabled server writes a

@@ -373,7 +373,7 @@ static void test_break_race(AshRuntime* rt) {
 int main(void) {
     /* A small pool on purpose: fewer workers than host threads means the
      * queue actually queues and the drain path actually drains. */
-    AshRuntimeConfig cfg = { 2 };
+    AshRuntimeConfig cfg = { 2, 0 };
     AshRuntime* rt = NULL;
     CHECK(ash_runtime_init(&cfg, &rt) == ASH_OK, "runtime init with config");
     if (!rt) return 1;

@@ -134,28 +134,17 @@ The frame is validated on the way in, not on the way out. The runtime checks the
 ```c
 typedef struct AshRuntimeConfig {
     uint32_t max_threads;    /* 0 selects the default pool of 4 workers */
-    uint32_t handshake_ms;   /* 0 selects the ten second handshake timeout */
+    uint32_t handshake_ms;   /* reserved; the layout is pinned, leave it 0 */
 } AshRuntimeConfig;
 
 AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out);
 void      ash_runtime_shutdown(AshRuntime* rt);
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
-AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
-                              const char* token);
-AshStatus ash_runtime_connect_all(AshRuntime* rt, const char** addrs,
-                                  const char** tokens, size_t n);
-AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr,
-                            const char* token, AshServer** out);
-void      ash_server_stop(AshServer* server);
 ```
 
 A NULL `cfg` means all defaults. `ash_module_load` hands `so_path` to dlopen as it stands, so a relative path resolves by the loader's rules from the process working directory; shutdown is described under Threading and frees everything the runtime tracked.
 
-`handshake_ms` is the one field Layer 2 adds: the timeout `ash_runtime_connect` gives a daemon to finish a handshake, 0 selecting ten seconds, and it is inert on a runtime that never connects. `ash_runtime_connect` dials an `ashd` daemon at `addr`, a `host:port` string, performs the handshake, and merges the daemon's whole iname table into this runtime's beside the local names, each remote entry marked with an origin naming the connection. `token` is the shared secret the daemon expects, NULL when the daemon runs without one. From a successful connect a remote contract signs, fulfills, reads its partial surface, and breaks through the same calls a local one does, the origin alone routing the work across the wire; the wire itself is [docs/network.md](network.md)'s subject and none of it shows through this API. Connect counts as registration and obeys the freeze law, `ASH_ERR_STATE` once the runtime is frozen, exactly like `ash_module_load`. A remote name that collides with one already in the table fails the connect with `ASH_ERR_NAME` and merges nothing; a version the daemon does not speak is `ASH_ERR_VERSION`; and a refused token, an unreachable address, or a connection that dies inside the handshake is `ASH_ERR_NET`, the one status Layer 2 appends. When a connection later dies, every proxy it signed latches Broken and every waiting future delivers `ASH_ERR_NET`, so the one new fact a network adds reaches a host through the channel it already reads.
-
-`ash_runtime_serve` is the far side of connect, the call that turns a host into a mesh node by serving this runtime's frozen iname table over TCP. `addr` is the `host:port` the node listens on and `token` the shared secret every peer must present, NULL to accept peers without one. The runtime is frozen if it is not already, so the table a peer fetches at the handshake is the table every later sign resolves against; the dump and its hash are snapshot, the address is bound, and an accept loop starts on a background thread. The call returns at once with an `AshServer` handle, an opaque type the header forward declares, so the host keeps its calling thread to serve more, connect out, and do its own work while the loop runs behind it. A node serves the contracts it registered locally and only those, never a remote origin it consumed, so a sign is one hop to the owner and the served table is exactly this runtime's own dump. More than one server may run at once, one per address a node wants to be reachable at, each with its own token and its own connection threads. Because a node serves its locals and never re-serves a remote, `ash_runtime_serve` after a consume edge has merged is `ASH_ERR_STATE`, which keeps a node serving before it connects; a NULL `rt`, `addr`, or `out` is `ASH_ERR_TYPE`, an address that will not bind is `ASH_ERR_NET`, and a dump or a thread that cannot be had is `ASH_ERR_OOM`. `ash_server_stop` shuts the listener down, wakes and joins every connection thread, breaks every instance those connections signed, and frees the handle, returning when nothing the server started is still running; a NULL server is a no-op, and the runtime it served is untouched and may still be shut down by its owner afterward. The library installs no signal handler: a host that wants a SIGINT to stop a server installs its own and calls `ash_server_stop` from it, the way `ashd`'s `main` does.
-
-`ash_runtime_connect_all` opens one consume edge per configured peer, `addrs[i]` under `tokens[i]`, in order, stopping at the first that fails and returning its status; a NULL `tokens` makes every edge tokenless, and a NULL `rt` or a NULL `addrs` with `n` nonzero is `ASH_ERR_TYPE`. It is a loop over `ash_runtime_connect` and nothing more, the mesh's startup wiring written as one call over a config array, so every rule connect carries rides through it unchanged and the edges opened before a failure stay open.
+`handshake_ms` is a reserved field: the config struct's layout is pinned, so the slot stays where it is and a host leaves it zero. `ASH_ERR_NET` is a reserved status the same way, the numbers behind it fixed forever. The cross process story lives in [docs/bridge.md](bridge.md): the compiler emits the gRPC surface, a server holds the runtime through this ABI, and nothing about serving shows through these calls.
 
 **Loading the runtime dynamically.** A compiled module carries undefined references to the runtime's exported symbols, `ash_register_contract` and the allocation helpers its thunks call, and no library dependency of its own; the dynamic linker resolves them against the process global scope when the runtime dlopens the module. A C host that links libashrt into its executable gets this for free, because an executable's startup dependencies join the global scope. A host that opens libashrt dynamically itself, dlopen from C or ctypes from Python, must open it with `RTLD_GLOBAL`, or every module load fails to resolve and reports `ASH_ERR_LOAD`.
 
@@ -559,5 +548,5 @@ The numbers are part of the wire: `ASH_OK` is 0 and the rest count up in the ord
 | `ASH_ERR_DEADLOCK` | reserved; v1 constructs no lock cycles and ships no detector |
 | `ASH_ERR_OOM` | allocation failed |
 | `ASH_ERR_LOAD` | dlopen or registrar failure on a module |
-| `ASH_ERR_NET` | the connection carrying this operation failed |
+| `ASH_ERR_NET` | reserved; the status numbers are pinned and this slot keeps its place |
 | `ASH_ERR_STORE` | the backend could not complete a store operation |

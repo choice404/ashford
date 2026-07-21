@@ -25,15 +25,14 @@ extern "C" {
 typedef struct AshRuntime  AshRuntime;
 typedef struct AshContract AshContract;
 typedef struct AshFuture   AshFuture;
-typedef struct AshServer   AshServer;
 
 /* ---- runtime lifecycle ---- */
 
 /* Pool sizing. max_threads of 0 selects the default of 4 workers; a value
  * beyond 256 is refused with ASH_ERR_TYPE rather than obeyed blindly.
- * handshake_ms is the timeout ash_runtime_connect gives a daemon to finish a
- * handshake, 0 selecting the default of ten seconds; a peer that will not
- * complete a HELLO in that window is not a peer and the connect fails. */
+ * handshake_ms is reserved: the layout is pinned, so a foreign host that
+ * rebuilds this struct writes the same eight bytes it always has, and the
+ * runtime reads the field as zero of no effect. */
 typedef struct AshRuntimeConfig {
     uint32_t max_threads;
     uint32_t handshake_ms;
@@ -49,77 +48,6 @@ void      ash_runtime_shutdown(AshRuntime* rt);
 /* dlopens a compiled module and calls its ash_module_register. The module
  * stays mapped until shutdown. ASH_ERR_STATE once the runtime is frozen. */
 AshStatus ash_module_load(AshRuntime* rt, const char* so_path);
-
-/* Connects to an ashd daemon at addr, a host:port string, performs the
- * handshake, and merges the daemon's whole iname table into this runtime's
- * table with an origin mark naming the connection. token is the shared secret
- * the daemon expects, NULL when the daemon runs without one. After a
- * successful connect the remote entries appear in lookup, enumeration, and the
- * canonical dump beside the local ones.
- *
- * Connect obeys the freeze law from the consume side. A runtime frozen with no
- * server running refuses it with ASH_ERR_STATE, exactly like ash_module_load,
- * the closed registration a pure client presents. A runtime that is serving does
- * not: a consume edge extends only the remote surface a node never re-serves,
- * never the frozen surface it offers, so a node may serve its own contracts and
- * still open an edge to a peer, which is how two serving nodes form the
- * symmetric pair a single freeze would otherwise deadlock. A remote name that
- * collides with a name already in the table, local or from another
- * connection, fails with ASH_ERR_NAME and merges nothing. A version the
- * daemon does not speak is ASH_ERR_VERSION; a refused token, an unreachable
- * address, or a connection that dies during the handshake is ASH_ERR_NET. The
- * handshake timeout is AshRuntimeConfig.handshake_ms, ten seconds by default.
- *
- * From a successful connect a remote contract signs, fulfills, reads its
- * partial surface, and breaks through the same calls a local one does; the
- * origin routes the work across the wire and the host code does not change. A
- * connection that later dies latches every proxy it signed Broken and delivers
- * ASH_ERR_NET to every future still waiting on it. */
-AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
-                              const char* token);
-
-/* Serves this runtime's frozen iname table over TCP, the far side of connect
- * and the call that turns any host into a mesh node. addr is the host:port the
- * node listens on; token is the shared secret every peer must present, NULL to
- * accept peers without one. The runtime is frozen if it is not already, so the
- * table a peer fetches at handshake is the table every later sign resolves
- * against, then the dump and its hash are snapshot, the address is bound, and
- * an accept loop is started on a background thread. The call returns at once
- * with an AshServer handle in out, so the host keeps its calling thread to
- * serve more, connect out, and do its own work while the loop runs behind it.
- *
- * A node serves the contracts it registered locally and only those; a remote
- * origin merged from a peer is never re-served, so a sign is one hop to the
- * owner and the served table is exactly this runtime's own dump. More than one
- * server may run at once, one per address a node wants to be reachable at, each
- * with its own token and its own connection threads.
- *
- * ASH_ERR_TYPE on a NULL rt, addr, or out; ASH_ERR_NET when the address will
- * not bind; ASH_ERR_OOM when the dump or a thread cannot be had. The library
- * carries no signal policy: a host that wants a SIGINT to stop a server installs
- * its own handler and calls ash_server_stop from it, the way ashd's main does. */
-AshStatus ash_runtime_serve(AshRuntime* rt, const char* addr,
-                            const char* token, AshServer** out);
-
-/* Stops a server: shuts the listener down, wakes and joins every connection
- * thread the way a break drains a client's waiters, breaks every instance those
- * connections signed, and frees the handle. Returns when the server is fully
- * torn down and nothing it started is still running. A NULL server is a no-op.
- * The runtime the server served is untouched and may still be shut down by its
- * owner afterward. */
-void      ash_server_stop(AshServer* server);
-
-/* Connects this runtime to each of n peers in turn, addrs[i] under tokens[i],
- * the startup wiring a mesh node does written as one call over a config array.
- * A NULL tokens makes every edge tokenless; otherwise tokens[i] is addrs[i]'s
- * secret, NULL for a tokenless peer in that slot. The connects run in order
- * through ash_runtime_connect and the first that fails returns its status at
- * once, the edges opened before it left in place, so a caller wanting all or
- * nothing shuts the runtime down on a failure. This is convenience over
- * ash_runtime_connect and no more: no registry, no discovery, the addresses
- * still explicit. ASH_ERR_TYPE on a NULL rt, or a NULL addrs with n nonzero. */
-AshStatus ash_runtime_connect_all(AshRuntime* rt, const char** addrs,
-                                  const char** tokens, size_t n);
 
 /* Called by a module's registrar. The runtime keeps the descriptor pointer,
  * it does not copy the tables. Registering also fills the iname table: one
@@ -282,8 +210,8 @@ AshStatus ash_partial_value(AshContract* c, AshContract* owner, AshValue* out);
  * holds a live signature it may keep driving or break.
  *
  * A park is a state between walks, never a snapshot of one mid flight: an
- * instance with an unwaited future, an open transactional episode, or a
- * remote proxy's signature is ASH_ERR_STATE. An unsigned instance is
+ * instance with an unwaited future or an open transactional episode is
+ * ASH_ERR_STATE. An unsigned instance is
  * ASH_ERR_STATE, and so is one the caller already ended: an explicit break
  * reclaimed the heap the vows and payloads live on, so there is nothing
  * left to write down, while an automatically broken instance keeps that

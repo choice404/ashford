@@ -7,10 +7,10 @@ crosses the line. This tutorial walks the whole language surface and then the
 part that is the point of it: driving one contract from C and from Python with
 no generated bindings on either side.
 
-The network layer, contracts served over a socket, is a real part of Ashford
-and is out of scope here on purpose. Everything below is the in process story:
-the language, and two languages meeting through it in one address space. The
-network is [docs/network.md](network.md) when you want it.
+The bridge, contracts served over gRPC to other processes, is a real part of
+Ashford and is out of scope here on purpose. Everything below is the in
+process story: the language, and two languages meeting through it in one
+address space. The bridge is [docs/bridge.md](bridge.md) when you want it.
 
 Every example in this tutorial is a real file under `skeleton/` or `lib/`, and
 every command is a real `make` target. Nothing here is pseudocode.
@@ -583,9 +583,9 @@ artifact, and every language meets at it.
   this tutorial showed and the ones it did not.
 - [docs/abi.md](abi.md) is the ABI a foreign host compiles against, the value
   layouts, the thunk frame, ownership, mangling, and the hash.
-- [docs/network.md](network.md) is the layer this tutorial skipped: the same
-  contracts served over a socket, signed and fulfilled across a machine
-  boundary with the host code unchanged.
+- [docs/bridge.md](bridge.md) is the layer this tutorial skipped: the same
+  contracts served over gRPC, the wire surface emitted by the compiler and
+  driven from any language with stock tooling.
 
 The fastest way to learn the rest is to read `skeleton/` beside `docs/abi.md`
 and change something. Every file there is compiled and driven by a gate, so a

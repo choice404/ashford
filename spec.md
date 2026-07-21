@@ -710,17 +710,17 @@ no uncommitted write survives a break and no connection outlives its instance.
 
 ---
 
-## The Network Layer
+## The Bridge
 
-Layer 2 serves the same contracts over a socket. A daemon, `ashd`, loads modules,
-freezes so its table is immutable, and serves their contracts on a TCP address. A
-client links the same `libashrt` and calls `ash_runtime_connect`, and every
-contract the daemon serves appears in the client's iname table beside the local
-ones. Signing and fulfilling a remote contract is the same code as a local one,
-so a host changes by a single line, a module load turned into a connect, when the
-contract moves across the wire. A shared token guards the connection, and a
-dropped connection surfaces as one new status, `ASH_ERR_NET`, through the wait a
-host already reads. The wire is a fixed frame header and a canonical little
-endian value encoding, and by reference arguments are refused across the network
-rather than bent. The network layer adds no language surface; it is the same
-contracts, one call wider.
+Across processes the same contracts speak gRPC, and Ashford keeps no wire of
+its own. `ashc emit-proto` writes the wire surface, one typed rpc per pledge
+and a signing stream whose lifetime is the instance's, plus the session
+wrappers protoc cannot write; a server is ordinary host code holding the
+runtime over the C ABI, and a client in any gRPC language builds from the
+emitted artifacts with stock tooling. A pledge's `Err` crosses as a value on
+an OK rpc, an Ashford status crosses as a gRPC code, the shape hash pins both
+ends to one contract, and a park store lets a session survive its stream, its
+client, and its server. The bridge adds no language surface; it is the same
+contracts, one emitted file wider. The canonical little endian value encoding
+remains the park row's format, so a parked value round trips exactly.
+[docs/bridge.md](docs/bridge.md) is the normative surface.

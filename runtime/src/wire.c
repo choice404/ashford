@@ -1,14 +1,14 @@
-/* wire.c: the canonical wire codec, docs/network.md made executable. This
- * translation unit knows no sockets; it turns frame headers and AshValues
- * into little endian bytes and back, and both C parties of the network
- * runtime, ashd and the client side of libashrt, link this one
- * implementation.
+/* wire.c: the canonical wire codec. This translation unit knows no sockets;
+ * it turns frame headers and AshValues into little endian bytes and back. The
+ * value half is the serialization the park format writes an instance's durable
+ * state through, so the runtime links this one implementation, and the
+ * test-wire gate pins every byte of the format against its checked in goldens.
  *
- * The status vocabulary is deliberately old. A malformed payload is
+ * The status vocabulary reuses the existing words. A malformed payload is
  * ASH_ERR_TYPE, the same word a thunk uses for a shape it cannot accept; an
- * oversized payload or a failed allocation is ASH_ERR_OOM, the refusal
- * docs/network.md pins for the 64 MiB cap. No new status exists for parsing,
- * because a parse failure is a type failure wearing a longer coat.
+ * oversized payload or a failed allocation is ASH_ERR_OOM, the refusal the
+ * codec pins at its 64 MiB cap. No new status exists for parsing, because a
+ * parse failure is a type failure wearing a longer coat.
  *
  * The decoder trusts nothing. Every count is checked against the bytes that
  * remain before anything is allocated, using the fact that no encoded value

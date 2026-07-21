@@ -63,20 +63,14 @@
 #include <ash/ash_store.h>
 #include <ash/ash_wire.h>
 
-#include "ash_net.h"
-#include "ash_remote.h"
-
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-
-#define ASH_HANDSHAKE_MS_DEFAULT 10000
 
 #define ASH_MAX_CONTRACT_TYPES 64
 #define ASH_MAX_MODULES        64
@@ -114,12 +108,6 @@ enum {
     TXN_DONE = 2
 };
 
-/* A client's connection to one daemon, defined in full with the remote path at
- * the end of the file. A proxy instance signed over it routes its lifecycle
- * across the wire; the struct is forward declared here so the instance can hold
- * one. */
-typedef struct AshConn AshConn;
-
 struct AshContract {
     AshRuntime*            rt;
     const AshContractDesc* desc;
@@ -130,19 +118,6 @@ struct AshContract {
     struct AshFuture*      futures;   /* every future this instance issued */
     uint64_t               shape_hash;
     int64_t                signed_at;
-
-    /* Remote proxy fields, all zero for a local instance. conn is the one test
-     * that tells a proxy from a local instance: non NULL means every lifecycle
-     * call routes to the wire instead of the pool. remote_id is the daemon's
-     * handle for this instance, meaningless off the connection. The vow set the
-     * SIGNED reply carried is stored here so ash_vow_ref, hash, and signed_at
-     * are local reads, sound because vows are immutable from the sign. */
-    AshConn*               conn;
-    uint64_t               remote_id;
-    struct AshContract*    proxy_next;   /* conn's list of its proxies */
-    char**                 rvow_names;   /* instance owned, remote_nvows of them */
-    AshValue*              rvow_vals;
-    uint32_t               remote_nvows;
 
     /* The latches, one slot per descriptor pledge, and the first Err payload
      * each broken pledge carried. Both arrays are plain heap freed at
@@ -209,16 +184,6 @@ typedef struct AshBinding {
     AshPledgeFn          fn;
 } AshBinding;
 
-/* A block of heap the runtime keeps for the life of a connection: the retained
- * iname dump text a remote merge tokenizes in place, which the merged entries
- * borrow into exactly the way a local pledge entry borrows into a module
- * image. They are freed wholesale at shutdown. */
-typedef struct AshNetBuf {
-    struct AshNetBuf* next;
-    void*             p;
-    size_t            n;
-} AshNetBuf;
-
 struct AshRuntime {
     const AshContractDesc* descs[ASH_MAX_CONTRACT_TYPES];
     size_t                 ndescs;
@@ -238,32 +203,7 @@ struct AshRuntime {
     size_t                 ninames;
     size_t                 iname_cap;
     int                    frozen;
-
-    /* Live ash_runtime_serve handles on this runtime, guarded by lock. The
-     * freeze fixes the surface a node offers; a consume edge extends only the
-     * surface a node holds, which is never re-served, so a node that serves may
-     * still connect out past its own freeze. A runtime frozen with no server is
-     * a closed registration and connect stays ASH_ERR_STATE, the Layer 2 rule;
-     * a serving node reads nservers above zero and its consume side stays open,
-     * which is what lets two nodes each serve then connect and so form the
-     * symmetric pair a single freeze would otherwise deadlock. */
-    int                    nservers;
     pthread_mutex_t        lock;      /* guards the tables above */
-
-    /* The handshake timeout ash_runtime_connect gives a daemon, resolved from
-     * the config at init, and the retained buffers remote merges borrow into.
-     * net_bufs is guarded by lock, the same discipline the iname table keeps. */
-    uint32_t               handshake_ms;
-    AshNetBuf*             net_bufs;
-
-    /* The remote surface: one open connection per daemon, and one row per
-     * remote contract naming the connection that serves it, so a sign by plain
-     * contract name resolves to an origin the same way find_desc resolves a
-     * local one. Both are guarded by lock. */
-    AshConn*               conns;
-    struct RemoteContract* remotes;
-    size_t                 nremotes;
-    size_t                 remotes_cap;
 
     /* The pool: nworkers threads draining one unbounded intrusive queue of
      * futures. qmu and qcv are a leaf lock pair, never held with another. */
@@ -282,77 +222,6 @@ typedef AshStatus (*AshRegisterFn)(AshRuntime*);
  * evaluator further down; both run under the instance lock. */
 static int pledge_is_loose(const AshContractDesc* d, uint32_t i);
 static int sub_all(const AshContract* c, uint32_t s, uint8_t want);
-
-/* Whether a pointer falls inside one of the runtime's retained net buffers,
- * the test that tells a remote iname string from a locally owned one at
- * shutdown. Defined with the connect path at the end of the file. */
-static int net_owned(const AshRuntime* rt, const void* ptr);
-
-/* The remote lifecycle, all defined with the connect path at the end of the
- * file. A proxy routes sign, fulfill, break, state, and the partial surface to
- * the wire; conn_shutdown tears one connection down, forfeiting its in flight
- * work to ASH_ERR_NET the way a local break forfeits to ASH_ERR_STATE. */
-typedef struct RemoteContract {
-    const char* name;        /* the plain contract name, runtime owned */
-    uint64_t    shape_hash;
-    uint32_t    version;
-    AshConn*    conn;
-} RemoteContract;
-
-/* A pending synchronous reply, the sign, break, or partial call's receipt. The
- * caller links one keyed by request id, sends its frame, and blocks on the cv
- * until the reader delivers the answer or the connection dies. */
-typedef struct PendingReply {
-    struct PendingReply* next;
-    uint64_t             req_id;
-    int                  done;
-    int                  dead;   /* the connection failed before the answer */
-    AshWireFrame         fr;
-    uint8_t*             payload;
-    pthread_mutex_t      mu;
-    pthread_cond_t       cv;
-} PendingReply;
-
-/* One connection to one daemon. A single reader thread owns every read; every
- * write goes under wmu so a detached decode never interleaves bytes with a
- * fulfill. Requests register in one of two maps keyed by request id, futures
- * for fulfillments and replies for the synchronous calls, and the reader routes
- * each answer to its waiter. proxies is the list of instances signed here, so a
- * disconnect can latch them all Broken. */
-struct AshConn {
-    struct AshConn*   next;      /* rt->conns */
-    AshRuntime*       rt;
-    int               fd;
-    pthread_mutex_t   wmu;       /* serializes frame writes */
-    pthread_t         reader;
-    int               reader_started;
-
-    pthread_mutex_t   pmu;       /* guards everything below */
-    uint64_t          next_req;
-    int               dead;
-    int               shutdown_done;
-    struct AshFuture* pending_futures;  /* linked via qnext */
-    PendingReply*     pending_replies;
-    AshContract*      proxies;          /* linked via proxy_next */
-};
-
-static AshStatus remote_sign(AshRuntime* rt, RemoteContract* rc,
-                             const AshVowBinding* vows, size_t nvows,
-                             uint64_t expected_hash, AshContract** out);
-static AshFuture* remote_fulfill(AshContract* c, const char* pledge_name,
-                                 const AshValue* args, size_t nargs,
-                                 const AshRef* refs, size_t nrefs);
-static AshStatus remote_break(AshContract* c);
-static AshContractState remote_state(AshContract* c);
-static size_t remote_partial_count(AshContract* c, AshItemState k);
-static const char* remote_partial_name(AshContract* c, AshItemState k, size_t i);
-static size_t remote_partial_nerrors(AshContract* c);
-static AshStatus remote_partial_error(AshContract* c, size_t i,
-                                      const char** pledge_name,
-                                      const AshValue** err);
-static void conn_shutdown(AshConn* conn);
-static void conn_free(AshConn* conn);
-static RemoteContract* find_remote(AshRuntime* rt, const char* name);
 
 /* ---- locking primitives ---- */
 
@@ -668,8 +537,6 @@ AshStatus ash_runtime_init(const AshRuntimeConfig* cfg, AshRuntime** out) {
         }
     }
     rt->nworkers = nworkers;
-    rt->handshake_ms = (cfg && cfg->handshake_ms != 0) ? cfg->handshake_ms
-                                                       : ASH_HANDSHAKE_MS_DEFAULT;
     *out = rt;
     return ASH_OK;
 }
@@ -698,21 +565,6 @@ void ash_runtime_shutdown(AshRuntime* rt) {
         pthread_join(rt->workers[i], NULL);
     }
     free(rt->workers);
-    /* Tear the connections down before the instances they proxy: each
-     * conn_shutdown forfeits its in flight work and joins its reader thread, so
-     * once the loop returns no reader can be decoding a result onto an instance
-     * this function is about to free. The proxy instances themselves are freed
-     * by the instance loop below, the same walk that frees a local one. */
-    {
-        AshConn* conn = rt->conns;
-        while (conn) {
-            AshConn* next = conn->next;
-            conn_shutdown(conn);
-            conn_free(conn);
-            conn = next;
-        }
-        rt->conns = NULL;
-    }
     for (size_t i = 0; i < rt->ninstances; i++) {
         AshContract* c = rt->instances[i];
         struct AshFuture* f = c->futures;
@@ -733,23 +585,13 @@ void ash_runtime_shutdown(AshRuntime* rt) {
         free(c);
     }
     for (size_t i = 0; i < rt->ninames; i++) {
-        /* A local contract entry's mangled name is its own heap; a remote
-         * entry's strings live in a retained net buffer freed below, so it is
-         * skipped here to keep the free single owned. */
-        if (rt->inames[i].kind == ASH_INAME_CONTRACT &&
-            !net_owned(rt, rt->inames[i].mangled)) {
+        /* A contract entry's mangled name is its own heap; a pledge entry
+         * borrows its descriptor's string, so only the contract entries free. */
+        if (rt->inames[i].kind == ASH_INAME_CONTRACT) {
             free((char*)rt->inames[i].mangled);
         }
     }
     free(rt->inames);
-    free(rt->remotes);
-    AshNetBuf* nb = rt->net_bufs;
-    while (nb) {
-        AshNetBuf* next = nb->next;
-        free(nb->p);
-        free(nb);
-        nb = next;
-    }
     for (size_t i = 0; i < rt->nmodules; i++) {
         dlclose(rt->modules[i]);
     }
@@ -1270,15 +1112,7 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
     pthread_mutex_lock(&rt->lock);
     const AshContractDesc* desc = find_desc(rt, contract_name);
     if (!desc) {
-        /* No local descriptor: the name may be a remote origin's, in which case
-         * the sign routes to the wire and its whole rulebook runs daemon side.
-         * A copy of the row is taken under the lock so a later connect's realloc
-         * of the remotes array cannot move it out from under the send. */
-        RemoteContract* rc = find_remote(rt, contract_name);
-        RemoteContract rcv;
-        if (rc) rcv = *rc;
         pthread_mutex_unlock(&rt->lock);
-        if (rc) return remote_sign(rt, &rcv, vows, nvows, expected_hash, out);
         return ASH_ERR_NAME;
     }
     if (expected_hash != 0 && expected_hash != desc->shape_hash) {
@@ -1357,7 +1191,6 @@ AshStatus ash_contract_sign(AshRuntime* rt, const char* contract_name,
 AshContractState ash_contract_state(const AshContract* c) {
     if (!c) return ASH_UNSIGNED;
     AshContract* mc = (AshContract*)c;
-    if (mc->conn) return remote_state(mc);
     pthread_mutex_lock(&mc->mu);
     AshContractState s = mc->state;
     pthread_mutex_unlock(&mc->mu);
@@ -1389,7 +1222,6 @@ AshRuntime* ash_instance_runtime(const AshContract* c) {
  * exactly two outcomes: delivered before the break, or ASH_ERR_STATE. */
 AshStatus ash_contract_break(AshContract* c) {
     if (!c) return ASH_ERR_TYPE;
-    if (c->conn) return remote_break(c);
     pthread_mutex_lock(&c->mu);
     if (c->state == ASH_UNSIGNED) {
         pthread_mutex_unlock(&c->mu);
@@ -1465,7 +1297,6 @@ static size_t partial_scan(const AshContract* c, AshItemState k, size_t want,
 
 size_t ash_partial_count(AshContract* c, AshItemState k) {
     if (!c) return 0;
-    if (c->conn) return remote_partial_count(c, k);
     pthread_mutex_lock(&c->mu);
     size_t n = partial_scan(c, k, 0, NULL);
     pthread_mutex_unlock(&c->mu);
@@ -1474,7 +1305,6 @@ size_t ash_partial_count(AshContract* c, AshItemState k) {
 
 const char* ash_partial_name(AshContract* c, AshItemState k, size_t i) {
     if (!c) return NULL;
-    if (c->conn) return remote_partial_name(c, k, i);
     const char* name = NULL;
     pthread_mutex_lock(&c->mu);
     partial_scan(c, k, i, &name);
@@ -1484,7 +1314,6 @@ const char* ash_partial_name(AshContract* c, AshItemState k, size_t i) {
 
 size_t ash_partial_nerrors(AshContract* c) {
     if (!c) return 0;
-    if (c->conn) return remote_partial_nerrors(c);
     size_t n = 0;
     pthread_mutex_lock(&c->mu);
     if (c->pledge_state) {
@@ -1499,7 +1328,6 @@ size_t ash_partial_nerrors(AshContract* c) {
 AshStatus ash_partial_error(AshContract* c, size_t i,
                             const char** pledge_name, const AshValue** err) {
     if (!c) return ASH_ERR_TYPE;
-    if (c->conn) return remote_partial_error(c, i, pledge_name, err);
     AshStatus st = ASH_ERR_NAME;
     pthread_mutex_lock(&c->mu);
     if (c->pledge_state) {
@@ -1527,20 +1355,6 @@ AshStatus ash_partial_error(AshContract* c, size_t i,
  * ownership rule every instance pointer follows. */
 const AshValue* ash_vow_ref(AshContract* c, const char* name) {
     if (!c || !name) return NULL;
-    if (c->conn) {
-        /* A proxy's vows are the effective set the SIGNED reply carried, stored
-         * by name at sign; the read is local because vows never move after. */
-        const AshValue* v = NULL;
-        pthread_mutex_lock(&c->mu);
-        for (uint32_t i = 0; i < c->remote_nvows; i++) {
-            if (strcmp(c->rvow_names[i], name) == 0) {
-                v = &c->rvow_vals[i];
-                break;
-            }
-        }
-        pthread_mutex_unlock(&c->mu);
-        return v;
-    }
     pthread_mutex_lock(&c->mu);
     const AshValue* v = NULL;
     if (c->vow_vals) {
@@ -1987,9 +1801,6 @@ AshFuture* ash_pledge_fulfill(AshContract* c, const char* pledge_name,
                               const AshValue* args, size_t nargs,
                               const AshRef* refs, size_t nrefs) {
     if (!c || !pledge_name) return NULL;
-    if (c->conn) {
-        return remote_fulfill(c, pledge_name, args, nargs, refs, nrefs);
-    }
     struct AshFuture* f = future_new(c);
     if (!f) return NULL;
     AshStatus st = ASH_OK;
@@ -2194,7 +2005,6 @@ AshStatus ash_partial_value(AshContract* c, AshContract* owner,
                             AshValue* out) {
     if (!c || !owner || !out) return ASH_ERR_TYPE;
     memset(out, 0, sizeof(*out));
-    if (c->conn) return ASH_ERR_STATE;
 
     pthread_mutex_lock(&c->mu);
     AshStatus st = ASH_OK;
@@ -2332,7 +2142,6 @@ static AshValue park_int_param(int64_t i) {
 
 AshStatus ash_instance_park(AshContract* c, const char* dsn, const char* key) {
     if (!c || !dsn || !key) return ASH_ERR_TYPE;
-    if (c->conn) return ASH_ERR_STATE;
     pthread_mutex_lock(&c->mu);
     AshStatus st = ASH_OK;
     if (c->state == ASH_UNSIGNED) st = ASH_ERR_STATE;
@@ -3153,1197 +2962,5 @@ AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
     RenderSink write_pass = { buf, cap, 0 };
     render_value(&write_pass, v, 0);
     buf[write_pass.pos] = '\0';
-    return ASH_OK;
-}
-
-/* ---- the network client ---- */
-
-/* The retained buffer bookkeeping and the remote table merge behind
- * ash_runtime_connect. A merge parses the daemon's canonical dump text back
- * into iname entries and inserts them beside the local ones, the reverse of
- * ash_iname_dump. The dump text carries a mangled name, a kind, a shape hash,
- * and a version, which is everything discovery and the dump need; the owning
- * contract name, the pledge symbol, and the argument count are not in the
- * dump, so a remote entry leaves them empty until a later layer that fulfills
- * across the wire needs them. */
-
-/* Whether a pointer falls inside one of the runtime's retained net buffers.
- * Called under rt->lock at shutdown, and cheap because the buffer list is one
- * entry per connection. */
-static int net_owned(const AshRuntime* rt, const void* ptr) {
-    const uint8_t* q = (const uint8_t*)ptr;
-    for (const AshNetBuf* b = rt->net_bufs; b; b = b->next) {
-        const uint8_t* base = (const uint8_t*)b->p;
-        if (q >= base && q < base + b->n) return 1;
-    }
-    return 0;
-}
-
-/* Hands one heap block to the runtime to hold until shutdown. Under rt->lock.
- * On failure the caller still owns the block. */
-static AshStatus net_track(AshRuntime* rt, void* p, size_t n) {
-    AshNetBuf* b = (AshNetBuf*)malloc(sizeof(AshNetBuf));
-    if (!b) return ASH_ERR_OOM;
-    b->p = p;
-    b->n = n;
-    b->next = rt->net_bufs;
-    rt->net_bufs = b;
-    return ASH_OK;
-}
-
-/* Removes one entry by mangled name, the rollback when a later insert of the
- * same merge fails. Under rt->lock. */
-static void iname_remove_one(AshRuntime* rt, const char* mangled) {
-    size_t pos;
-    if (!iname_find(rt, mangled, &pos)) return;
-    memmove(rt->inames + pos, rt->inames + pos + 1,
-            (rt->ninames - pos - 1) * sizeof(AshInameEntry));
-    rt->ninames--;
-}
-
-/* ---- the daemon seam: a decode arena and vow enumeration ----
- *
- * ashd reaches these through ash_remote.h. The scratch instance is a bare
- * AshContract the wire decoder can own values on when there is no real instance
- * yet, which is the case for a SIGN frame's vow overrides. The vow enumeration
- * walks a signed instance's effective vows so the daemon can put the whole set
- * in a SIGNED reply. */
-
-AshContract* ash_scratch_new(AshRuntime* rt) {
-    AshContract* c = (AshContract*)calloc(1, sizeof(AshContract));
-    if (!c) return NULL;
-    if (mutex_init_recursive(&c->mu) != 0) {
-        free(c);
-        return NULL;
-    }
-    c->rt = rt;
-    c->state = ASH_SIGNED; /* so the allocation helpers do not balk */
-    return c;
-}
-
-void ash_scratch_free(AshContract* c) {
-    if (!c) return;
-    contract_free_owned(c);
-    pthread_mutex_destroy(&c->mu);
-    free(c);
-}
-
-size_t ash_instance_nvows(const AshContract* c) {
-    if (!c || !c->desc || c->state == ASH_UNSIGNED) return 0;
-    return c->desc->nvows;
-}
-
-const char* ash_instance_vow_name(const AshContract* c, size_t i) {
-    if (!c || !c->desc || i >= c->desc->nvows) return NULL;
-    return c->desc->vows[i].name;
-}
-
-const AshValue* ash_instance_vow_value(const AshContract* c, size_t i) {
-    if (!c || !c->vow_vals || !c->desc || i >= c->desc->nvows) return NULL;
-    return &c->vow_vals[i];
-}
-
-uint32_t ash_runtime_handshake_ms(const AshRuntime* rt) {
-    return rt ? rt->handshake_ms : ASH_HANDSHAKE_MS_DEFAULT;
-}
-
-/* The serve loop lives in mesh.c, a separate unit that cannot see the runtime
- * struct, so it reports a server's arrival and departure here. attach counts one
- * live server so a frozen node keeps its consume side open; detach drops the
- * count when a server stops, and a runtime back to zero servers is a closed
- * registration again. Both take the runtime lock the connect gate reads under. */
-void ash_runtime_server_attach(AshRuntime* rt) {
-    if (!rt) return;
-    pthread_mutex_lock(&rt->lock);
-    rt->nservers++;
-    pthread_mutex_unlock(&rt->lock);
-}
-
-int ash_runtime_has_remotes(const AshRuntime* rt) {
-    if (!rt) return 0;
-    AshRuntime* mrt = (AshRuntime*)rt;
-    pthread_mutex_lock(&mrt->lock);
-    int has = mrt->nremotes > 0;
-    pthread_mutex_unlock(&mrt->lock);
-    return has;
-}
-
-void ash_runtime_server_detach(AshRuntime* rt) {
-    if (!rt) return;
-    pthread_mutex_lock(&rt->lock);
-    if (rt->nservers > 0) rt->nservers--;
-    pthread_mutex_unlock(&rt->lock);
-}
-
-/* ---- the client's remote surface ---- */
-
-static AshStatus error_status(const AshWireFrame* fr, const uint8_t* pl) {
-    if (fr->payload_len >= 4 && pl) return (AshStatus)ash_net_get_u32(pl);
-    return ASH_ERR_NET;
-}
-
-static RemoteContract* find_remote(AshRuntime* rt, const char* name) {
-    for (size_t i = 0; i < rt->nremotes; i++) {
-        if (strcmp(rt->remotes[i].name, name) == 0) return &rt->remotes[i];
-    }
-    return NULL;
-}
-
-/* Adds one remote contract row, the name kept runtime owned. Under rt->lock. */
-static AshStatus remotes_add(AshRuntime* rt, const char* name, uint64_t hash,
-                             uint32_t ver, AshConn* conn) {
-    if (rt->nremotes == rt->remotes_cap) {
-        size_t cap = rt->remotes_cap ? rt->remotes_cap * 2 : 8;
-        RemoteContract* g =
-            (RemoteContract*)realloc(rt->remotes, cap * sizeof(RemoteContract));
-        if (!g) return ASH_ERR_OOM;
-        rt->remotes = g;
-        rt->remotes_cap = cap;
-    }
-    rt->remotes[rt->nremotes].name = name;
-    rt->remotes[rt->nremotes].shape_hash = hash;
-    rt->remotes[rt->nremotes].version = ver;
-    rt->remotes[rt->nremotes].conn = conn;
-    rt->nremotes++;
-    return ASH_OK;
-}
-
-/* Recovers the plain contract name from a contract kind mangled name, the
- * reverse of iname_contract_mangled: __ash_ash_{name}__{16 hex}_v{digits}. The
- * suffix is parsed from the right so a name with underscores stays whole; a
- * mangled name that does not fit the shape returns NULL. Heap the caller owns. */
-static char* parse_contract_name(const char* m) {
-    const char* pre = "__ash_ash_";
-    size_t plen = strlen(pre);
-    if (strncmp(m, pre, plen) != 0) return NULL;
-    size_t len = strlen(m);
-    const char* end = m + len;
-    const char* d = end;
-    while (d > m && d[-1] >= '0' && d[-1] <= '9') d--;
-    if (d == end) return NULL;                 /* no version digits */
-    if (d - 2 < m || d[-1] != 'v' || d[-2] != '_') return NULL;
-    const char* vstart = d - 2;                /* the "_v" */
-    if (vstart - 16 < m) return NULL;
-    const char* hstart = vstart - 16;
-    for (const char* h = hstart; h < vstart; h++) {
-        char ch = *h;
-        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return NULL;
-    }
-    if (hstart - 2 < m + (long)plen) return NULL;
-    if (hstart[-1] != '_' || hstart[-2] != '_') return NULL;
-    const char* nstart = m + plen;
-    const char* nend = hstart - 2;
-    if (nend <= nstart) return NULL;
-    size_t nlen = (size_t)(nend - nstart);
-    char* out = (char*)malloc(nlen + 1);
-    if (!out) return NULL;
-    memcpy(out, nstart, nlen);
-    out[nlen] = '\0';
-    return out;
-}
-
-/* Parses the daemon's canonical dump text into iname entries and merges them
- * all or nothing, the reverse of ash_iname_dump. The text is copied into a
- * retained buffer and tokenized in place so each mangled name borrows into it
- * exactly as a local pledge entry borrows into a module image. A contract entry
- * also recovers its plain name, which the dump does not carry, so a later sign
- * by that name resolves to this connection's origin. A name that already
- * exists, local or from an earlier connection, fails the whole merge with
- * ASH_ERR_NAME and inserts nothing. */
-static AshStatus iname_merge_remote(AshRuntime* rt, AshConn* conn,
-                                    const uint8_t* text, uint32_t len) {
-    char* buf = (char*)malloc((size_t)len + 1);
-    if (!buf) return ASH_ERR_OOM;
-    if (len) memcpy(buf, text, len);
-    buf[len] = '\0';
-
-    AshInameEntry* ents = NULL;
-    char** cnames = NULL;      /* parsed contract name per entry, NULL for pledges */
-    size_t nents = 0, cap = 0;
-    AshStatus st = ASH_OK;
-    char* p = buf;
-    while (*p) {
-        char* line = p;
-        char* nl = strchr(p, '\n');
-        if (nl) {
-            *nl = '\0';
-            p = nl + 1;
-        } else {
-            p = line + strlen(line);
-        }
-        if (*line == '\0') continue;
-        char* sp = strchr(line, ' ');
-        if (!sp) {
-            st = ASH_ERR_TYPE;
-            break;
-        }
-        *sp = '\0';
-        char kindbuf[16];
-        unsigned long long hash = 0;
-        unsigned ver = 0;
-        if (sscanf(sp + 1, "%15s %llx v%u", kindbuf, &hash, &ver) != 3) {
-            st = ASH_ERR_TYPE;
-            break;
-        }
-        uint32_t kind;
-        if (strcmp(kindbuf, "contract") == 0) {
-            kind = ASH_INAME_CONTRACT;
-        } else if (strcmp(kindbuf, "pledge") == 0) {
-            kind = ASH_INAME_PLEDGE;
-        } else {
-            st = ASH_ERR_TYPE;
-            break;
-        }
-        char* cname = NULL;
-        if (kind == ASH_INAME_CONTRACT) {
-            cname = parse_contract_name(line);
-            if (!cname) {
-                st = ASH_ERR_TYPE;
-                break;
-            }
-        }
-        if (nents == cap) {
-            size_t ncap = cap ? cap * 2 : 16;
-            AshInameEntry* ge = realloc(ents, ncap * sizeof(*ge));
-            char** gc = realloc(cnames, ncap * sizeof(*gc));
-            if (!ge || !gc) {
-                free(ge ? ge : ents);
-                free(gc ? gc : cnames);
-                free(cname);
-                ents = NULL;
-                cnames = NULL;
-                free(buf);
-                return ASH_ERR_OOM;
-            }
-            ents = ge;
-            cnames = gc;
-            cap = ncap;
-        }
-        AshInameEntry e;
-        memset(&e, 0, sizeof e);
-        e.mangled = line;
-        e.kind = kind;
-        e.shape_hash = (uint64_t)hash;
-        e.version = (uint32_t)ver;
-        ents[nents] = e;
-        cnames[nents] = cname;
-        nents++;
-    }
-    if (st != ASH_OK) {
-        for (size_t i = 0; i < nents; i++) free(cnames[i]);
-        free(ents);
-        free(cnames);
-        free(buf);
-        return st;
-    }
-
-    pthread_mutex_lock(&rt->lock);
-    size_t start_remotes = rt->nremotes;
-    size_t inserted = 0;
-    for (size_t i = 0; i < nents; i++) {
-        size_t pos;
-        if (iname_find(rt, ents[i].mangled, &pos)) {
-            st = ASH_ERR_NAME;
-            break;
-        }
-    }
-    if (st == ASH_OK) {
-        for (; inserted < nents; inserted++) {
-            if (ents[inserted].kind == ASH_INAME_CONTRACT) {
-                ents[inserted].contract = cnames[inserted];
-            }
-            st = iname_insert(rt, &ents[inserted]);
-            if (st != ASH_OK) break;
-            if (ents[inserted].kind == ASH_INAME_CONTRACT) {
-                st = remotes_add(rt, cnames[inserted], ents[inserted].shape_hash,
-                                 ents[inserted].version, conn);
-                if (st != ASH_OK) {
-                    /* the entry inserted but its origin row did not: drop the
-                     * entry too so the rollback below is uniform */
-                    iname_remove_one(rt, ents[inserted].mangled);
-                    break;
-                }
-            }
-        }
-    }
-    if (st == ASH_OK) {
-        /* Commit the borrowed storage: the dump buffer and every parsed name go
-         * into the runtime's retained set, so the merged entries' pointers hold
-         * to shutdown. A failure here rolls the visible tables back; a buffer
-         * already retained is simply freed at shutdown. */
-        if (net_track(rt, buf, (size_t)len + 1) != ASH_OK) {
-            st = ASH_ERR_OOM;
-        } else {
-            buf = NULL; /* owned by net_bufs now */
-            for (size_t i = 0; i < nents; i++) {
-                if (!cnames[i]) continue;
-                if (net_track(rt, cnames[i], strlen(cnames[i]) + 1) != ASH_OK) {
-                    st = ASH_ERR_OOM;
-                    break;
-                }
-                cnames[i] = NULL; /* owned by net_bufs now */
-            }
-        }
-    }
-    if (st != ASH_OK) {
-        for (size_t i = 0; i < inserted; i++) {
-            iname_remove_one(rt, ents[i].mangled);
-        }
-        rt->nremotes = start_remotes;
-        pthread_mutex_unlock(&rt->lock);
-        for (size_t i = 0; i < nents; i++) free(cnames[i]);
-        free(ents);
-        free(cnames);
-        free(buf);
-        return st;
-    }
-    pthread_mutex_unlock(&rt->lock);
-    free(ents);
-    free(cnames);
-    free(buf);
-    return ASH_OK;
-}
-
-/* Sends one frame under the connection's write lock, the one gate every write
- * passes so a reader's decode reply and a caller's fulfill never interleave. */
-static int conn_send(AshConn* conn, uint32_t kind, uint64_t req_id,
-                     const uint8_t* pl, uint32_t plen) {
-    pthread_mutex_lock(&conn->wmu);
-    int rc = ash_net_send_frame(conn->fd, kind, req_id, pl, plen);
-    pthread_mutex_unlock(&conn->wmu);
-    return rc;
-}
-
-/* Finishes one fulfillment from its RESULT or ERROR frame. The value is decoded
- * onto the proxy under its own lock, the same home a local result has; a proxy
- * a break already latched Broken takes no value, so a late RESULT racing a
- * break resolves to ASH_ERR_STATE instead of allocating onto a dead heap. */
-static void complete_fulfill(struct AshFuture* f, const AshWireFrame* fr,
-                             const uint8_t* pl) {
-    if (fr->kind == ASH_WIRE_ERROR) {
-        future_finish(f, error_status(fr, pl), NULL);
-        return;
-    }
-    if (fr->kind != ASH_WIRE_RESULT || fr->payload_len < 4) {
-        future_finish(f, ASH_ERR_NET, NULL);
-        return;
-    }
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr->payload_len);
-    uint32_t status = 0;
-    ash_rbuf_u32(&r, &status);
-    if ((AshStatus)status != ASH_OK) {
-        future_finish(f, (AshStatus)status, NULL);
-        return;
-    }
-    AshContract* c = f->c;
-    AshValue out;
-    memset(&out, 0, sizeof out);
-    pthread_mutex_lock(&c->mu);
-    if (c->state == ASH_BROKEN) {
-        pthread_mutex_unlock(&c->mu);
-        future_finish(f, ASH_ERR_STATE, NULL);
-        return;
-    }
-    AshStatus dst = ash_wire_decode_value(c, r.p, r.left, &out, NULL);
-    pthread_mutex_unlock(&c->mu);
-    if (dst != ASH_OK) {
-        future_finish(f, ASH_ERR_NET, NULL);
-    } else {
-        future_finish(f, ASH_OK, &out);
-    }
-}
-
-/* Hands a synchronous answer to its waiter, transferring the payload buffer. */
-static void deliver_reply(PendingReply* rep, const AshWireFrame* fr,
-                          uint8_t* pl) {
-    pthread_mutex_lock(&rep->mu);
-    rep->fr = *fr;
-    rep->payload = pl;
-    rep->done = 1;
-    pthread_cond_signal(&rep->cv);
-    pthread_mutex_unlock(&rep->mu);
-}
-
-/* Routes one received frame to the request its id answers. A request id lives
- * in exactly one map, so the id alone decides fulfill versus synchronous reply,
- * whatever the kind, which is what lets an ERROR answer either. */
-static void conn_dispatch(AshConn* conn, const AshWireFrame* fr, uint8_t* pl) {
-    struct AshFuture* fut = NULL;
-    PendingReply* rep = NULL;
-    pthread_mutex_lock(&conn->pmu);
-    struct AshFuture** pf = &conn->pending_futures;
-    while (*pf) {
-        if ((*pf)->req_id == fr->request_id) {
-            fut = *pf;
-            *pf = fut->qnext;
-            break;
-        }
-        pf = &(*pf)->qnext;
-    }
-    if (!fut) {
-        PendingReply** pr = &conn->pending_replies;
-        while (*pr) {
-            if ((*pr)->req_id == fr->request_id) {
-                rep = *pr;
-                *pr = rep->next;
-                break;
-            }
-            pr = &(*pr)->next;
-        }
-    }
-    pthread_mutex_unlock(&conn->pmu);
-
-    if (fut) {
-        complete_fulfill(fut, fr, pl);
-        free(pl);
-    } else if (rep) {
-        deliver_reply(rep, fr, pl); /* takes the payload */
-    } else {
-        free(pl); /* an answer to nothing, dropped */
-    }
-}
-
-/* Tears one connection down exactly once: every in flight fulfillment delivers
- * ASH_ERR_NET, every pending synchronous call learns the peer is gone, and
- * every proxy signed here latches Broken so a later fulfill is a local
- * ASH_ERR_STATE with no wire. The instance heaps are left for shutdown, so a
- * result a host already waited stays readable, the wait-before-break rule
- * unchanged across the network. */
-static void conn_shutdown(AshConn* conn) {
-    pthread_mutex_lock(&conn->pmu);
-    if (conn->shutdown_done) {
-        pthread_mutex_unlock(&conn->pmu);
-        return;
-    }
-    conn->shutdown_done = 1;
-    conn->dead = 1;
-    struct AshFuture* futs = conn->pending_futures;
-    conn->pending_futures = NULL;
-    PendingReply* reps = conn->pending_replies;
-    conn->pending_replies = NULL;
-    AshContract* proxies = conn->proxies;
-    conn->proxies = NULL;
-    pthread_mutex_unlock(&conn->pmu);
-
-    /* Wake a reader blocked in a read, or unblock the send side that detected
-     * the failure; the fd is closed later by conn_free. */
-    shutdown(conn->fd, SHUT_RDWR);
-
-    while (futs) {
-        struct AshFuture* next = futs->qnext;
-        future_finish(futs, ASH_ERR_NET, NULL);
-        futs = next;
-    }
-    while (reps) {
-        PendingReply* next = reps->next;
-        pthread_mutex_lock(&reps->mu);
-        reps->dead = 1;
-        reps->done = 1;
-        pthread_cond_signal(&reps->cv);
-        pthread_mutex_unlock(&reps->mu);
-        reps = next;
-    }
-    while (proxies) {
-        AshContract* next = proxies->proxy_next;
-        pthread_mutex_lock(&proxies->mu);
-        if (proxies->state != ASH_BROKEN && proxies->state != ASH_UNSIGNED) {
-            proxies->state = ASH_BROKEN;
-        }
-        pthread_mutex_unlock(&proxies->mu);
-        proxies = next;
-    }
-}
-
-static void* conn_reader(void* arg) {
-    AshConn* conn = (AshConn*)arg;
-    for (;;) {
-        AshWireFrame fr;
-        uint8_t* pl = NULL;
-        int rc = ash_net_recv_frame(conn->fd, &fr, &pl);
-        if (rc != 0) {
-            free(pl);
-            break; /* EOF, error, or a malformed frame the stream cannot survive */
-        }
-        conn_dispatch(conn, &fr, pl);
-    }
-    conn_shutdown(conn);
-    return NULL;
-}
-
-static AshConn* conn_new(AshRuntime* rt, int fd) {
-    AshConn* conn = (AshConn*)calloc(1, sizeof(AshConn));
-    if (!conn) return NULL;
-    conn->rt = rt;
-    conn->fd = fd;
-    conn->next_req = 3; /* the handshake used ids 1 and 2 */
-    if (pthread_mutex_init(&conn->wmu, NULL) != 0) {
-        free(conn);
-        return NULL;
-    }
-    if (pthread_mutex_init(&conn->pmu, NULL) != 0) {
-        pthread_mutex_destroy(&conn->wmu);
-        free(conn);
-        return NULL;
-    }
-    return conn;
-}
-
-static void conn_free(AshConn* conn) {
-    if (conn->reader_started) pthread_join(conn->reader, NULL);
-    close(conn->fd);
-    pthread_mutex_destroy(&conn->wmu);
-    pthread_mutex_destroy(&conn->pmu);
-    free(conn);
-}
-
-/* One synchronous request and its reply, the shape sign, break, and partial
- * share. The reply registers before the send so an answer can never arrive
- * before its receipt exists; a dead connection returns ASH_ERR_NET. On ASH_OK
- * the caller owns *out_pl and frees it. */
-static AshStatus conn_call(AshConn* conn, uint32_t kind, const AshWBuf* body,
-                           AshWireFrame* out_fr, uint8_t** out_pl) {
-    *out_pl = NULL;
-    if (body->err) return ASH_ERR_OOM;
-    PendingReply rep;
-    memset(&rep, 0, sizeof rep);
-    if (pthread_mutex_init(&rep.mu, NULL) != 0) return ASH_ERR_OOM;
-    if (pthread_cond_init(&rep.cv, NULL) != 0) {
-        pthread_mutex_destroy(&rep.mu);
-        return ASH_ERR_OOM;
-    }
-
-    pthread_mutex_lock(&conn->pmu);
-    if (conn->dead) {
-        pthread_mutex_unlock(&conn->pmu);
-        pthread_mutex_destroy(&rep.mu);
-        pthread_cond_destroy(&rep.cv);
-        return ASH_ERR_NET;
-    }
-    rep.req_id = conn->next_req++;
-    rep.next = conn->pending_replies;
-    conn->pending_replies = &rep;
-    pthread_mutex_unlock(&conn->pmu);
-
-    if (conn_send(conn, kind, rep.req_id, body->data, (uint32_t)body->len) != 0) {
-        conn_shutdown(conn); /* delivers dead to rep among the rest */
-    }
-
-    pthread_mutex_lock(&rep.mu);
-    while (!rep.done) pthread_cond_wait(&rep.cv, &rep.mu);
-    int dead = rep.dead;
-    AshWireFrame fr = rep.fr;
-    uint8_t* pl = rep.payload;
-    pthread_mutex_unlock(&rep.mu);
-
-    pthread_mutex_destroy(&rep.mu);
-    pthread_cond_destroy(&rep.cv);
-    if (dead) {
-        free(pl);
-        return ASH_ERR_NET;
-    }
-    *out_fr = fr;
-    *out_pl = pl;
-    return ASH_OK;
-}
-
-static AshStatus remote_sign(AshRuntime* rt, RemoteContract* rc,
-                             const AshVowBinding* vows, size_t nvows,
-                             uint64_t expected_hash, AshContract** out) {
-    AshConn* conn = rc->conn;
-    AshWBuf w;
-    ash_wbuf_init(&w);
-    ash_wbuf_str(&w, rc->name, strlen(rc->name));
-    ash_wbuf_u64(&w, expected_hash);
-    ash_wbuf_u32(&w, (uint32_t)nvows);
-    for (size_t i = 0; i < nvows; i++) {
-        if (!vows[i].name) {
-            ash_wbuf_free(&w);
-            return ASH_ERR_NAME;
-        }
-        ash_wbuf_str(&w, vows[i].name, strlen(vows[i].name));
-        ash_wbuf_value(&w, &vows[i].value);
-    }
-    if (w.err) {
-        ash_wbuf_free(&w);
-        return ASH_ERR_TYPE; /* a vow value that cannot cross, or OOM */
-    }
-
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    AshStatus st = conn_call(conn, ASH_WIRE_SIGN, &w, &fr, &pl);
-    ash_wbuf_free(&w);
-    if (st != ASH_OK) return st;
-    if (fr.kind == ASH_WIRE_ERROR) {
-        AshStatus e = error_status(&fr, pl);
-        free(pl);
-        return e;
-    }
-    if (fr.kind != ASH_WIRE_SIGNED) {
-        free(pl);
-        return ASH_ERR_NET;
-    }
-
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint64_t inst_id = 0, shape_hash = 0;
-    int64_t signed_at = 0;
-    uint32_t vcount = 0;
-    if (!ash_rbuf_u64(&r, &inst_id) || !ash_rbuf_i64(&r, &signed_at) ||
-        !ash_rbuf_u64(&r, &shape_hash) || !ash_rbuf_u32(&r, &vcount)) {
-        free(pl);
-        return ASH_ERR_NET;
-    }
-
-    AshContract* c = (AshContract*)calloc(1, sizeof(AshContract));
-    if (!c) {
-        free(pl);
-        return ASH_ERR_OOM;
-    }
-    if (mutex_init_recursive(&c->mu) != 0) {
-        free(c);
-        free(pl);
-        return ASH_ERR_OOM;
-    }
-    c->rt = rt;
-    c->conn = conn;
-    c->remote_id = inst_id;
-    c->shape_hash = shape_hash;
-    c->signed_at = signed_at;
-    c->state = ASH_SIGNED;
-
-    st = ASH_OK;
-    if (vcount) {
-        c->rvow_names = (char**)ash_bytes(c, vcount * sizeof(char*));
-        c->rvow_vals = (AshValue*)ash_bytes(c, vcount * sizeof(AshValue));
-        if (!c->rvow_names || !c->rvow_vals) {
-            st = ASH_ERR_OOM;
-        } else {
-            memset(c->rvow_names, 0, vcount * sizeof(char*));
-            memset(c->rvow_vals, 0, vcount * sizeof(AshValue));
-        }
-    }
-    for (uint32_t i = 0; st == ASH_OK && i < vcount; i++) {
-        const char* nm;
-        uint32_t nlen;
-        if (!ash_rbuf_str(&r, &nm, &nlen)) {
-            st = ASH_ERR_NET;
-            break;
-        }
-        char* nmc = (char*)ash_bytes(c, (uint64_t)nlen + 1);
-        if (!nmc) {
-            st = ASH_ERR_OOM;
-            break;
-        }
-        memcpy(nmc, nm, nlen);
-        nmc[nlen] = '\0';
-        c->rvow_names[i] = nmc;
-        AshValue v;
-        size_t consumed = 0;
-        if (ash_wire_decode_value(c, r.p, r.left, &v, &consumed) != ASH_OK) {
-            st = ASH_ERR_NET;
-            break;
-        }
-        ash_rbuf_skip(&r, consumed);
-        c->rvow_vals[i] = v;
-        c->remote_nvows = i + 1;
-    }
-    free(pl);
-    if (st != ASH_OK) {
-        contract_free_owned(c);
-        pthread_mutex_destroy(&c->mu);
-        free(c);
-        return st;
-    }
-
-    pthread_mutex_lock(&rt->lock);
-    int room = rt->ninstances < ASH_MAX_INSTANCES;
-    if (room) rt->instances[rt->ninstances++] = c;
-    pthread_mutex_unlock(&rt->lock);
-    if (!room) {
-        contract_free_owned(c);
-        pthread_mutex_destroy(&c->mu);
-        free(c);
-        return ASH_ERR_OOM;
-    }
-
-    pthread_mutex_lock(&conn->pmu);
-    int dead = conn->dead;
-    if (!dead) {
-        c->proxy_next = conn->proxies;
-        conn->proxies = c;
-    }
-    pthread_mutex_unlock(&conn->pmu);
-    if (dead) {
-        pthread_mutex_lock(&c->mu);
-        c->state = ASH_BROKEN;
-        pthread_mutex_unlock(&c->mu);
-    }
-    *out = c;
-    return ASH_OK;
-}
-
-static AshFuture* remote_fulfill(AshContract* c, const char* pledge_name,
-                                 const AshValue* args, size_t nargs,
-                                 const AshRef* refs, size_t nrefs) {
-    AshConn* conn = c->conn;
-    struct AshFuture* f = future_new(c);
-    if (!f) return NULL;
-
-    /* Every failure short of the future itself arrives through the wait, the
-     * same delivery point a local fulfillment's errors keep. Refs never cross
-     * the wire in v1, so a ref bearing fulfill is refused loudly here. */
-    AshStatus err = ASH_OK;
-    if ((nargs > 0 && !args) || (nrefs > 0 && !refs)) {
-        err = ASH_ERR_TYPE;
-    } else if (nrefs > 0) {
-        err = ASH_ERR_TYPE;
-    } else {
-        pthread_mutex_lock(&c->mu);
-        if (c->state == ASH_BROKEN) err = ASH_ERR_STATE;
-        pthread_mutex_unlock(&c->mu);
-    }
-    if (err != ASH_OK) {
-        future_finish(f, err, NULL);
-        return f;
-    }
-
-    AshWBuf w;
-    ash_wbuf_init(&w);
-    ash_wbuf_u64(&w, c->remote_id);
-    ash_wbuf_str(&w, pledge_name, strlen(pledge_name));
-    ash_wbuf_u32(&w, (uint32_t)nargs);
-    for (size_t i = 0; i < nargs; i++) ash_wbuf_value(&w, &args[i]);
-    if (w.err) {
-        ash_wbuf_free(&w);
-        future_finish(f, ASH_ERR_TYPE, NULL);
-        return f;
-    }
-
-    pthread_mutex_lock(&conn->pmu);
-    if (conn->dead) {
-        pthread_mutex_unlock(&conn->pmu);
-        ash_wbuf_free(&w);
-        future_finish(f, ASH_ERR_NET, NULL);
-        return f;
-    }
-    uint64_t req_id = conn->next_req++;
-    f->req_id = req_id;
-    f->qnext = conn->pending_futures;
-    conn->pending_futures = f;
-    pthread_mutex_unlock(&conn->pmu);
-
-    if (conn_send(conn, ASH_WIRE_FULFILL, req_id, w.data, (uint32_t)w.len) != 0) {
-        conn_shutdown(conn); /* finishes f with ASH_ERR_NET */
-    }
-    ash_wbuf_free(&w);
-    return f;
-}
-
-static AshStatus remote_break(AshContract* c) {
-    AshConn* conn = c->conn;
-    pthread_mutex_lock(&c->mu);
-    if (c->state == ASH_UNSIGNED) {
-        pthread_mutex_unlock(&c->mu);
-        return ASH_ERR_STATE;
-    }
-    int already = (c->state == ASH_BROKEN);
-    for (struct AshFuture* f = c->futures; f; f = f->next) future_forfeit(f);
-    /* An explicit break reclaims the proxy's own heap the way a local break
-     * reclaims an instance's, under the lock so no reader is mid write into it.
-     * The stored vows and every decoded result die here, the wait before break
-     * rule the same across the wire; the vow pointers are cleared so a later
-     * ash_vow_ref reads no vows rather than freed memory, exactly as the local
-     * path leaves vow_vals NULL. */
-    contract_free_owned(c);
-    c->rvow_names = NULL;
-    c->rvow_vals = NULL;
-    c->remote_nvows = 0;
-    c->state = ASH_BROKEN;
-    pthread_mutex_unlock(&c->mu);
-    if (already) return ASH_OK; /* the connection died; nothing to send */
-
-    AshWBuf w;
-    ash_wbuf_init(&w);
-    ash_wbuf_u64(&w, c->remote_id);
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    AshStatus st = conn_call(conn, ASH_WIRE_BREAK, &w, &fr, &pl);
-    ash_wbuf_free(&w);
-    if (st != ASH_OK) return ASH_OK; /* proxy already latched Broken locally */
-    free(pl);
-    return ASH_OK;
-}
-
-/* One PARTIAL_QUERY round trip, the shared front of every partial read. On
- * ASH_OK the caller owns *out_pl and reads a PARTIAL frame from it. */
-static AshStatus remote_partial_query(AshContract* c, AshWireFrame* out_fr,
-                                      uint8_t** out_pl) {
-    *out_pl = NULL;
-    AshWBuf w;
-    ash_wbuf_init(&w);
-    ash_wbuf_u64(&w, c->remote_id);
-    AshStatus st = conn_call(c->conn, ASH_WIRE_PARTIAL_QUERY, &w, out_fr, out_pl);
-    ash_wbuf_free(&w);
-    if (st != ASH_OK) return st;
-    if (out_fr->kind == ASH_WIRE_ERROR) {
-        AshStatus e = error_status(out_fr, *out_pl);
-        free(*out_pl);
-        *out_pl = NULL;
-        return e;
-    }
-    if (out_fr->kind != ASH_WIRE_PARTIAL) {
-        free(*out_pl);
-        *out_pl = NULL;
-        return ASH_ERR_NET;
-    }
-    return ASH_OK;
-}
-
-/* Whether the proxy has latched Broken, an explicit break or a disconnect. A
- * broken proxy answers every partial read locally and empty, both because its
- * heap may already be reclaimed and because a broken instance has nothing to
- * report, so no read after a break touches a heap the break is freeing. */
-static int remote_broken(AshContract* c) {
-    pthread_mutex_lock(&c->mu);
-    int b = (c->state == ASH_BROKEN);
-    pthread_mutex_unlock(&c->mu);
-    return b;
-}
-
-static AshContractState remote_state(AshContract* c) {
-    if (remote_broken(c)) return ASH_BROKEN;
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (remote_partial_query(c, &fr, &pl) != ASH_OK) return ASH_BROKEN;
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint32_t state = ASH_BROKEN;
-    ash_rbuf_u32(&r, &state);
-    free(pl);
-    return (AshContractState)state;
-}
-
-/* Walks the item block of a PARTIAL frame, calling visit for each item until it
- * returns nonzero or the items run out. Returns the item count read. */
-static size_t partial_walk_items(AshRBuf* r, uint32_t nitems,
-                                 int (*visit)(const char*, uint32_t, uint32_t,
-                                              void*),
-                                 void* ctx) {
-    for (uint32_t i = 0; i < nitems; i++) {
-        const char* nm;
-        uint32_t nl, is;
-        if (!ash_rbuf_str(r, &nm, &nl) || !ash_rbuf_u32(r, &is)) return i;
-        if (visit && visit(nm, nl, is, ctx)) return i + 1;
-    }
-    return nitems;
-}
-
-typedef struct CountCtx { AshItemState k; size_t n; } CountCtx;
-static int count_visit(const char* nm, uint32_t nl, uint32_t is, void* v) {
-    (void)nm; (void)nl;
-    CountCtx* cx = (CountCtx*)v;
-    if ((AshItemState)is == cx->k) cx->n++;
-    return 0;
-}
-
-static size_t remote_partial_count(AshContract* c, AshItemState k) {
-    if (remote_broken(c)) return 0;
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (remote_partial_query(c, &fr, &pl) != ASH_OK) return 0;
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint32_t state, nitems;
-    CountCtx cx = { k, 0 };
-    if (ash_rbuf_u32(&r, &state) && ash_rbuf_u32(&r, &nitems)) {
-        partial_walk_items(&r, nitems, count_visit, &cx);
-    }
-    free(pl);
-    return cx.n;
-}
-
-typedef struct NameCtx {
-    AshItemState k;
-    size_t       want;
-    size_t       seen;
-    const char*  nm;
-    uint32_t     nl;
-} NameCtx;
-static int name_visit(const char* nm, uint32_t nl, uint32_t is, void* v) {
-    NameCtx* cx = (NameCtx*)v;
-    if ((AshItemState)is != cx->k) return 0;
-    if (cx->seen == cx->want) {
-        cx->nm = nm;
-        cx->nl = nl;
-        return 1;
-    }
-    cx->seen++;
-    return 0;
-}
-
-static const char* remote_partial_name(AshContract* c, AshItemState k,
-                                       size_t i) {
-    if (remote_broken(c)) return NULL;
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (remote_partial_query(c, &fr, &pl) != ASH_OK) return NULL;
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint32_t state, nitems;
-    NameCtx cx = { k, i, 0, NULL, 0 };
-    const char* result = NULL;
-    if (ash_rbuf_u32(&r, &state) && ash_rbuf_u32(&r, &nitems)) {
-        partial_walk_items(&r, nitems, name_visit, &cx);
-        if (cx.nm) {
-            /* The name is copied onto the proxy, so the allocation and the write
-             * both run under the instance lock, the discipline every c owned
-             * write keeps: a concurrent break that frees this heap is serialized
-             * against the copy, and a break that already landed leaves the proxy
-             * Broken so the copy is skipped rather than aimed at freed memory.
-             * The local surface returns descriptor memory; a proxy returns an
-             * instance owned copy, alive until the proxy breaks, one rule. */
-            pthread_mutex_lock(&c->mu);
-            if (c->state != ASH_BROKEN) {
-                char* copy = (char*)ash_bytes(c, (uint64_t)cx.nl + 1);
-                if (copy) {
-                    memcpy(copy, cx.nm, cx.nl);
-                    copy[cx.nl] = '\0';
-                    result = copy;
-                }
-            }
-            pthread_mutex_unlock(&c->mu);
-        }
-    }
-    free(pl);
-    return result;
-}
-
-/* Skips the item block whole, leaving the cursor at the error count. */
-static int partial_skip_items(AshRBuf* r, uint32_t nitems) {
-    for (uint32_t i = 0; i < nitems; i++) {
-        const char* nm;
-        uint32_t nl, is;
-        if (!ash_rbuf_str(r, &nm, &nl) || !ash_rbuf_u32(r, &is)) return 0;
-    }
-    return 1;
-}
-
-static size_t remote_partial_nerrors(AshContract* c) {
-    if (remote_broken(c)) return 0;
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (remote_partial_query(c, &fr, &pl) != ASH_OK) return 0;
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint32_t state, nitems, nerr = 0;
-    if (ash_rbuf_u32(&r, &state) && ash_rbuf_u32(&r, &nitems) &&
-        partial_skip_items(&r, nitems)) {
-        ash_rbuf_u32(&r, &nerr);
-    }
-    free(pl);
-    return nerr;
-}
-
-static AshStatus remote_partial_error(AshContract* c, size_t idx,
-                                      const char** pledge_name,
-                                      const AshValue** err) {
-    if (remote_broken(c)) return ASH_ERR_NAME;
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (remote_partial_query(c, &fr, &pl) != ASH_OK) return ASH_ERR_NAME;
-    AshRBuf r;
-    ash_rbuf_init(&r, pl, fr.payload_len);
-    uint32_t state, nitems, nerr;
-    AshStatus st = ASH_ERR_NAME;
-    /* The Err payload is decoded onto the proxy and its name copied there, so
-     * the whole walk runs under the instance lock, no c owned allocation or
-     * write ever outside it: a break that races is serialized, and a break that
-     * already latched Broken skips the walk rather than decoding onto a heap it
-     * is reclaiming. The network round trip already finished above, so the lock
-     * never covers a wire call. */
-    pthread_mutex_lock(&c->mu);
-    if (c->state == ASH_BROKEN) {
-        pthread_mutex_unlock(&c->mu);
-        free(pl);
-        return ASH_ERR_NAME;
-    }
-    if (ash_rbuf_u32(&r, &state) && ash_rbuf_u32(&r, &nitems) &&
-        partial_skip_items(&r, nitems) && ash_rbuf_u32(&r, &nerr)) {
-        for (uint32_t i = 0; i < nerr; i++) {
-            const char* nm;
-            uint32_t nl;
-            if (!ash_rbuf_str(&r, &nm, &nl)) break;
-            AshValue v;
-            size_t consumed = 0;
-            if (ash_wire_decode_value(c, r.p, r.left, &v, &consumed) != ASH_OK)
-                break;
-            ash_rbuf_skip(&r, consumed);
-            if (i != idx) continue;
-            st = ASH_OK;
-            if (pledge_name) {
-                char* copy = (char*)ash_bytes(c, (uint64_t)nl + 1);
-                if (!copy) {
-                    st = ASH_ERR_OOM;
-                    break;
-                }
-                memcpy(copy, nm, nl);
-                copy[nl] = '\0';
-                *pledge_name = copy;
-            }
-            if (err) {
-                AshValue* box = (AshValue*)ash_bytes(c, sizeof(AshValue));
-                if (!box) {
-                    st = ASH_ERR_OOM;
-                    break;
-                }
-                *box = v;
-                *err = box;
-            }
-            break;
-        }
-    }
-    pthread_mutex_unlock(&c->mu);
-    free(pl);
-    return st;
-}
-
-AshStatus ash_runtime_connect(AshRuntime* rt, const char* addr,
-                              const char* token) {
-    if (!rt || !addr) return ASH_ERR_TYPE;
-    /* Connect obeys the freeze law from the consume side: a closed registration
-     * refuses it, but a serving node does not, because a consume edge grows only
-     * the remote surface a node never re-serves, never the frozen surface it
-     * offers. So the gate is frozen and not serving, which keeps a pure client's
-     * post-freeze connect the ASH_ERR_STATE Layer 2 pins while letting a node
-     * that already serves open the edge the symmetric pair needs. */
-    pthread_mutex_lock(&rt->lock);
-    int blocked = rt->frozen && rt->nservers == 0;
-    uint32_t hs = rt->handshake_ms ? rt->handshake_ms
-                                   : ASH_HANDSHAKE_MS_DEFAULT;
-    pthread_mutex_unlock(&rt->lock);
-    if (blocked) return ASH_ERR_STATE;
-
-    /* The connect itself is on the handshake clock, so a peer that drops its
-     * SYNs cannot park the caller forever; the reads and writes of the HELLO
-     * round trip carry the same bound, the whole handshake finishing inside hs
-     * or failing ASH_ERR_NET. */
-    int fd = ash_net_dial_timeout(addr, hs);
-    if (fd < 0) return ASH_ERR_NET;
-    ash_net_set_rcvtimeo(fd, hs);
-    ash_net_set_sndtimeo(fd, hs);
-
-    /* HELLO: the protocol version, then the token as a length prefixed string,
-     * empty when the client has none. */
-    size_t tlen = token ? strlen(token) : 0;
-    uint32_t plen = (uint32_t)(8 + tlen);
-    uint8_t* hp = (uint8_t*)malloc(plen);
-    if (!hp) {
-        close(fd);
-        return ASH_ERR_OOM;
-    }
-    ash_net_put_u32(hp, 1);
-    ash_net_put_u32(hp + 4, (uint32_t)tlen);
-    if (tlen) memcpy(hp + 8, token, tlen);
-    int wr = ash_net_send_frame(fd, ASH_WIRE_HELLO, 1, hp, plen);
-    free(hp);
-    if (wr != 0) {
-        close(fd);
-        return ASH_ERR_NET;
-    }
-
-    AshWireFrame fr;
-    uint8_t* pl = NULL;
-    if (ash_net_recv_frame(fd, &fr, &pl) != 0) {
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    if (fr.kind == ASH_WIRE_ERROR) {
-        AshStatus st = error_status(&fr, pl);
-        free(pl);
-        close(fd);
-        return st;
-    }
-    if (fr.kind != ASH_WIRE_HELLO_OK || fr.payload_len < 12 || !pl) {
-        free(pl);
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    uint32_t accepted = ash_net_get_u32(pl);
-    uint64_t table_hash = ash_net_get_u64(pl + 4);
-    free(pl);
-    pl = NULL;
-    if (accepted != 1) {
-        close(fd);
-        return ASH_ERR_VERSION;
-    }
-
-    /* INAME_SYNC fetches the whole discovery table in one INAME_TABLE reply. */
-    if (ash_net_send_frame(fd, ASH_WIRE_INAME_SYNC, 2, NULL, 0) != 0) {
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    if (ash_net_recv_frame(fd, &fr, &pl) != 0) {
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    if (fr.kind == ASH_WIRE_ERROR) {
-        AshStatus st = error_status(&fr, pl);
-        free(pl);
-        close(fd);
-        return st;
-    }
-    if (fr.kind != ASH_WIRE_INAME_TABLE || fr.payload_len < 4 || !pl) {
-        free(pl);
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    uint32_t dlen = ash_net_get_u32(pl);
-    if ((uint64_t)dlen + 4 > fr.payload_len) {
-        free(pl);
-        close(fd);
-        return ASH_ERR_NET;
-    }
-    const uint8_t* dbytes = pl + 4;
-    /* The HELLO_OK hash is the daemon's claim about the table it is about to
-     * send; a mismatch means the two disagree and the connection is not to be
-     * trusted. */
-    if (ash_net_fnv1a64(dbytes, dlen) != table_hash) {
-        free(pl);
-        close(fd);
-        return ASH_ERR_NET;
-    }
-
-    /* The handshake is done; the connection now stays open under a reader
-     * thread that owns every later read. Both clocks come off so a fulfillment
-     * blocks as long as its pledge runs, exactly as a local wait does, and a
-     * RESULT the size of the wire's cap is never a timed out write. */
-    ash_net_set_rcvtimeo(fd, 0);
-    ash_net_set_sndtimeo(fd, 0);
-    AshConn* conn = conn_new(rt, fd);
-    if (!conn) {
-        free(pl);
-        close(fd);
-        return ASH_ERR_OOM;
-    }
-    if (pthread_create(&conn->reader, NULL, conn_reader, conn) != 0) {
-        free(pl);
-        conn_free(conn); /* reader not started, just closes and destroys */
-        return ASH_ERR_OOM;
-    }
-    conn->reader_started = 1;
-
-    AshStatus st = iname_merge_remote(rt, conn, dbytes, dlen);
-    free(pl);
-    if (st != ASH_OK) {
-        conn_shutdown(conn);
-        conn_free(conn);
-        return st;
-    }
-
-    pthread_mutex_lock(&rt->lock);
-    conn->next = rt->conns;
-    rt->conns = conn;
-    pthread_mutex_unlock(&rt->lock);
     return ASH_OK;
 }

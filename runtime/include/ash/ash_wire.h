@@ -1,18 +1,19 @@
-/* ash_wire.h: the wire codec of the network runtime, a library first and a
- * protocol second. Frames and values encode and decode here with no socket in
- * sight, so the format can be golden tested byte for byte before any network
- * exists. The format is docs/network.md's: a fixed 20 byte frame header, and
- * a canonical little endian serialization of the AshValue representation with
- * the pointers flattened out. Canonical means one value has one byte string;
- * encoding a decoded payload reproduces the input exactly.
+/* ash_wire.h: the canonical wire codec, a library first and a protocol second.
+ * Frames and values encode and decode here with no socket in sight, so the
+ * format is golden tested byte for byte on its own. It is a fixed 20 byte frame
+ * header, and a canonical little endian serialization of the AshValue
+ * representation with the pointers flattened out, the same serialization the
+ * park format writes an instance's durable state through. Canonical means one
+ * value has one byte string; encoding a decoded payload reproduces the input
+ * exactly.
  *
- * Nothing on the wire is trusted. Every length is checked against the buffer
- * before it is read, decoding caps its nesting at 64 levels, and the two tags
- * that never cross, ASH_TY_INSTANCE and ASH_TY_PLEDGE_REF, are refused by the
- * encoder with ASH_ERR_TYPE and read as malformed by the decoder. A malformed
- * payload reports ASH_ERR_TYPE, the shape mismatch status the ABI already
- * has; an oversized one reports ASH_ERR_OOM, the refusal docs/network.md
- * pins for the payload cap. */
+ * Nothing in an encoded payload is trusted. Every length is checked against the
+ * buffer before it is read, decoding caps its nesting at 64 levels, and the two
+ * tags that never cross, ASH_TY_INSTANCE and ASH_TY_PLEDGE_REF, are refused by
+ * the encoder with ASH_ERR_TYPE and read as malformed by the decoder. A
+ * malformed payload reports ASH_ERR_TYPE, the shape mismatch status the ABI
+ * already has; an oversized one reports ASH_ERR_OOM, the refusal the codec pins
+ * at its payload cap. */
 
 #ifndef ASH_WIRE_H
 #define ASH_WIRE_H

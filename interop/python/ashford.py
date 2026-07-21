@@ -159,10 +159,9 @@ class AshInameEntry(C.Structure):
 
 
 class AshRuntimeConfig(C.Structure):
-    """Pool sizing and the handshake clock. max_threads of 0 selects the
-    default of four workers; handshake_ms is the timeout ash_runtime_connect
-    gives a daemon to finish a handshake, 0 selecting ten seconds. Two uint32
-    fields in declaration order with nothing packed between them, so a foreign
+    """Pool sizing. max_threads of 0 selects the default of four workers.
+    handshake_ms is reserved: the layout is pinned, so the two uint32 fields
+    stay in declaration order with nothing packed between them and a foreign
     host that rebuilds this struct writes exactly these eight bytes."""
 
     _fields_ = [("max_threads", C.c_uint32), ("handshake_ms", C.c_uint32)]
@@ -422,12 +421,6 @@ class Runtime:
         lib.ash_runtime_shutdown.restype = None
         lib.ash_module_load.argtypes = [v, s]
         lib.ash_module_load.restype = i
-        lib.ash_runtime_connect.argtypes = [v, s, s]
-        lib.ash_runtime_connect.restype = i
-        lib.ash_runtime_serve.argtypes = [v, s, s, C.POINTER(v)]
-        lib.ash_runtime_serve.restype = i
-        lib.ash_server_stop.argtypes = [v]
-        lib.ash_server_stop.restype = None
         lib.ash_runtime_freeze.argtypes = [v]
         lib.ash_runtime_freeze.restype = i
         lib.ash_pledge_bind.argtypes = [v, s, AshPledgeFn]
@@ -487,62 +480,6 @@ class Runtime:
     def load(self, so_path):
         _check(self._lib.ash_module_load(self._rt, str(so_path).encode()),
                f"ash_module_load {so_path}")
-
-    def connect(self, addr, token=None):
-        """Connects this runtime to an ashd daemon at addr, a host:port string,
-        and merges the daemon's whole iname table into this one beside the local
-        names. token is the shared secret the daemon expects, None when the
-        daemon runs without one; it crosses as bytes and is never logged here.
-
-        After a successful connect a remote contract signs, fulfills, reads its
-        partial surface, and breaks through the same calls a local one does, the
-        origin alone deciding which side of the wire the work lands on. This is
-        the one line a host adds to run against a daemon instead of a module.
-
-        Connect counts as registration and obeys the freeze law, so it raises an
-        AshError carrying ASH_ERR_STATE once the runtime is frozen. A remote name
-        that collides with one already in the table is ASH_ERR_NAME, a refused
-        token or an unreachable address is ASH_ERR_NET, and a version the daemon
-        does not speak is ASH_ERR_VERSION, each surfacing as the status a caller
-        already knows how to handle."""
-        tok = None
-        if token is not None:
-            tok = token if isinstance(token, bytes) else str(token).encode("utf-8")
-        _check(self._lib.ash_runtime_connect(self._rt,
-                                             str(addr).encode("utf-8"), tok),
-               f"ash_runtime_connect {addr}")
-
-    def serve(self, addr, token=None):
-        """Serves this runtime's frozen iname table over TCP and returns a
-        Server handle, the far side of connect and the call that turns this
-        host into a mesh node. addr is the host:port the node listens on; token
-        is the shared secret every peer must present, None to accept peers
-        without one. It crosses as bytes and, like the connect token, is never
-        logged here.
-
-        The runtime is frozen if it is not already, so the table a peer fetches
-        at handshake is the table every later sign resolves against; then the
-        dump and its hash are snapshot, the address is bound, and an accept loop
-        starts on a background thread. The call returns at once with a Server in
-        hand, so this thread keeps running: it can serve more, connect out, and
-        do its own work while the loop serves behind it. A pledge this runtime
-        bound to a Python callable dispatches on a pool worker exactly as it
-        does for an in process host, the trampoline taking the GIL there whether
-        the fulfillment began on this thread or arrived on a peer's connection.
-
-        A node serves the contracts it registered locally and only those; a
-        remote origin merged from a peer is never re-served, so serving after a
-        consume edge has merged is ASH_ERR_STATE. ASH_ERR_NET when the address
-        will not bind, ASH_ERR_OOM when the dump or a thread cannot be had."""
-        tok = None
-        if token is not None:
-            tok = token if isinstance(token, bytes) else str(token).encode("utf-8")
-        srv = C.c_void_p()
-        _check(self._lib.ash_runtime_serve(self._rt,
-                                           str(addr).encode("utf-8"), tok,
-                                           C.byref(srv)),
-               f"ash_runtime_serve {addr}")
-        return Server(self, srv)
 
     def freeze(self):
         _check(self._lib.ash_runtime_freeze(self._rt), "ash_runtime_freeze")
@@ -761,39 +698,6 @@ class Runtime:
         else:
             raise AshError(ASH_ERR_TYPE,
                            f"cannot encode {type(py).__name__}")
-
-
-# ---------------------------------------------------------------------------
-# The server handle.
-# ---------------------------------------------------------------------------
-
-
-class Server:
-    """One running serve endpoint, the handle Runtime.serve returns. Thin on
-    purpose: it owns the AshServer pointer and stops it, the accept loop and
-    the connection threads living entirely in the runtime behind the pointer.
-
-    stop shuts the listener down, drains the connection threads, breaks every
-    instance those connections signed, and frees the handle; it is idempotent,
-    so the context manager's exit and an explicit stop do not double free. The
-    runtime the server served is untouched and is shut down by its owner
-    afterward, the same order a C host tears a node down in."""
-
-    def __init__(self, rt, ptr):
-        self._rt = rt
-        self._ptr = ptr
-
-    def stop(self):
-        if self._ptr:
-            self._rt._lib.ash_server_stop(self._ptr)
-            self._ptr = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-        return False
 
 
 # ---------------------------------------------------------------------------

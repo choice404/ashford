@@ -1,5 +1,5 @@
-/* test_wire.c: the wire codec gate. No socket anywhere; the codec is a
- * library and this test holds it to docs/network.md byte for byte. Three
+/* test_wire.c: the value codec gate. The codec is a library, the canonical
+ * encoding the park row serializes through, and this test pins it. Three
  * claims are pinned. Goldens: every fixture in tests/wire is the canonical
  * encoding of a value this file builds by hand, and the encoder must
  * reproduce each one exactly. Canonicity: decoding a golden and encoding the

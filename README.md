@@ -117,35 +117,23 @@ The runtime binds from anything that can load a C library, and the repository pr
 make test-python
 ```
 
-The same contracts run across a network. `ashd` is a small daemon over the runtime that loads modules, freezes so its table is immutable, and serves their contracts on a TCP address. A client links the same `libashrt` and calls `ash_runtime_connect`, and every contract the daemon serves lands in the client's iname table beside the local ones. Signing and fulfilling a remote contract is the same code as a local one, so a host changes by a single line, a module load turned into a connect, when the contract moves across the wire. A shared token read from a file guards the daemon and the client presents it at the handshake; [docs/network.md](docs/network.md) is the normative wire.
+The same contracts run across processes, and the wire is gRPC. Ashford does not carry a transport of its own: the compiler emits the wire surface and the whole gRPC ecosystem, every language, every load balancer, every proxy, is the transport. A server is ordinary host code holding the runtime through the C ABI and serving the emitted surface; a client in any gRPC language builds from the emitted artifacts with stock tooling and never learns Ashford exists. Signing is a stream whose lifetime is the instance's, a pledge's `Err` crosses as a value on an OK rpc while an Ashford status crosses as a gRPC code, and the shape hash pins both ends to one contract. [docs/bridge.md](docs/bridge.md) is the normative surface.
 
 ```sh
-# a C client drives a remote Greeter over loopback, token and refusal paths
-make test-net
+# the payment contract served over gRPC, driven from Python
+make test-grpc-bridge
 
-# the Python payment walk, run in process and over the wire side by side
-make test-net-python
+# the same lifecycle driven from Go and from Node, built from emitted artifacts
+make test-grpc-go
+make test-grpc-node
 ```
 
-`make test-net-python` stands up two daemons on loopback, one under a token and one without, and runs `interop/python/demo_remote.py`, the remote twin of the local payment demo. It drives the same sign, fulfill, partial, and break sequence once from a module loaded in process and once over a connection, proves the two agree outcome for outcome, then walks the token matrix and kills the daemon mid fulfillment to watch the network's one new failure reach an in flight wait.
-
-Those same contracts also weave into a mesh. Serving is a library call, `ash_runtime_serve`, the far side of connect lifted out of `ashd` into `libashrt`, so a node is an ordinary runtime that serves the contracts it holds and connects to the peers whose contracts it wants at the same time. A node loads and binds, serves, and then opens an edge to each peer, and a lookup, a sign, and a fulfill read one table without caring which peer, or the node itself, owns the name. The two directions of a conversation are two one directional edges, each a plain connection, so two nodes that each serve and connect form a full duplex pair, and three form a mesh, every sign one hop to the owner with no relay and no routing. `ashd` does not go away; it becomes the thin case, a node that only serves. `ash_runtime_connect_all` wires a node to a list of peer addresses in one call, still explicit addresses and still no registry. Because serving is a library call the provider side is any language: a Python host binds a Python function over an abstract pledge and serves it, a C peer connects and fulfills it, and the result the C peer reads was computed by Python, live, in Python's process. Each edge carries its own token, presented at the handshake and compared in constant time, the Layer 2 posture per edge. [docs/mesh.md](docs/mesh.md) is the normative design and wire.
+A session survives more than its connection. A server started with a park store writes an instance down when its stream ends, the vows, the latches, the error payloads, and the transactional fates in one row, and a `Resume` call stands it back up under the token the signature carried, one shot. The gate kills the server between the park and the resume and finishes the contract on a fresh server holding the same store, which is the partition and replica story in one run:
 
 ```sh
-# a plain C host stands up a server, a client drives it, under ASan
-make test-mesh-serve
-
-# two symmetric nodes, each serving and connecting, both directions asserted
-make test-mesh-pair
-
-# a Python provider serves a bound Python pledge, a C consumer fulfills it
-make test-mesh-python
-
-# three nodes under a fulfillment storm, a per edge kill, memory flat
-make test-mesh-stress
+# park, kill the server, resume on a fresh one, finish the contract
+make test-grpc-resume
 ```
-
-`make test-mesh-pair` brings up node A serving Greeter and node B serving PaymentService, opens the two edges after both serve, and drives both directions at once in a loop, each thread signing, fulfilling, checking, and breaking every pass. `make test-mesh-python` stands up a Python node that binds a Python `charge` over the abstract pledge and serves it, connects a C client, and asserts the value the client reads equals the same computation run in process. `make test-mesh-stress` wires three nodes into one mesh, storms every edge with concurrent fulfillments and demands each resolves to the right owner, then drops a node mid mesh to watch its peers land `ASH_ERR_NET` on exactly the dead edge's waits and stand otherwise, memory flat across the churn.
 
 The same contracts run backed by a database. A contract declares the table shape it needs as a `schema`, a vow like any other that locks at sign, binds a live database through a `dsn` vow, and its pledges read and write rows through the store standard library. A group of writes that must all land or all vanish is a `transactional` subcontract, the unit the language already had for all-or-nothing, so a transfer is a modifier and not a new idea. The database sits behind the contract, not in front of the host: the store is invisible across the C ABI, so a host signs, fulfills, and breaks a store-backed contract with the same calls it always used, and the storage never shows through. The reference backend is SQLite, vendored as the amalgamation and compiled into `libashrt`, so the store gates are hermetic and need no server. [docs/database.md](docs/database.md) is the normative store design.
 
@@ -164,13 +152,13 @@ make test-store-python
 
 ## Status
 
-The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. An `ashd` daemon serves those same contracts over TCP, and a client, C or Python, connects with `ash_runtime_connect` and signs, fulfills, and breaks across the wire with its host code unchanged, a shared token guarding the connection and a dropped connection surfacing as one new status through the wait a host already reads. Contracts run backed by a database too: a `schema` is a vow, a `transactional` subcontract is a transaction, and a SQLite backend vendored into the runtime persists the rows, the store invisible across the boundary. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over both the pool and the socket, network gates that stand up a real daemon, and store gates that sign a contract against a real SQLite file hold the line on every build.
+The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. Contracts run backed by a database: a `schema` is a vow, a `transactional` subcontract is a transaction, and a SQLite backend vendored into the runtime persists the rows, the store invisible across the boundary. An instance's durable state parks into a store row and resumes in another process, from the C surface and from inside the language alike. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over the pool, and store gates that sign a contract against a real SQLite file hold the line on every build.
 
-Layer 1 is complete, from the language surface through the memory model, threading, discovery, and a second language over the boundary; Layer 2, the network runtime, runs; Layer 3, the store runtime, runs, contracts backed by a database with schemas as vows and transactions as subcontracts, driven from C and from Python alike; and Layer 4, the mesh, runs. Serving is a library call, so a node serves the contracts it holds and connects to the peers whose contracts it wants at once, symmetric halves of one process rather than a daemon and a client. A node's provider side is any language that reaches the ABI, so a Python node and a C node exchange results through one contract across the wire, and three nodes wire by address into one mesh, every sign one hop to the owner with no relay. Mesh gates stand up a plain C server, a symmetric pair driving both directions at once, a Python provider a C consumer reads, and a three node mesh under a fulfillment storm and a per edge kill, beside the network and store gates on every build.
+The cross process story is the bridge. `ashc emit-proto` writes the gRPC surface and its session wrappers, a reference server holds the runtime over the C ABI and serves it, and clients in Python, Go, and Node drive the whole lifecycle from the emitted artifacts alone. The session is a stream, the park store makes it survive the stream, the server, and the process, and the gates prove each claim including a server killed between a park and a resume. Ashford keeps no wire of its own: in one process the languages share memory through `libashrt`, and across processes they share gRPC, which every language already speaks.
 
 ## Requirements
 
-- The dusk toolchain, 0.6.0 or newer, to build `ashc`.
+- The dusk toolchain, 1.5.3 or newer, to build `ashc`.
 - cc and clang, to compile the emitted C and the runtime.
 - make.
 
