@@ -32,6 +32,7 @@ Exit status 0 means every check below held.
 """
 
 import argparse
+import string
 import subprocess
 import sys
 import time
@@ -72,8 +73,8 @@ class Session:
     typed pledge calls from protoc for free, but this object, the thing that
     must stay alive and must be closed, is not something protoc writes."""
 
-    def __init__(self, stub, request):
-        self._stream = stub.Session(request)
+    def __init__(self, stub, request, stream_call=None):
+        self._stream = (stub.Session if stream_call is None else stream_call)(request)
         event = next(self._stream)
         assert event.WhichOneof("event") == "signed"
         self.signed = event.signed
@@ -105,6 +106,77 @@ def wait_for_live(stub, want, timeout):
             return time.monotonic() - t0
         time.sleep(0.005)
     return None
+
+
+def park_walk(stub):
+    """Parks a partly progressed session and leaves its token as the one
+    machine readable line, for the restart half of the round trip."""
+    check(live(stub) == 0, "the park table starts empty")
+    with Session(stub, pb.SignRequest(currency="EUR")) as session:
+        signed = session.signed
+        token = signed.park_token
+        check(signed.instance_id != 0, "the park session issued an instance id")
+        check(signed.shape_hash != 0,
+              "the park session carries a nonzero shape hash")
+        check(len(token) == 32 and all(ch in string.hexdigits for ch in token),
+              "the park session carries a hex park token")
+        out = stub.ValidateCard(pb.ValidateCardRequest(
+            instance_id=session.instance_id, card="4111 1111"))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the park session latched validate_card")
+        print(token, flush=True)
+
+    check(wait_for_live(stub, 0, 5.0) is not None,
+          "closing the park stream dropped its row")
+    expect_code(lambda: stub.GetPartial(
+        pb.PartialRequest(instance_id=signed.instance_id)),
+        grpc.StatusCode.NOT_FOUND, "the parked instance id")
+
+
+def resume_walk(stub, token):
+    """Reopens one parked session and proves its latch crossed the store and
+    a server restart, while the bad and repeated token cases stay one shot."""
+    check(live(stub) == 0, "the resumed server table starts empty")
+    expect_code(lambda: Session(
+        stub, pb.ResumeRequest(park_token="not-a-park-token"), stub.Resume),
+        grpc.StatusCode.NOT_FOUND, "a garbage park token")
+    expect_code(lambda: Session(
+        stub, pb.ResumeRequest(park_token=token, expected_hash=12345),
+        stub.Resume), grpc.StatusCode.ABORTED, "a wrong resume shape hash")
+
+    with Session(stub, pb.ResumeRequest(park_token=token), stub.Resume) as session:
+        signed = session.signed
+        iid = session.instance_id
+        check(iid != 0, "the resumed stream issued a fresh instance id")
+        check(signed.park_token == token,
+              "the resumed stream kept its park token")
+
+        expect_code(lambda: Session(
+            stub, pb.ResumeRequest(park_token=token), stub.Resume),
+            grpc.StatusCode.NOT_FOUND, "a consumed park token")
+
+        out = stub.ValidateAmount(pb.ValidateAmountRequest(instance_id=iid,
+                                                           amount=25.0))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the resumed validation fulfilled")
+        partial = stub.GetPartial(pb.PartialRequest(instance_id=iid))
+        check(partial.state == pb.PARTIAL and
+              list(partial.fulfilled) == ["Validation"],
+              "the validate_card latch crossed park and resume")
+
+        out = stub.Charge(pb.ChargeRequest(instance_id=iid, card="4111 1111",
+                                           amount=25.0))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the resumed charge fulfilled")
+        out = stub.NotifyUser(pb.NotifyUserRequest(instance_id=iid, ok=True))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the resumed notify_user fulfilled")
+        partial = stub.GetPartial(pb.PartialRequest(instance_id=iid))
+        check(partial.state == pb.FULFILLED,
+              "the resumed instance fulfilled")
+
+    check(wait_for_live(stub, 0, 5.0) is not None,
+          "closing the resumed stream dropped its row")
 
 
 def walk(stub, legacy_ttl, port):
@@ -335,8 +407,13 @@ def main():
     ap.add_argument("--legacy-ttl", type=float, default=2.0,
                     help="the idle timer step 1's server ran, kept only as "
                          "the yardstick the new checks are measured against")
-    ap.add_argument("--hold-session", action="store_true",
-                    help="internal: open a session and hold it until killed")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--park-walk", action="store_true",
+                      help="park one partly progressed session and print its token")
+    mode.add_argument("--resume-walk", metavar="TOKEN",
+                      help="resume TOKEN and finish its parked walk")
+    mode.add_argument("--hold-session", action="store_true",
+                      help="internal: open a session and hold it until killed")
     args = ap.parse_args()
 
     if args.hold_session:
@@ -349,11 +426,18 @@ def main():
             print("[bridge_client] FAIL: server never came up",
                   file=sys.stderr)
             return 1
-        walk(pb_grpc.PaymentServiceStub(ch), args.legacy_ttl, args.port)
+        stub = pb_grpc.PaymentServiceStub(ch)
+        if args.park_walk:
+            park_walk(stub)
+        elif args.resume_walk:
+            resume_walk(stub, args.resume_walk)
+        else:
+            walk(stub, args.legacy_ttl, args.port)
 
     if _failures:
         return 1
-    print("[bridge_client] ok")
+    if not args.park_walk:
+        print("[bridge_client] ok")
     return 0
 
 

@@ -193,10 +193,10 @@ func req_msg_name(prefix: string, camel: string) -> string {
 }
 
 // Whether a pledge's rpc spelling takes a name the session surface owns,
-// recorded as a build error: the service already carries Session,
+// recorded as a build error: the service already carries Session, Resume,
 // GetPartial, and Break.
 func rpc_name_taken(g: *Cg, pl: PledgeNode, camel: string) -> bool {
-    if str_eq(camel, "Session") || str_eq(camel, "GetPartial") || str_eq(camel, "Break") {
+    if str_eq(camel, "Session") || str_eq(camel, "Resume") || str_eq(camel, "GetPartial") || str_eq(camel, "Break") {
         cg_err(g, pl.lo, pl.hi, tmsg2("codegen: a pledge's rpc spelling collides with the session surface: ", camel))
         return true
     }
@@ -555,6 +555,7 @@ func emit_contract_messages(g: *Cg, cid: int64, many: bool, seen: *Vector<string
     }
     cg_top(g, tmsg3("  uint64 shape_hash = ", int_to_string(vec_len(vows) + 2), ";"))
     cg_top(g, tmsg3("  int64 signed_at = ", int_to_string(vec_len(vows) + 3), ";"))
+    cg_top(g, tmsg3("  string park_token = ", int_to_string(vec_len(vows) + 4), ";  // the resume key a park enabled server issues; empty when parking is off"))
     cg_top(g, "}")
     cg_top(g, "")
 
@@ -565,6 +566,14 @@ func emit_contract_messages(g: *Cg, cid: int64, many: bool, seen: *Vector<string
     cg_top(g, "  oneof event {")
     cg_top(g, tmsg3("    ", tmsg2(prefix, "Signed"), " signed = 1;"))
     cg_top(g, "  }")
+    cg_top(g, "}")
+    cg_top(g, "")
+
+    cg_top(g, "// The resume call: the token names a parked row on the server's park")
+    cg_top(g, "// store, and a 0 expected_hash skips the shape check the way sign's does.")
+    cg_top(g, tmsg3("message ", tmsg2(prefix, "ResumeRequest"), " {"))
+    cg_top(g, "  string park_token = 1;")
+    cg_top(g, "  uint64 expected_hash = 2;")
     cg_top(g, "}")
     cg_top(g, "")
 
@@ -678,6 +687,9 @@ func emit_service(g: *Cg, cid: int64, many: bool) -> void {
     cg_top(g, "  // then stays open and empty for as long as the instance lives. Ending the")
     cg_top(g, "  // stream, by close, by cancel, or by dying, ends the instance.")
     cg_top(g, tmsg5("  rpc Session(", tmsg2(prefix, "SignRequest"), ") returns (stream ", tmsg2(prefix, "SessionEvent"), ");"))
+    cg_top(g, "  // A parked instance stood back up: the stream is once again the")
+    cg_top(g, "  // instance's life, and its first event carries the signature.")
+    cg_top(g, tmsg5("  rpc Resume(", tmsg2(prefix, "ResumeRequest"), ") returns (stream ", tmsg2(prefix, "SessionEvent"), ");"))
     mut i: int64 = 0
     while i < vec_len(pls) {
         info: PlInfo = vec_get(pls, i)
@@ -814,6 +826,31 @@ func emit_go_contract(g: *Cg, cid: int64, many: bool) -> void {
     cg_top(g, tmsg5("	return &", cname, "Session{Signed: signed, cancel: cancel, stream: stream}, nil", "", ""))
     cg_top(g, "}")
     cg_top(g, "")
+    cg_top(g, tmsg5("// Resume", cname, "Session stands a parked instance back up and holds its new", "", ""))
+    cg_top(g, "// session stream, the same handle open answers: the signature is read off")
+    cg_top(g, "// the stream before this returns, and Close is once again the ending.")
+    cg_top(g, tmsg7("func Resume", cname, "Session(ctx context.Context, c ", cname, "Client, req *", tmsg2(prefix, "ResumeRequest"), ") ("))
+    cg_top(g, tmsg5("	*", cname, "Session, error,", "", ""))
+    cg_top(g, ") {")
+    cg_top(g, "	sctx, cancel := context.WithCancel(ctx)")
+    cg_top(g, "	stream, err := c.Resume(sctx, req)")
+    cg_top(g, "	if err != nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, err")
+    cg_top(g, "	}")
+    cg_top(g, "	ev, err := stream.Recv()")
+    cg_top(g, "	if err != nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, err")
+    cg_top(g, "	}")
+    cg_top(g, "	signed := ev.GetSigned()")
+    cg_top(g, "	if signed == nil {")
+    cg_top(g, "		cancel()")
+    cg_top(g, "		return nil, fmt.Errorf(\"the session stream opened with %v, not the signature\", ev)")
+    cg_top(g, "	}")
+    cg_top(g, tmsg5("	return &", cname, "Session{Signed: signed, cancel: cancel, stream: stream}, nil", "", ""))
+    cg_top(g, "}")
+    cg_top(g, "")
     cg_top(g, "// Close ends the session; the server breaks the instance and drops it.")
     cg_top(g, tmsg3("func (s *", cname, "Session) Close() { s.cancel() }"))
 }
@@ -920,6 +957,11 @@ func emit_ts_contract(g: *Cg, cid: int64) -> void {
     cg_top(g, "  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins")
     cg_top(g, "}")
     cg_top(g, "")
+    cg_top(g, tmsg3("export interface ", cname, "ResumeRequest {"))
+    cg_top(g, "  park_token: string;  // the resume key a park enabled server issued at sign")
+    cg_top(g, "  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins")
+    cg_top(g, "}")
+    cg_top(g, "")
     cg_top(g, tmsg3("export interface ", cname, "Signed {"))
     cg_top(g, "  instance_id: string;")
     mut j: int64 = 0
@@ -933,6 +975,7 @@ func emit_ts_contract(g: *Cg, cid: int64) -> void {
     }
     cg_top(g, "  shape_hash: string;")
     cg_top(g, "  signed_at: string;")
+    cg_top(g, "  park_token: string;  // empty when the server runs without a park store")
     cg_top(g, "}")
     cg_top(g, "")
     cg_top(g, tmsg5("// ", cname, "Session holds a signed instance open. The instance lives", "", ""))
@@ -967,6 +1010,33 @@ func emit_ts_contract(g: *Cg, cid: int64) -> void {
     cg_top(g, "    stream.on(\"error\", (err) => {")
     cg_top(g, "      // After the signature the stream's end is the session's end, the")
     cg_top(g, "      // cancel the close asked for; before it, the sign itself refused.")
+    cg_top(g, "      if (!opened) { reject(err); }")
+    cg_top(g, "    });")
+    cg_top(g, "  });")
+    cg_top(g, "}")
+    cg_top(g, "")
+    cg_top(g, tmsg5("// resume", cname, "Session stands a parked instance back up and holds its new", "", ""))
+    cg_top(g, "// session stream, the same handle open answers; close is once again the")
+    cg_top(g, "// ending.")
+    cg_top(g, tmsg5("export function resume", cname, "Session(", "", ""))
+    cg_top(g, tmsg5("  client: { Resume(req: ", cname, "ResumeRequest): SessionStream },", "", ""))
+    cg_top(g, tmsg5("  req: ", cname, "ResumeRequest,", "", ""))
+    cg_top(g, tmsg5("): Promise<", cname, "Session> {", "", ""))
+    cg_top(g, "  return new Promise((resolve, reject) => {")
+    cg_top(g, "    const stream = client.Resume(req);")
+    cg_top(g, "    let opened = false;")
+    cg_top(g, "    stream.on(\"data\", (ev) => {")
+    cg_top(g, "      if (opened) { return; }")
+    cg_top(g, tmsg5("      const signed = (ev as { signed?: ", cname, "Signed }).signed;", "", ""))
+    cg_top(g, "      if (!signed) {")
+    cg_top(g, "        stream.cancel();")
+    cg_top(g, "        reject(new Error(\"the session stream opened without the signature\"));")
+    cg_top(g, "        return;")
+    cg_top(g, "      }")
+    cg_top(g, "      opened = true;")
+    cg_top(g, "      resolve({ signed, close: () => stream.cancel() });")
+    cg_top(g, "    });")
+    cg_top(g, "    stream.on(\"error\", (err) => {")
     cg_top(g, "      if (!opened) { reject(err); }")
     cg_top(g, "    });")
     cg_top(g, "  });")

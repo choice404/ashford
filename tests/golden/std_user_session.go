@@ -54,6 +54,31 @@ func OpenIntGateSession(ctx context.Context, c IntGateClient, req *IntGateSignRe
 	return &IntGateSession{Signed: signed, cancel: cancel, stream: stream}, nil
 }
 
+// ResumeIntGateSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers: the signature is read off
+// the stream before this returns, and Close is once again the ending.
+func ResumeIntGateSession(ctx context.Context, c IntGateClient, req *IntGateResumeRequest) (
+	*IntGateSession, error,
+) {
+	sctx, cancel := context.WithCancel(ctx)
+	stream, err := c.Resume(sctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ev, err := stream.Recv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	signed := ev.GetSigned()
+	if signed == nil {
+		cancel()
+		return nil, fmt.Errorf("the session stream opened with %v, not the signature", ev)
+	}
+	return &IntGateSession{Signed: signed, cancel: cancel, stream: stream}, nil
+}
+
 // Close ends the session; the server breaks the instance and drops it.
 func (s *IntGateSession) Close() { s.cancel() }
 
@@ -79,6 +104,31 @@ func OpenStdUserSession(ctx context.Context, c StdUserClient, req *StdUserSignRe
 ) {
 	sctx, cancel := context.WithCancel(ctx)
 	stream, err := c.Session(sctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ev, err := stream.Recv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	signed := ev.GetSigned()
+	if signed == nil {
+		cancel()
+		return nil, fmt.Errorf("the session stream opened with %v, not the signature", ev)
+	}
+	return &StdUserSession{Signed: signed, cancel: cancel, stream: stream}, nil
+}
+
+// ResumeStdUserSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers: the signature is read off
+// the stream before this returns, and Close is once again the ending.
+func ResumeStdUserSession(ctx context.Context, c StdUserClient, req *StdUserResumeRequest) (
+	*StdUserSession, error,
+) {
+	sctx, cancel := context.WithCancel(ctx)
+	stream, err := c.Resume(sctx, req)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -138,6 +188,31 @@ func OpenMathOpsSession(ctx context.Context, c MathOpsClient, req *MathOpsSignRe
 	return &MathOpsSession{Signed: signed, cancel: cancel, stream: stream}, nil
 }
 
+// ResumeMathOpsSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers: the signature is read off
+// the stream before this returns, and Close is once again the ending.
+func ResumeMathOpsSession(ctx context.Context, c MathOpsClient, req *MathOpsResumeRequest) (
+	*MathOpsSession, error,
+) {
+	sctx, cancel := context.WithCancel(ctx)
+	stream, err := c.Resume(sctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ev, err := stream.Recv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	signed := ev.GetSigned()
+	if signed == nil {
+		cancel()
+		return nil, fmt.Errorf("the session stream opened with %v, not the signature", ev)
+	}
+	return &MathOpsSession{Signed: signed, cancel: cancel, stream: stream}, nil
+}
+
 // Close ends the session; the server breaks the instance and drops it.
 func (s *MathOpsSession) Close() { s.cancel() }
 
@@ -163,6 +238,31 @@ func OpenListOpsSession(ctx context.Context, c ListOpsClient, req *ListOpsSignRe
 ) {
 	sctx, cancel := context.WithCancel(ctx)
 	stream, err := c.Session(sctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ev, err := stream.Recv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	signed := ev.GetSigned()
+	if signed == nil {
+		cancel()
+		return nil, fmt.Errorf("the session stream opened with %v, not the signature", ev)
+	}
+	return &ListOpsSession{Signed: signed, cancel: cancel, stream: stream}, nil
+}
+
+// ResumeListOpsSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers: the signature is read off
+// the stream before this returns, and Close is once again the ending.
+func ResumeListOpsSession(ctx context.Context, c ListOpsClient, req *ListOpsResumeRequest) (
+	*ListOpsSession, error,
+) {
+	sctx, cancel := context.WithCancel(ctx)
+	stream, err := c.Resume(sctx, req)
 	if err != nil {
 		cancel()
 		return nil, err

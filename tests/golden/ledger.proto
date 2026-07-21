@@ -28,6 +28,7 @@ message Signed {
   string dsn = 2;
   uint64 shape_hash = 3;
   int64 signed_at = 4;
+  string park_token = 5;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -37,6 +38,13 @@ message SessionEvent {
   oneof event {
     Signed signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message ResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // The declared sum LedgerError: every arm is bare, so it crosses as an
@@ -141,6 +149,9 @@ service Ledger {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(SignRequest) returns (stream SessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(ResumeRequest) returns (stream SessionEvent);
   rpc Balance(BalanceRequest) returns (FloatLedgerErrorResult);
   rpc Open(OpenRequest) returns (BoolLedgerErrorResult);
   rpc SetBalance(SetBalanceRequest) returns (BoolLedgerErrorResult);

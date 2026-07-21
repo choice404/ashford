@@ -36,8 +36,10 @@ Run it directly: python bridge_server.py --port 50251
 """
 
 import argparse
+import sqlite3
 import sys
 import threading
+import uuid
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +112,7 @@ class Instance:
     it so a handler cannot outlive the server it belongs to."""
     instance_id: int
     contract: object
+    park_token: str
     lock: threading.Lock
     done: threading.Event
 
@@ -126,11 +129,12 @@ class InstanceTable:
         self._next_id = 1
         self._live = {}
 
-    def insert(self, contract):
+    def insert(self, contract, park_token=""):
         with self._lock:
             iid = self._next_id
             self._next_id += 1
             inst = Instance(instance_id=iid, contract=contract,
+                            park_token=park_token,
                             lock=threading.Lock(), done=threading.Event())
             self._live[iid] = inst
             return inst
@@ -188,9 +192,11 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
     and map what came back. Session is the one handler that is not shaped like
     that, because it is the one that owns a lifetime."""
 
-    def __init__(self, rt, table):
+    def __init__(self, rt, table, park_dsn=None):
         self._rt = rt
         self._table = table
+        self._park_dsn = park_dsn
+        self._resume_lock = threading.Lock()
 
     def _instance(self, instance_id, context):
         s = self._table.get(instance_id)
@@ -216,15 +222,37 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         resolve the id while the break is in flight. Then the instance lock,
         which waits out any call admitted before the row went, so a body that
         was already running finishes against a live instance instead of one
-        being torn down under it. Then the break."""
+        being torn down under it. With a park store, the instance writes its
+        resumable record before the break."""
         s = self._table.remove(instance_id)
         if s is None:
             return
         s.done.set()
         with s.lock:
+            if self._park_dsn:
+                try:
+                    s.contract.park(self._park_dsn, s.park_token)
+                except AshError as e:
+                    if e.status == ASH_ERR_STATE:
+                        print(f"[bridge_server] session {instance_id} ended "
+                              f"({reason}), explicit break left no heap to "
+                              "park", flush=True)
+                    else:
+                        print(f"[bridge_server] session {instance_id} ended "
+                              f"({reason}), park failed: {e}", flush=True)
             _break_quietly(s)
+        action = "parked, broken and dropped" if self._park_dsn else \
+            "instance broken and dropped"
         print(f"[bridge_server] session {instance_id} ended ({reason}), "
-              f"instance broken and dropped", flush=True)
+              f"{action}", flush=True)
+
+    @staticmethod
+    def _signed(inst):
+        c = inst.contract
+        return pb.SessionEvent(signed=pb.Signed(
+            instance_id=inst.instance_id, currency=c.vow("currency"),
+            shape_hash=c.hash(), signed_at=c.signed_at(),
+            park_token=inst.park_token))
 
     # ---- the session, which is the signing rpc ----
 
@@ -250,7 +278,8 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         except AshError as e:
             _abort(context, e)
 
-        inst = self._table.insert(c)
+        token = uuid.uuid4().hex if self._park_dsn else ""
+        inst = self._table.insert(c, token)
         iid = inst.instance_id
         print(f"[bridge_server] session {iid} signed, currency "
               f"{c.vow('currency')}", flush=True)
@@ -260,13 +289,44 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
             return
 
         try:
-            yield pb.SessionEvent(signed=pb.Signed(
-                instance_id=iid, currency=c.vow("currency"),
-                shape_hash=c.hash(), signed_at=c.signed_at()))
+            yield self._signed(inst)
             # Nothing else to send. The handler exists from here on only to
             # keep the stream up, and the stream exists only to say the peer
             # is still there. That sentence is what the idle timer was
             # standing in for.
+            inst.done.wait()
+        finally:
+            self.end_session(iid, "handler exit")
+
+    def Resume(self, request, context):
+        """Stand one parked instance back up, consume its store row, and hold
+        its new session stream. The same token is kept so the next stream
+        termination parks the same session name again."""
+        if not self._park_dsn:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION,
+                          "server runs without a park store")
+
+        with self._resume_lock:
+            try:
+                c = self._rt.resume(self._park_dsn, request.park_token,
+                                    request.expected_hash)
+                with sqlite3.connect(self._park_dsn) as db:
+                    db.execute("DELETE FROM ash_park WHERE pkey = ?",
+                               (request.park_token.encode(),))
+                inst = self._table.insert(c, request.park_token)
+            except AshError as e:
+                _abort(context, e)
+
+        iid = inst.instance_id
+        print(f"[bridge_server] session {iid} resumed, currency "
+              f"{c.vow('currency')}", flush=True)
+
+        if not context.add_callback(lambda: self.end_session(iid, "stream terminated")):
+            self.end_session(iid, "stream was already over")
+            return
+
+        try:
+            yield self._signed(inst)
             inst.done.wait()
         finally:
             self.end_session(iid, "handler exit")
@@ -336,14 +396,14 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         return pb.DebugReply(live_instances=self._table.count())
 
 
-def serve(port):
+def serve(port, park_dsn=None):
     rt = Runtime(OUT / "libashrt.so")
     rt.load(OUT / "libpayment.ash.so")
     rt.bind("PaymentService.charge", charge)
     rt.freeze()
 
     table = InstanceTable()
-    servicer = PaymentServicer(rt, table)
+    servicer = PaymentServicer(rt, table, park_dsn)
 
     pool = futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
     server = grpc.server(pool)
@@ -375,8 +435,10 @@ def serve(port):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=50251)
+    ap.add_argument("--park-dsn", metavar="PATH",
+                    help="the sqlite park store a closed session writes to")
     args = ap.parse_args()
-    serve(args.port)
+    serve(args.port, args.park_dsn)
     return 0
 
 

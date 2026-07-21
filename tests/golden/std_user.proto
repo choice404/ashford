@@ -26,6 +26,7 @@ message IntGateSigned {
   uint64 instance_id = 1;
   uint64 shape_hash = 2;
   int64 signed_at = 3;
+  string park_token = 4;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -35,6 +36,13 @@ message IntGateSessionEvent {
   oneof event {
     IntGateSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message IntGateResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // Result<Int, Int>: the contract's own Err is a value, not a
@@ -65,6 +73,7 @@ message StdUserSigned {
   uint64 instance_id = 1;
   uint64 shape_hash = 2;
   int64 signed_at = 3;
+  string park_token = 4;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -74,6 +83,13 @@ message StdUserSessionEvent {
   oneof event {
     StdUserSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message StdUserResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // List<Int> as a message, so a list can ride a oneof arm.
@@ -154,6 +170,7 @@ message MathOpsSigned {
   double epsilon = 2;
   uint64 shape_hash = 3;
   int64 signed_at = 4;
+  string park_token = 5;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -163,6 +180,13 @@ message MathOpsSessionEvent {
   oneof event {
     MathOpsSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message MathOpsResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // The declared sum AshMathError: every arm is bare, so it crosses as an
@@ -283,6 +307,7 @@ message ListOpsSigned {
   uint64 instance_id = 1;
   uint64 shape_hash = 2;
   int64 signed_at = 3;
+  string park_token = 4;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -292,6 +317,13 @@ message ListOpsSessionEvent {
   oneof event {
     ListOpsSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message ListOpsResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // Option<Int> as a message: an unset value is None.
@@ -385,6 +417,9 @@ service IntGate {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(IntGateSignRequest) returns (stream IntGateSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(IntGateResumeRequest) returns (stream IntGateSessionEvent);
   rpc DoublePos(IntGateDoublePosRequest) returns (IntIntResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);
   rpc Break(BreakRequest) returns (BreakReply);
@@ -395,6 +430,9 @@ service StdUser {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(StdUserSignRequest) returns (stream StdUserSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(StdUserResumeRequest) returns (stream StdUserSessionEvent);
   rpc Sort3(StdUserSort3Request) returns (IntListIntResult);
   rpc CheckPositive(StdUserCheckPositiveRequest) returns (IntCommonErrorResult);
   rpc Describe(StdUserDescribeRequest) returns (StringCommonErrorResult);
@@ -408,6 +446,9 @@ service MathOps {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(MathOpsSignRequest) returns (stream MathOpsSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(MathOpsResumeRequest) returns (stream MathOpsSessionEvent);
   rpc Abs(MathOpsAbsRequest) returns (IntAshMathErrorResult);
   rpc Sign(MathOpsSignPledgeRequest) returns (IntAshMathErrorResult);
   rpc Min(MathOpsMinRequest) returns (IntAshMathErrorResult);
@@ -429,6 +470,9 @@ service ListOps {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(ListOpsSignRequest) returns (stream ListOpsSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(ListOpsResumeRequest) returns (stream ListOpsSessionEvent);
   rpc Sum(ListOpsSumRequest) returns (IntCommonErrorResult);
   rpc Product(ListOpsProductRequest) returns (IntCommonErrorResult);
   rpc MinOf(ListOpsMinOfRequest) returns (IntOption);

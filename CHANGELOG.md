@@ -5,6 +5,58 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.4.0] the session that survives
+
+The bridge spends the parked instance. A park enabled server writes a
+session down when its stream ends and stands it back up when the client
+returns, so a contract now outlives its connection, its client, and the
+server process itself. The gate kills the server between the park and the
+resume, and the latch set before the death answers the walk that finishes
+after it: the stream's partition trade from step 1b is paid back, and
+replica affinity has its answer, any server holding the park store can
+resume the session.
+
+- issue a park token beside every signature on a park enabled server,
+  Signed gaining park_token, empty when parking is off so a server without
+  the flag is byte for byte the step 1b server
+- park on the stream's end, not the contract's: a termination without an
+  explicit Break parks the instance under its token before the break that
+  drops the row, while an explicit Break stays the one true ending, the
+  runtime's refusal to park an ended instance taken as the answer it is
+- add the Resume rpc: the token stands the instance back up under a fresh
+  id on a new stream, one shot, the parked row deleted on success, a spent
+  or unknown token NOT_FOUND, a lying hash ABORTED before the row is
+  touched, and a resumed session that later drops parks again under the
+  same token
+- keep the one shot rule bridge policy, not runtime law: the runtime
+  writes and reads park rows, and the server's own sqlite delete decides
+  who may resume a token and how often
+- carry the surface out of the compiler: emit-proto adds park_token to
+  Signed, the ResumeRequest message, the Resume rpc beside Session, Resume
+  to the reserved rpc spellings, and a resume opener in both the Go and
+  TypeScript wrappers, the same handle open answers
+- expose park and resume in the Python binding, the ctypes twins of the
+  language's own spellings
+- gate the whole claim in one file: test-grpc-resume signs on a park
+  enabled server, latches a pledge, drops the stream, kills the server,
+  stands a fresh one up on the same park store, resumes by token, and
+  finishes the contract on the latch that crossed the death, beside the
+  old gates proving a parkless server unchanged and the Go and Node walks
+  green on the widened surface
+
+### Notes
+
+The design sentence from step 1b closes its loop here: the stream is how a
+client says still mine and done, and the park store is how a contract
+survives everything the stream cannot. The two roles never blur, because
+the park happens exactly where the break used to and the resume is a new
+stream taking ownership, so there is still never a moment when an instance
+lives without an owner: the owner is the stream, or the row, never neither,
+never both. What step 1b called the remaining quarter is now spent in
+full: correct lifetimes came from the stream, and affinity and partition
+tolerance came from the store, each from the piece of the system whose job
+it was.
+
 ## [v0.3.9] the instance surface
 
 The lifecycle reads and writes from inside the language. An instance

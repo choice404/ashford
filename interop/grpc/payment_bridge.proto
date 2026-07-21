@@ -32,6 +32,14 @@ message Signed {
   string currency = 2;            // the effective vow after defaults and overrides
   uint64 shape_hash = 3;
   int64 signed_at = 4;
+  string park_token = 5;          // the resumable session name, empty without a park store
+}
+
+// Reopens one parked session. expected_hash follows SignRequest: 0 skips the
+// check, a nonzero value pins the shape the caller is prepared to resume.
+message ResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 // What the session stream carries. Signed is the first event and today it is
@@ -99,6 +107,9 @@ service PaymentService {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(SignRequest) returns (stream SessionEvent);
+  // Reopens a parked session, then holds it by the same stream rule Session
+  // uses. A token resumes once, and its later stream may park it again.
+  rpc Resume(ResumeRequest) returns (stream SessionEvent);
   rpc ValidateCard(ValidateCardRequest) returns (BoolIntResult);
   rpc ValidateAmount(ValidateAmountRequest) returns (BoolIntResult);
   rpc Charge(ChargeRequest) returns (BoolIntResult);

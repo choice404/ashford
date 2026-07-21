@@ -30,11 +30,17 @@ export interface PaymentServiceSignRequest {
   expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
 }
 
+export interface PaymentServiceResumeRequest {
+  park_token: string;  // the resume key a park enabled server issued at sign
+  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
+}
+
 export interface PaymentServiceSigned {
   instance_id: string;
   currency: string;
   shape_hash: string;
   signed_at: string;
+  park_token: string;  // empty when the server runs without a park store
 }
 
 // PaymentServiceSession holds a signed instance open. The instance lives
@@ -69,6 +75,33 @@ export function openPaymentServiceSession(
     stream.on("error", (err) => {
       // After the signature the stream's end is the session's end, the
       // cancel the close asked for; before it, the sign itself refused.
+      if (!opened) { reject(err); }
+    });
+  });
+}
+
+// resumePaymentServiceSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers; close is once again the
+// ending.
+export function resumePaymentServiceSession(
+  client: { Resume(req: PaymentServiceResumeRequest): SessionStream },
+  req: PaymentServiceResumeRequest,
+): Promise<PaymentServiceSession> {
+  return new Promise((resolve, reject) => {
+    const stream = client.Resume(req);
+    let opened = false;
+    stream.on("data", (ev) => {
+      if (opened) { return; }
+      const signed = (ev as { signed?: PaymentServiceSigned }).signed;
+      if (!signed) {
+        stream.cancel();
+        reject(new Error("the session stream opened without the signature"));
+        return;
+      }
+      opened = true;
+      resolve({ signed, close: () => stream.cancel() });
+    });
+    stream.on("error", (err) => {
       if (!opened) { reject(err); }
     });
   });

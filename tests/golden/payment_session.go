@@ -54,5 +54,30 @@ func OpenPaymentServiceSession(ctx context.Context, c PaymentServiceClient, req 
 	return &PaymentServiceSession{Signed: signed, cancel: cancel, stream: stream}, nil
 }
 
+// ResumePaymentServiceSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers: the signature is read off
+// the stream before this returns, and Close is once again the ending.
+func ResumePaymentServiceSession(ctx context.Context, c PaymentServiceClient, req *ResumeRequest) (
+	*PaymentServiceSession, error,
+) {
+	sctx, cancel := context.WithCancel(ctx)
+	stream, err := c.Resume(sctx, req)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	ev, err := stream.Recv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	signed := ev.GetSigned()
+	if signed == nil {
+		cancel()
+		return nil, fmt.Errorf("the session stream opened with %v, not the signature", ev)
+	}
+	return &PaymentServiceSession{Signed: signed, cancel: cancel, stream: stream}, nil
+}
+
 // Close ends the session; the server breaks the instance and drops it.
 func (s *PaymentServiceSession) Close() { s.cancel() }

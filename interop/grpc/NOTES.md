@@ -530,3 +530,54 @@ longs as String, oneofs on. The wire's own snake_case and decimal strings
 for every 64 bit integer are the wrapper's interface spellings, and the
 oneof's discriminator is how a result says which arm it is, the same
 WhichOneof the Python client leans on.
+
+# The gRPC bridge, step 3: the session that survives
+
+Step 1b bought correct lifetimes by making the connection the session, and
+paid for them with a trade this file wrote down honestly: a stream is less
+partition tolerant than a long timer, because a network blip that kills the
+stream kills the instance. The answer was named in the same breath, an
+instance that can be written down, and the runtime now has it. Step 3
+spends it.
+
+## The shape
+
+A server started with --park-dsn issues every session a park token beside
+its signature. Nothing else changes while the stream lives. When the stream
+ends without an explicit Break, the server parks the instance under that
+token before the break that drops the row, so the ending the connection
+announces is a comma, not a period. A new rpc, Resume, takes the token and
+stands the instance back up under a fresh id, holds it on a new stream, and
+deletes the parked row, one shot: the second Resume with a spent token is
+NOT_FOUND, a lying hash is ABORTED before the row is touched, and a resumed
+session that later drops parks again under the same token.
+
+An explicit Break stays the one true ending, on the bridge as everywhere:
+the runtime refuses to park what the caller already ended, the server takes
+that refusal as the answer it is, and the token dies with the instance.
+Without --park-dsn the server is byte for byte what step 1b shipped, down
+to an empty park_token nobody asserts on.
+
+## The proof
+
+The gate is one file and it is the whole claim: a park enabled server signs
+a session, the client latches validate_card and closes, the instance parks,
+and then the server itself is killed. A fresh server starts on the same
+park store, the client resumes by token, and the latch set before the death
+is still set: ValidateAmount lands and the state reads PARTIAL with
+Validation fulfilled, on an instance whose first server no longer exists.
+The walk runs on to FULFILLED. That is the partition trade paid back and
+the affinity question answered in the same run, because the second server
+is any replica that can reach the park store.
+
+## What it costs
+
+The park store is a database the server names, and the one shot delete is
+the server's own sqlite statement, not a runtime call: the runtime writes
+and reads rows, and who may resume a token, once, is bridge policy. That
+split is deliberate. A different bridge might let a token resume many
+times, or fence it to a tenant; the runtime should not have an opinion. The
+emitted surface carries the whole story now, park_token on the signature,
+ResumeRequest, and the Resume rpc, with the Go and TypeScript wrappers
+growing a resume opener whose shape is the open they already had, so a
+consumer that survived this file's earlier steps learns one new verb.

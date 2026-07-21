@@ -56,7 +56,7 @@ MODULE_CALC := $(OUT)/libmesh_calc.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host daemon test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism test-net test-net-tsan test-net2 test-net2-tsan test-net-stress test-net-stress-tsan test-net-python test-mesh-serve test-mesh-pair test-mesh-pair-tsan test-mesh-python test-mesh-stress test-mesh-stress-tsan grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, the store, the
@@ -803,6 +803,50 @@ test-grpc-go: $(RT_SO) $(MODULE_PAY) $(ASHC)
 	./$(OUT)/bridge_client_go -addr 127.0.0.1:50252; \
 	code=$$?; \
 	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	exit $$code
+
+# The step 3 gate: the session that survives. A park enabled server signs a
+# session whose stream then drops, the instance parks under its token, the
+# server itself is killed and a fresh one stands up on the same park store,
+# and the client resumes by token: the latch set before the death answers
+# the walk that finishes after it. This is the partition trade the stream
+# took in step 1b paid back, and the affinity answer in one file: any
+# replica holding the park store can resume the session. Out of the all
+# gate beside the other gRPC gates, skipping clean without grpcio.
+test-grpc-resume: $(RT_SO) $(MODULE_PAY)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-grpc-resume] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	mkdir -p $(GRPC_GEN); \
+	$$py -m grpc_tools.protoc -I interop/grpc \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    $(GRPC_PROTO) || exit 1; \
+	parkdb=$$(mktemp target/ashparkgrpc_XXXXXX); \
+	$$py interop/grpc/bridge_server.py --port 50256 --park-dsn "$$parkdb" & \
+	srv=$$!; \
+	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
+	token=$$($$py interop/grpc/bridge_client.py --port 50256 --park-walk | tail -n 1); \
+	if [ -z "$$token" ]; then \
+	    echo "[test-grpc-resume] the park walk failed"; \
+	    kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	    rm -f "$$parkdb"; exit 1; \
+	fi; \
+	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	$$py interop/grpc/bridge_server.py --port 50256 --park-dsn "$$parkdb" & \
+	srv=$$!; \
+	$$py interop/grpc/bridge_client.py --port 50256 --resume-walk "$$token"; \
+	code=$$?; \
+	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
+	rm -f "$$parkdb"; \
+	if [ $$code -eq 0 ]; then echo "[test-grpc-resume] ok"; fi; \
 	exit $$code
 
 # The Node twin of the Go gate: the same server, driven by a client whose

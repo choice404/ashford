@@ -29,10 +29,16 @@ export interface IntGateSignRequest {
   expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
 }
 
+export interface IntGateResumeRequest {
+  park_token: string;  // the resume key a park enabled server issued at sign
+  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
+}
+
 export interface IntGateSigned {
   instance_id: string;
   shape_hash: string;
   signed_at: string;
+  park_token: string;  // empty when the server runs without a park store
 }
 
 // IntGateSession holds a signed instance open. The instance lives
@@ -72,6 +78,33 @@ export function openIntGateSession(
   });
 }
 
+// resumeIntGateSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers; close is once again the
+// ending.
+export function resumeIntGateSession(
+  client: { Resume(req: IntGateResumeRequest): SessionStream },
+  req: IntGateResumeRequest,
+): Promise<IntGateSession> {
+  return new Promise((resolve, reject) => {
+    const stream = client.Resume(req);
+    let opened = false;
+    stream.on("data", (ev) => {
+      if (opened) { return; }
+      const signed = (ev as { signed?: IntGateSigned }).signed;
+      if (!signed) {
+        stream.cancel();
+        reject(new Error("the session stream opened without the signature"));
+        return;
+      }
+      opened = true;
+      resolve({ signed, close: () => stream.cancel() });
+    });
+    stream.on("error", (err) => {
+      if (!opened) { reject(err); }
+    });
+  });
+}
+
 // StdUserShapeHash is the contract's shape hash, the same value the
 // compiled module registers. Sending its decimal spelling as expected_hash
 // pins the wire to this build; leaving the field unset skips the check.
@@ -81,10 +114,16 @@ export interface StdUserSignRequest {
   expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
 }
 
+export interface StdUserResumeRequest {
+  park_token: string;  // the resume key a park enabled server issued at sign
+  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
+}
+
 export interface StdUserSigned {
   instance_id: string;
   shape_hash: string;
   signed_at: string;
+  park_token: string;  // empty when the server runs without a park store
 }
 
 // StdUserSession holds a signed instance open. The instance lives
@@ -124,6 +163,33 @@ export function openStdUserSession(
   });
 }
 
+// resumeStdUserSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers; close is once again the
+// ending.
+export function resumeStdUserSession(
+  client: { Resume(req: StdUserResumeRequest): SessionStream },
+  req: StdUserResumeRequest,
+): Promise<StdUserSession> {
+  return new Promise((resolve, reject) => {
+    const stream = client.Resume(req);
+    let opened = false;
+    stream.on("data", (ev) => {
+      if (opened) { return; }
+      const signed = (ev as { signed?: StdUserSigned }).signed;
+      if (!signed) {
+        stream.cancel();
+        reject(new Error("the session stream opened without the signature"));
+        return;
+      }
+      opened = true;
+      resolve({ signed, close: () => stream.cancel() });
+    });
+    stream.on("error", (err) => {
+      if (!opened) { reject(err); }
+    });
+  });
+}
+
 // MathOpsShapeHash is the contract's shape hash, the same value the
 // compiled module registers. Sending its decimal spelling as expected_hash
 // pins the wire to this build; leaving the field unset skips the check.
@@ -134,11 +200,17 @@ export interface MathOpsSignRequest {
   expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
 }
 
+export interface MathOpsResumeRequest {
+  park_token: string;  // the resume key a park enabled server issued at sign
+  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
+}
+
 export interface MathOpsSigned {
   instance_id: string;
   epsilon: number;
   shape_hash: string;
   signed_at: string;
+  park_token: string;  // empty when the server runs without a park store
 }
 
 // MathOpsSession holds a signed instance open. The instance lives
@@ -178,6 +250,33 @@ export function openMathOpsSession(
   });
 }
 
+// resumeMathOpsSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers; close is once again the
+// ending.
+export function resumeMathOpsSession(
+  client: { Resume(req: MathOpsResumeRequest): SessionStream },
+  req: MathOpsResumeRequest,
+): Promise<MathOpsSession> {
+  return new Promise((resolve, reject) => {
+    const stream = client.Resume(req);
+    let opened = false;
+    stream.on("data", (ev) => {
+      if (opened) { return; }
+      const signed = (ev as { signed?: MathOpsSigned }).signed;
+      if (!signed) {
+        stream.cancel();
+        reject(new Error("the session stream opened without the signature"));
+        return;
+      }
+      opened = true;
+      resolve({ signed, close: () => stream.cancel() });
+    });
+    stream.on("error", (err) => {
+      if (!opened) { reject(err); }
+    });
+  });
+}
+
 // ListOpsShapeHash is the contract's shape hash, the same value the
 // compiled module registers. Sending its decimal spelling as expected_hash
 // pins the wire to this build; leaving the field unset skips the check.
@@ -187,10 +286,16 @@ export interface ListOpsSignRequest {
   expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
 }
 
+export interface ListOpsResumeRequest {
+  park_token: string;  // the resume key a park enabled server issued at sign
+  expected_hash?: string;  // a decimal uint64; the shape hash's toString() pins
+}
+
 export interface ListOpsSigned {
   instance_id: string;
   shape_hash: string;
   signed_at: string;
+  park_token: string;  // empty when the server runs without a park store
 }
 
 // ListOpsSession holds a signed instance open. The instance lives
@@ -225,6 +330,33 @@ export function openListOpsSession(
     stream.on("error", (err) => {
       // After the signature the stream's end is the session's end, the
       // cancel the close asked for; before it, the sign itself refused.
+      if (!opened) { reject(err); }
+    });
+  });
+}
+
+// resumeListOpsSession stands a parked instance back up and holds its new
+// session stream, the same handle open answers; close is once again the
+// ending.
+export function resumeListOpsSession(
+  client: { Resume(req: ListOpsResumeRequest): SessionStream },
+  req: ListOpsResumeRequest,
+): Promise<ListOpsSession> {
+  return new Promise((resolve, reject) => {
+    const stream = client.Resume(req);
+    let opened = false;
+    stream.on("data", (ev) => {
+      if (opened) { return; }
+      const signed = (ev as { signed?: ListOpsSigned }).signed;
+      if (!signed) {
+        stream.cancel();
+        reject(new Error("the session stream opened without the signature"));
+        return;
+      }
+      opened = true;
+      resolve({ signed, close: () => stream.cancel() });
+    });
+    stream.on("error", (err) => {
       if (!opened) { reject(err); }
     });
   });

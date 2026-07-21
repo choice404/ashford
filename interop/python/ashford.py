@@ -435,6 +435,11 @@ class Runtime:
         lib.ash_contract_sign.argtypes = [v, s, C.POINTER(AshVowBinding), z,
                                           C.c_uint64, C.POINTER(v)]
         lib.ash_contract_sign.restype = i
+        lib.ash_instance_park.argtypes = [v, s, s]
+        lib.ash_instance_park.restype = i
+        lib.ash_instance_resume.argtypes = [v, s, s, C.c_uint64,
+                                            C.POINTER(v)]
+        lib.ash_instance_resume.restype = i
         lib.ash_contract_state.argtypes = [v]
         lib.ash_contract_state.restype = i
         lib.ash_contract_hash.argtypes = [v]
@@ -613,6 +618,15 @@ class Runtime:
                                            arr, n, expected_hash, C.byref(c)),
                f"ash_contract_sign {contract_name}")
         del keep
+        return Contract(self, c)
+
+    def resume(self, dsn, key, expected_hash=0):
+        """Resumes the parked instance key names in dsn and returns its
+        contract handle. A nonzero expected hash pins the shape at resume."""
+        c = C.c_void_p()
+        _check(self._lib.ash_instance_resume(
+            self._rt, dsn.encode(), key.encode(), expected_hash, C.byref(c)),
+            f"ash_instance_resume {key}")
         return Contract(self, c)
 
     # ---- the iname table ----
@@ -845,6 +859,12 @@ class Contract:
     def break_(self):
         _check(self._rt._lib.ash_contract_break(self._ptr),
                "ash_contract_break")
+
+    def park(self, dsn, key):
+        """Writes this instance under key in the park store behind dsn."""
+        _check(self._rt._lib.ash_instance_park(self._ptr, dsn.encode(),
+                                                key.encode()),
+               f"ash_instance_park {key}")
 
     # ---- vows ----
 

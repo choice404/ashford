@@ -26,6 +26,7 @@ message SidekickSigned {
   uint64 instance_id = 1;
   uint64 shape_hash = 2;
   int64 signed_at = 3;
+  string park_token = 4;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -35,6 +36,13 @@ message SidekickSessionEvent {
   oneof event {
     SidekickSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message SidekickResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 message DemoErrorBadMood {
@@ -82,6 +90,7 @@ message MainSigned {
   string greeting = 2;
   uint64 shape_hash = 3;
   int64 signed_at = 4;
+  string park_token = 5;  // the resume key a park enabled server issues; empty when parking is off
 }
 
 // What the session stream carries. Signed is the first event; the stream's
@@ -91,6 +100,13 @@ message MainSessionEvent {
   oneof event {
     MainSigned signed = 1;
   }
+}
+
+// The resume call: the token names a parked row on the server's park
+// store, and a 0 expected_hash skips the shape check the way sign's does.
+message MainResumeRequest {
+  string park_token = 1;
+  uint64 expected_hash = 2;
 }
 
 message MainRunRequest {
@@ -131,6 +147,9 @@ service Sidekick {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(SidekickSignRequest) returns (stream SidekickSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(SidekickResumeRequest) returns (stream SidekickSessionEvent);
   rpc Double(SidekickDoubleRequest) returns (IntDemoErrorResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);
   rpc Break(BreakRequest) returns (BreakReply);
@@ -141,6 +160,9 @@ service Main {
   // then stays open and empty for as long as the instance lives. Ending the
   // stream, by close, by cancel, or by dying, ends the instance.
   rpc Session(MainSignRequest) returns (stream MainSessionEvent);
+  // A parked instance stood back up: the stream is once again the
+  // instance's life, and its first event carries the signature.
+  rpc Resume(MainResumeRequest) returns (stream MainSessionEvent);
   rpc Run(MainRunRequest) returns (IntDemoErrorResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);
   rpc Break(BreakRequest) returns (BreakReply);
