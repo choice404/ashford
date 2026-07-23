@@ -919,6 +919,19 @@ static char* store_sql_select(const AshSchemaDesc* s) {
     return q;
 }
 
+/* SELECT c0, c1, ... FROM table WHERE col=?1, the equality lookup by column. */
+static char* store_sql_select_eq(const AshSchemaDesc* s, uint32_t col) {
+    size_t need = 48 + strlen(s->table) + strlen(s->cols[col].name) + store_cols_span(s);
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT ");
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
+    snprintf(q + n, need - n, " FROM %s WHERE %s=?1", s->table, s->cols[col].name);
+    return q;
+}
+
 /* INSERT INTO table(c0, ...) VALUES(?, ...), every column bound positionally. */
 static char* store_sql_insert(const AshSchemaDesc* s) {
     size_t need = 48 + strlen(s->table) + store_cols_span(s) + (size_t)s->ncols * 3;
@@ -1013,6 +1026,34 @@ AshStatus ash_store_find(AshContract* c, const AshSchemaDesc* schema,
                 }
                 if (st == ASH_OK) st = store_ok(c, &opt, out);
             }
+        }
+        free(sql);
+        free(cts);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_query_eq(AshContract* c, const AshSchemaDesc* schema,
+                             uint32_t col, const AshValue* value,
+                             AshValue* out) {
+    if (!c || !schema || !value || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (schema->ncols == 0 || col >= schema->ncols) return ASH_ERR_TYPE;
+    if (value->ty != schema->cols[col].ty) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_select_eq(schema, col);
+        uint32_t* cts = store_col_types(schema);
+        if (!sql || !cts) {
+            st = ASH_ERR_OOM;
+        } else {
+            AshStoreAlloc alloc = { instance_store_bytes, c };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, value, 1, cts, NULL,
+                                 schema->ncols, &alloc, &rows);
+            if (st == ASH_OK) st = store_ok(c, &rows, out);
         }
         free(sql);
         free(cts);

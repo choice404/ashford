@@ -908,6 +908,32 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_option(t, row_ty), err_ty) }
     }
+    if str_eq(op, "query") {
+        // The second argument is a bare column name the checker already
+        // resolved to a real schema field, so it lowers to that field's
+        // declaration index, and the value lowers against the column's type.
+        a1e: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 1))
+        mut colidx: int64 = -1
+        mut col_ty: int64 = ty_unknown(t)
+        mut i: int64 = 0
+        while i < rs.len {
+            f: FieldSig = sig_field((*g).sigs, rs.off, i)
+            if f.name == a1e.a {
+                colidx = i
+                col_ty = f.ty
+            }
+            i = i + 1
+        }
+        if colidx < 0 {
+            cg_unsupported(g, e.lo, e.hi, "a Store.query on an unknown column")
+            return bad_val(g)
+        }
+        qval: CVal = gen_expr(g, cg_arg_expr(g, e, 2), col_ty)
+        callq: string = tmsg7(" = ash_store_query_eq(cc, ", schref, ", ", int_to_string(colidx), "u, &", qval.cvar, tmsg5(", &", out, ");", "", ""))
+        cg_line(g, tmsg3("AshStatus ", st, callq))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+    }
     if str_eq(op, "insert") {
         row: CVal = gen_expr(g, cg_arg_expr(g, e, 1), row_ty)
         call2: string = tmsg5(" = ash_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))

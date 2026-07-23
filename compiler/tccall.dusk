@@ -468,26 +468,21 @@ func is_store_ns(tc: *Tc, base_id: int64) -> bool {
     return g.kind != gk_contract()
 }
 
-// One Store.* operation: find, insert, update, or delete, each naming a schema
-// declared in the same contract. The first argument is the schema name, read as
-// a bare identifier rather than inferred as a value, and the rest are the key
-// and the row the operation binds. A row is the schema's record, so find yields
-// Result<Option<Row>, StoreError>, and the write forms yield Result<Unit,
-// StoreError>; a store failure rides that Result's Err, the surface's one new
-// value. query is the bound predicate form and lands in S2, so it is named as
-// not yet supported rather than guessed at.
+// One Store.* operation: find, query, insert, update, or delete, each naming a
+// schema declared in the same contract. The first argument is the schema name,
+// read as a bare identifier rather than inferred as a value, and the rest are
+// the key, column, or row the operation binds. A row is the schema's record, so
+// find yields Result<Option<Row>, StoreError>, query yields Result<List<Row>,
+// StoreError>, and the write forms yield Result<Unit, StoreError>; a store
+// failure rides that Result's Err, the surface's one new value. query binds one
+// column to one value with equality and answers every matching row; comparison
+// operators and conjunction are later steps.
 func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
     op: string = ast_name(a, mname)
     err_ty: int64 = ty_named(t, "StoreError")
-    if str_eq(op, "query") {
-        // The schema name is not a value, so the arguments are left un-inferred
-        // rather than faulted one by one for a form that lands in S2.
-        tc_emit(tc, e.lo, e.hi, "not yet supported: Store.query, the bound predicate form arrives in S2")
-        return ty_unknown(t)
-    }
-    if !str_eq(op, "find") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
+    if !str_eq(op, "find") && !str_eq(op, "query") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
         walk_args(tc, e.b, e.c)
         tc_emit(tc, e.lo, e.hi, tmsg3("Store has no operation '", op, "'"))
         return ty_unknown(t)
@@ -520,6 +515,39 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     mut pk_ty: int64 = ty_unknown(t)
     if rs.found {
         if rs.len > 0 { pk_ty = sig_field((*tc).sigs, rs.off, 0).ty }
+    }
+    if str_eq(op, "query") {
+        // query binds a column to a value: the count is checked first, then the
+        // second argument is read as a bare column name resolved against the
+        // schema, and the third is checked against that column's own type. The
+        // answer is every matching row, so the result carries a list.
+        if e.c != 3 {
+            tc_emit(tc, e.lo, e.hi, tmsg_count(tmsg3("Store.", op, " takes "), 3, tmsg_count(" arguments, got ", e.c, "")))
+        }
+        mut col_ty: int64 = ty_unknown(t)
+        if e.c >= 2 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            a1e: ExprNode = vec_get((*a).exprs, a1.expr)
+            if a1e.kind != xk_ident() {
+                tc_emit(tc, a1e.lo, a1e.hi, "the second argument of Store.query is a column name")
+            } else {
+                mut found_col: bool = false
+                mut i: int64 = 0
+                while i < rs.len {
+                    f: FieldSig = sig_field((*tc).sigs, rs.off, i)
+                    if f.name == a1e.a {
+                        col_ty = f.ty
+                        found_col = true
+                    }
+                    i = i + 1
+                }
+                if !found_col {
+                    tc_emit(tc, a1e.lo, a1e.hi, tmsg5("no column '", ast_name(a, a1e.a), "' in schema '", ast_name(a, sc.name), "'"))
+                }
+            }
+        }
+        check_store_arg(tc, e, 2, col_ty, "the value")
+        return ty_result(t, ty_list(t, row_ty), err_ty)
     }
     // The argument shapes per operation. The count is checked first, then each
     // trailing argument against the key or row type the schema fixes.

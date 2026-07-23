@@ -60,6 +60,24 @@ contract Ledger {
         }
     }
 
+    // The total an owner holds across every account: Store.query binds the owner
+    // column to the given name and answers every matching row, and the pledge
+    // folds their balances into one sum. An owner with no accounts is a clean
+    // Ok(0.0), the empty list a fold that never runs, and only a backend failure
+    // leaves this Result as Err(StoreFailed) for the status channel.
+    pledge owned_total(owner: String) -> Result<Float, LedgerError> {
+        return match Store.query(Accounts, owner, owner) {
+            Ok(rows) -> {
+                let mut sum = 0.0
+                for row in rows {
+                    sum = sum + row.balance
+                }
+                Ok(sum)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the

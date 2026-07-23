@@ -2,8 +2,9 @@
  * end to end. It loads the compiled Ledger module, signs it against a real
  * SQLite file mkstemp'd under target and unlinked at the end, and drives the
  * loose store pledges the milestone ships: open writes a row through
- * Store.insert, balance reads one back through Store.find, and set_balance
- * rewrites one through Store.update, each a Result whose Ok arm the primitive
+ * Store.insert, balance reads one back through Store.find, set_balance rewrites
+ * one through Store.update, and owned_total reads every row of one owner through
+ * Store.query and folds their balances, each a Result whose Ok arm the primitive
  * built. It pins the claims the roadmap fixes for S1. A fresh database file is
  * created and works, the schema reconciled into it at sign. A written row reads
  * back its value, and an update round trips. A missing account is
@@ -193,6 +194,31 @@ int main(void) {
         r = run(c, "balance", key1, 1);
         CHECK(ok_float(&r, &bal) && bal == 250.0,
               "the table survived the injection string");
+
+        /* Store.query over a non-key column: two accounts share the owner "ada"
+         * and a third holds "bob", so owned_total binds the owner column and
+         * folds only ada's rows into their sum, never bob's. An owner with no
+         * matching row is a clean Ok(0.0), the empty list a fold that never
+         * runs. */
+        AshValue open_ada1[3] = { int_val(10), str_val("ada"), float_val(40.0) };
+        r = run(c, "open", open_ada1, 3);
+        CHECK(ok_true(&r), "open ada account 10");
+        AshValue open_ada2[3] = { int_val(11), str_val("ada"), float_val(60.0) };
+        r = run(c, "open", open_ada2, 3);
+        CHECK(ok_true(&r), "open ada account 11");
+        AshValue open_bob[3] = { int_val(12), str_val("bob"), float_val(999.0) };
+        r = run(c, "open", open_bob, 3);
+        CHECK(ok_true(&r), "open bob account 12");
+
+        AshValue who_ada[1] = { str_val("ada") };
+        r = run(c, "owned_total", who_ada, 1);
+        CHECK(ok_float(&r, &bal) && bal == 100.0,
+              "owned_total of ada sums both her balances and excludes bob");
+
+        AshValue who_none[1] = { str_val("nobody") };
+        r = run(c, "owned_total", who_none, 1);
+        CHECK(ok_float(&r, &bal) && bal == 0.0,
+              "owned_total of an owner with no rows is Ok(0.0)");
 
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }

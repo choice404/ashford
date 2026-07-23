@@ -5,6 +5,34 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.5.1] the bound predicate
+
+The store surface reads sets. `Store.query(S, column, value)` answers every
+row whose column equals the value as `Result<List<Row>, StoreError>`, the
+column a bare name the checker resolves against the schema at compile time,
+the value checked against that column's declared type, and no rows an Ok of
+an empty list, never an error. One column, one equality, on purpose: the
+predicate a single equality cannot spell is composed in the pledge, and
+comparison, conjunction, and ordering stay on the leaves out list with
+their names on them.
+
+- resolve the column at compile time: the checker matches the bare name
+  against the schema's fields and refuses an unknown column, a non name in
+  column position, and a value whose type disagrees, each with a named
+  diagnostic; the resolved index rides into the emitted call, so no column
+  name is ever looked up at runtime
+- lower onto one runtime primitive: ash_store_query_eq builds the select
+  from the compiler owned schema descriptor with the value always bound as
+  a parameter, never concatenated, and materializes the rows as the
+  instance owned list of records every read already answers
+- walk the result in the language: the Ledger's owned_total pledge queries
+  by owner and folds the balances over the returned rows, record field
+  reads on a queried list, proven in the store gate against accounts that
+  share an owner and a stranger who owns nothing
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md: the
+  operation table carries query beside find, and the leaves out list
+  narrows to what equality cannot spell
+
 ## [v0.5.0] the one wire
 
 Ashford keeps no wire of its own. Inside one process the languages share

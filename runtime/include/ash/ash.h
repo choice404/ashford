@@ -444,13 +444,18 @@ AshStatus ash_value_render(const AshValue* v, char* buf, size_t cap,
  * rules stay values in its own error type and never reach this status.
  *
  * find looks one row up by primary key and lands Ok(Some(row)) or Ok(None).
- * insert adds one row from a record whose fields are the schema's columns in
- * order, and update replaces a keyed row's columns from the same shape; both
- * land Ok(Unit). delete removes a row by key and lands Ok(Unit). Every out is a
- * Result whose Ok arm the primitive builds; the Err arm is the surface's, never
- * reached here because a backend failure is the status, not a value. */
+ * query_eq reads every row whose named column equals one scalar value and lands
+ * Ok(list) with the rows in backend order. insert adds one row from a record
+ * whose fields are the schema's columns in order, and update replaces a keyed
+ * row's columns from the same shape; both land Ok(Unit). delete removes a row
+ * by key and lands Ok(Unit). Every out is a Result whose Ok arm the primitive
+ * builds; the Err arm is the surface's, never reached here because a backend
+ * failure is the status, not a value. */
 AshStatus ash_store_find(AshContract* c, const AshSchemaDesc* schema,
                          const AshValue* key, AshValue* out);
+AshStatus ash_store_query_eq(AshContract* c, const AshSchemaDesc* schema,
+                             uint32_t col, const AshValue* value,
+                             AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,
