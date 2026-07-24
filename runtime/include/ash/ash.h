@@ -477,6 +477,12 @@ typedef struct AshStoreTerm {
 AshStatus ash_store_query_where(AshContract* c, const AshSchemaDesc* schema,
                                 const AshStoreTerm* terms, uint32_t nterms,
                                 AshValue* out);
+/* query_where, with rows ordered by one schema column. order_desc is 0 for
+ * ascending and 1 for descending. */
+AshStatus ash_store_query_ordered(AshContract* c, const AshSchemaDesc* schema,
+                                  const AshStoreTerm* terms, uint32_t nterms,
+                                  uint32_t order_col, uint32_t order_desc,
+                                  AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

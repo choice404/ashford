@@ -93,6 +93,17 @@ static int ok_float(const AshValue* r, double* out) {
     return 1;
 }
 
+/* An Ok(String) result, compared against an expected C string byte for byte. */
+static int ok_str(const AshValue* r, const char* want) {
+    if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
+    const AshValue* p = (const AshValue*)r->as.box;
+    if (p->ty != ASH_TY_STRING) return 0;
+    size_t wl = strlen(want);
+    if ((size_t)p->as.s.len != wl) return 0;
+    if (wl == 0) return 1;
+    return memcmp(p->as.s.ptr, want, wl) == 0;
+}
+
 /* Whether a Result is an Err, the contract's own error surfacing as a value. */
 static int is_err(const AshValue* r) {
     return r->ty == ASH_TY_RESULT && r->tag == 1;
@@ -260,6 +271,27 @@ int main(void) {
         r = run(c, "owned_above", above_ada_hi, 2);
         CHECK(ok_float(&r, &bal) && bal == 0.0,
               "owned_above of ada at 1000 matches no row and is Ok(0.0)");
+
+        /* Store.query in its ordered form: a predicate then asc(column) or
+         * desc(column). The table holds 1/alice 250, 3/injection 5, 10/ada 40,
+         * 11/ada 60, and 12/bob 999. owners_asc(40.0) keeps every row at or
+         * above 40, orders them by ascending balance, 40 ada, 60 ada, 250 alice,
+         * 999 bob, and folds their owners into one string; owners_desc(40.0)
+         * folds them largest balance first. The balances are all distinct, so
+         * the order is total and the concatenation is exact. */
+        AshValue floor40[1] = { float_val(40.0) };
+        r = run(c, "owners_asc", floor40, 1);
+        CHECK(ok_str(&r, "adaadaalicebob"),
+              "owners_asc(40.0) folds owners by ascending balance");
+        r = run(c, "owners_desc", floor40, 1);
+        CHECK(ok_str(&r, "bobaliceadaada"),
+              "owners_desc(40.0) folds owners by descending balance");
+
+        /* A floor no account clears orders an empty list into Ok(""). */
+        AshValue floor_hi[1] = { float_val(100000.0) };
+        r = run(c, "owners_asc", floor_hi, 1);
+        CHECK(ok_str(&r, ""),
+              "owners_asc(100000.0) matches no row and is an ordered Ok(\"\")");
 
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }

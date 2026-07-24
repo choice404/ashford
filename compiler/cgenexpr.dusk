@@ -911,6 +911,34 @@ func cg_query_terms(g: *Cg, rs: RecSig, xid: int64, terms: *Vector<string>) -> v
     vec_push(terms, entry)
 }
 
+// Lowers a Store.query predicate into one AshStoreTerm array declaration and
+// returns the array's name beside its term count. Each comparison's value lands
+// in its own temporary through cg_query_terms, so the array's initializers hold
+// borrows into live values; the count rides back so the caller passes it to the
+// primitive it feeds.
+func cg_build_term_array(g: *Cg, rs: RecSig, xid: int64) -> (string, int64) {
+    terms: *Vector<string> = alloc(vec_new())
+    cg_query_terms(g, rs, xid, terms)
+    arr: string = cg_tmp(g)
+    line: *StringBuilder = alloc(sb_new())
+    sb_push(line, "AshStoreTerm ")
+    sb_push(line, arr)
+    sb_push(line, "[] = { ")
+    mut ti: int64 = 0
+    while ti < vec_len(terms) {
+        if ti > 0 { sb_push(line, ", ") }
+        sb_push(line, vec_get(terms, ti))
+        ti = ti + 1
+    }
+    sb_push(line, " };")
+    text: string = substring(sb_cstr(line), 0, sb_size(line))
+    sb_free(line)
+    free(line)
+    cg_line(g, text)
+    free(text)
+    return (arr, vec_len(terms))
+}
+
 // A Store.* operation lowered onto its runtime primitive. The schema name is a
 // bare identifier, resolved to the emitted descriptor entry and never lowered
 // as a value; the key and row lower against the types the schema fixes. The
@@ -977,6 +1005,45 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             cg_line(g, tmsg3("AshStatus ", st, callw))
             cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+        }
+        // The ordered form: a predicate then asc(column) or desc(column). The
+        // predicate lowers to the same term array the where form builds, the
+        // ordering column resolves to its declaration index, and the callee name
+        // fixes the direction, 0 ascending or 1 descending. The primitive answers
+        // every row the predicate accepts, ordered by that column.
+        if e.c == 3 {
+            a2oe: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 2))
+            if a2oe.kind == xk_call() {
+                ocn: ExprNode = vec_get((*a).exprs, a2oe.a)
+                if ocn.kind == xk_ident() {
+                    octext: string = ast_name(a, ocn.a)
+                    if str_eq(octext, "asc") || str_eq(octext, "desc") {
+                        arr2, nterms2 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+                        iarg: ArgNode = vec_get((*a).args, vec_get((*a).kids, a2oe.b))
+                        ie: ExprNode = vec_get((*a).exprs, iarg.expr)
+                        mut ordcol: int64 = -1
+                        mut oi: int64 = 0
+                        while oi < rs.len {
+                            f: FieldSig = sig_field((*g).sigs, rs.off, oi)
+                            if f.name == ie.a { ordcol = oi }
+                            oi = oi + 1
+                        }
+                        if ordcol < 0 {
+                            cg_unsupported(g, e.lo, e.hi, "a Store.query ordered by an unknown column")
+                            return bad_val(g)
+                        }
+                        mut descflag: string = "0u"
+                        if str_eq(octext, "desc") { descflag = "1u" }
+                        nterms_s: string = tmsg2(int_to_string(nterms2), "u, ")
+                        ordcol_s: string = tmsg2(int_to_string(ordcol), "u, ")
+                        tail: string = tmsg5(descflag, ", &", out, ");", "")
+                        callo: string = tmsg7(" = ash_store_query_ordered(cc, ", schref, ", ", arr2, ", ", nterms_s, tmsg2(ordcol_s, tail))
+                        cg_line(g, tmsg3("AshStatus ", st, callo))
+                        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+                        return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+                    }
+                }
+            }
         }
         // The second argument is a bare column name the checker already
         // resolved to a real schema field, so it lowers to that field's

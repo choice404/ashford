@@ -13,6 +13,8 @@
 //   Store.find(S, key)             -> Result<Option<Row>, StoreError>
 //   Store.query(S, column, value)  -> Result<List<Row>, StoreError>
 //   Store.query(S, predicate)      -> Result<List<Row>, StoreError>
+//   Store.query(S, predicate, asc(column))  -> Result<List<Row>, StoreError>
+//   Store.query(S, predicate, desc(column)) -> Result<List<Row>, StoreError>
 //   Store.insert(S, row)           -> Result<Unit, StoreError>
 //   Store.update(S, key, row)      -> Result<Unit, StoreError>
 //   Store.delete(S, key)           -> Result<Unit, StoreError>
@@ -24,7 +26,11 @@
 // comparison tests a column with ==, !=, <, <=, >, or >= against a value.
 // Every comparison names its column on the left as a bare name resolved against
 // the schema at compile time, never a value, and query answers every row the
-// whole predicate accepts. Every operation returns a Result so a store failure
+// whole predicate accepts. A third argument orders those rows: asc(column) sorts
+// them by the named column ascending and desc(column) descending. asc and desc
+// are reserved suffixes in the third argument position, not values and not
+// functions, and the column they wrap is a bare name resolved against the schema
+// at compile time the same way a comparison's column is. Every operation returns a Result so a store failure
 // is a value in the surface's own error type. The
 // backend failing the runtime, a connection lost, a disk with no room, a
 // constraint the backend refused, rides back as the ASH_ERR_STORE status

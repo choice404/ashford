@@ -531,6 +531,38 @@ func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64) -> void {
     tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with &&")
 }
 
+// The third argument of the ordered Store.query, asc(column) or desc(column):
+// a call to asc or desc naming exactly one bare column resolved against the
+// schema, never a value. The column drives the order the runtime primitive
+// applies and the callee name drives its direction, so the argument is read the
+// way the predicate's own columns are, at compile time and never inferred.
+func check_query_order(tc: *Tc, rs: RecSig, sname: int64, callid: int64) -> void {
+    a: *Ast = (*tc).ast
+    ce: ExprNode = vec_get((*a).exprs, callid)
+    cn: ExprNode = vec_get((*a).exprs, ce.a)
+    opname: string = ast_name(a, cn.a)
+    if ce.c != 1 {
+        tc_emit(tc, ce.lo, ce.hi, tmsg3("the argument of ", opname, " is a column name"))
+        return
+    }
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, ce.b))
+    ae: ExprNode = vec_get((*a).exprs, arg.expr)
+    if ae.kind != xk_ident() {
+        tc_emit(tc, ae.lo, ae.hi, tmsg3("the argument of ", opname, " is a column name"))
+        return
+    }
+    mut found_col: bool = false
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*tc).sigs, rs.off, i)
+        if f.name == ae.a { found_col = true }
+        i = i + 1
+    }
+    if !found_col {
+        tc_emit(tc, ae.lo, ae.hi, tmsg5("no column '", ast_name(a, ae.a), "' in schema '", ast_name(a, sname), "'"))
+    }
+}
+
 // One Store.* operation: find, query, insert, update, or delete, each naming a
 // schema declared in the same contract. The first argument is the schema name,
 // read as a bare identifier rather than inferred as a value, and the rest are
@@ -590,6 +622,36 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
             a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
             check_query_pred(tc, rs, sc.name, a1.expr)
             return ty_result(t, ty_list(t, row_ty), err_ty)
+        }
+        // The ordered form: a predicate, then asc(column) or desc(column). It is
+        // chosen when the third argument is that ordering call, or when the
+        // second argument is a predicate rather than the equality form's bare
+        // column, so a comparison in the second slot never falls back to the
+        // equality shape it cannot be. The predicate walks the same check the two
+        // argument form does, a lone comparison a predicate of one, and the third
+        // argument names the ordering column against the schema.
+        if e.c == 3 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            a1e: ExprNode = vec_get((*a).exprs, a1.expr)
+            a2: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 2))
+            a2e: ExprNode = vec_get((*a).exprs, a2.expr)
+            mut a2_order: bool = false
+            if a2e.kind == xk_call() {
+                occ: ExprNode = vec_get((*a).exprs, a2e.a)
+                if occ.kind == xk_ident() {
+                    octext: string = ast_name(a, occ.a)
+                    if str_eq(octext, "asc") || str_eq(octext, "desc") { a2_order = true }
+                }
+            }
+            if a2_order || a1e.kind != xk_ident() {
+                check_query_pred(tc, rs, sc.name, a1.expr)
+                if a2_order {
+                    check_query_order(tc, rs, sc.name, a2.expr)
+                } else {
+                    tc_emit(tc, a2e.lo, a2e.hi, "the third argument of Store.query is asc(column) or desc(column)")
+                }
+                return ty_result(t, ty_list(t, row_ty), err_ty)
+            }
         }
         // query binds a column to a value: the count is checked first, then the
         // second argument is read as a bare column name resolved against the

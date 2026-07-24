@@ -5,6 +5,37 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.5.4] the ordered read
+
+The query surface answers in order. A trailing `asc(column)` or
+`desc(column)` on the predicate form of `Store.query` orders the matching
+rows by one column before they come back: the column is a bare name the
+checker resolves against the schema at compile time, `asc` and `desc` are
+reserved spellings in that position and nowhere else, and the order rides
+the same prepared statement as the predicate, one ORDER BY on the select
+the schema descriptor already builds. An empty set comes back ordered the
+same as ever, an Ok of an empty list. Disjunction, negation, aggregation,
+and a row limit stay on the leaves out list with their names on them.
+
+- check the order where the schema lives: the third argument dispatches on
+  asc or desc by name, a call that is neither, an argument that is not a
+  bare column name, and a column the schema does not carry are each
+  refused with a named diagnostic, and the equality and predicate forms
+  stay byte for byte what they were
+- lower onto one runtime primitive: ash_store_query_ordered takes the
+  terms of the predicate plus a column index and a direction, appends
+  ORDER BY with the name from the compiler owned schema descriptor and the
+  direction from a two word table, and binds every value as a parameter,
+  never concatenated
+- walk both directions in the gate: owners_asc and owners_desc fold the
+  owner names over the ordered rows, proven against a table whose balances
+  are all distinct so the order is total, and an empty match answers the
+  empty string
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  the ordered form joins the operation table, asc and desc are named as
+  reserved in the third position, and the leaves out list narrows to what
+  one ordered conjunction cannot spell
+
 ## [v0.5.3] the composed predicate
 
 The query surface composes. `Store.query(S, predicate)` takes comparisons,

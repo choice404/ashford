@@ -117,6 +117,44 @@ contract Ledger {
         }
     }
 
+    // The owners of every account at or above a floor, listed by ascending
+    // balance: Store.query reads the ordered form, the balance column cleared
+    // against the floor with '>=' and asc(balance) fixing the order, and the
+    // pledge folds the owners of the returned rows into one string in that
+    // order. asc names the balance column as a bare name resolved against the
+    // schema, never a value, the way every column in a query is. A floor no
+    // account clears is a clean Ok(""), the empty list a fold that never runs,
+    // and only a backend failure leaves this Result as Err(StoreFailed).
+    pledge owners_asc(min: Float) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, balance >= min, asc(balance)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // The same owners listed by descending balance: Store.query reads the
+    // ordered form with desc(balance), so the rows arrive largest balance first
+    // and the pledge folds their owners into one string in that order. The only
+    // change from owners_asc is the direction the third argument names.
+    pledge owners_desc(min: Float) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, balance >= min, desc(balance)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the
