@@ -128,11 +128,15 @@ make test-grpc-go
 make test-grpc-node
 ```
 
-A session survives more than its connection. A server started with a park store writes an instance down when its stream ends, the vows, the latches, the error payloads, and the transactional fates in one row, and a `Resume` call stands it back up under the token the signature carried, one shot. The gate kills the server between the park and the resume and finishes the contract on a fresh server holding the same store, which is the partition and replica story in one run:
+A session survives more than its connection. A server started with a park store writes an instance down when its stream ends, the vows, the latches, the error payloads, and the transactional fates in one row, and a `Resume` call stands it back up under the token the signature carried, one shot. The gate kills the server between the park and the resume and finishes the contract on a fresh server holding the same store, which is the partition and replica story in one run. The one shot holds across replicas too: two servers can share one park store, the row's delete is the claim, and when both race the same token exactly one wins and the other answers not found:
 
 ```sh
 # park, kill the server, resume on a fresh one, finish the contract
 make test-grpc-resume
+
+# two replicas, one park store: kill one mid session, resume on the other,
+# then race both for a single token and demand exactly one winner
+make test-grpc-failover
 ```
 
 The same contracts run backed by a database. A contract declares the table shape it needs as a `schema`, a vow like any other that locks at sign, binds a live database through a `dsn` vow, and its pledges read and write rows through the store standard library. A group of writes that must all land or all vanish is a `transactional` subcontract, the unit the language already had for all-or-nothing, so a transfer is a modifier and not a new idea. The database sits behind the contract, not in front of the host: the store is invisible across the C ABI, so a host signs, fulfills, and breaks a store-backed contract with the same calls it always used, and the storage never shows through. The reference backend is SQLite, vendored as the amalgamation and compiled into `libashrt`, so the store gates are hermetic and need no server. [docs/database.md](docs/database.md) is the normative store design.

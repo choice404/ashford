@@ -53,7 +53,7 @@ MODULE_LIFE := $(OUT)/liblifecycle.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, and the store, with
@@ -603,6 +603,56 @@ test-grpc-resume: $(RT_SO) $(MODULE_PAY)
 	kill $$srv 2>/dev/null; wait $$srv 2>/dev/null; \
 	rm -f "$$parkdb"; \
 	if [ $$code -eq 0 ]; then echo "[test-grpc-resume] ok"; fi; \
+	exit $$code
+
+# The failover gate: two replicas, one park store, and the claim that makes
+# them honest. Replica A parks a session and dies by SIGKILL, replica B
+# resumes it on nothing but the shared store, which is the affinity answer
+# proven with the failed half actually failed. Then the sharper question: a
+# second session parks, A comes back, and both replicas race one Resume for
+# the same token at the same moment. The DELETE is the claim, so exactly one
+# wins and the loser answers NOT_FOUND, the same answer a spent token earns.
+# Out of the all gate beside the other gRPC gates, skipping clean without
+# grpcio.
+test-grpc-failover: $(RT_SO) $(MODULE_PAY)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-grpc-failover] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	mkdir -p $(GRPC_GEN); \
+	$$py -m grpc_tools.protoc -I interop/grpc \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    $(GRPC_PROTO) || exit 1; \
+	parkdb=$$(mktemp target/ashparkgrpc_XXXXXX); \
+	$$py interop/grpc/bridge_server.py --port 50257 --park-dsn "$$parkdb" & \
+	srva=$$!; \
+	$$py interop/grpc/bridge_server.py --port 50258 --park-dsn "$$parkdb" & \
+	srvb=$$!; \
+	trap 'kill -9 $$srva $$srvb 2>/dev/null; wait $$srva $$srvb 2>/dev/null; rm -f "$$parkdb"' EXIT INT TERM; \
+	token=$$($$py interop/grpc/bridge_client.py --port 50257 --park-walk | tail -n 1); \
+	if [ -z "$$token" ]; then \
+	    echo "[test-grpc-failover] the park walk on replica A failed"; \
+	    exit 1; \
+	fi; \
+	kill -9 $$srva 2>/dev/null; wait $$srva 2>/dev/null; \
+	$$py interop/grpc/bridge_client.py --port 50258 --resume-walk "$$token" || exit 1; \
+	token2=$$($$py interop/grpc/bridge_client.py --port 50258 --park-walk | tail -n 1); \
+	if [ -z "$$token2" ]; then \
+	    echo "[test-grpc-failover] the park walk on replica B failed"; \
+	    exit 1; \
+	fi; \
+	$$py interop/grpc/bridge_server.py --port 50257 --park-dsn "$$parkdb" & \
+	srva=$$!; \
+	$$py interop/grpc/bridge_client.py --port 50257 --peer-port 50258 --race-resume "$$token2"; \
+	code=$$?; \
+	if [ $$code -eq 0 ]; then echo "[test-grpc-failover] ok"; fi; \
 	exit $$code
 
 # The Node twin of the Go gate: the same server, driven by a client whose

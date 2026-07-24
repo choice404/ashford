@@ -581,3 +581,51 @@ emitted surface carries the whole story now, park_token on the signature,
 ResumeRequest, and the Resume rpc, with the Go and TypeScript wrappers
 growing a resume opener whose shape is the open they already had, so a
 consumer that survived this file's earlier steps learns one new verb.
+
+# The gRPC bridge, step 3b: the second server
+
+## The second server
+
+Step 3 parked an instance, killed its server, and resumed it on another. That
+proved a parked session outlives its process, but it left one question standing:
+if two servers share one park store, who owns a token when both reach for it at
+once.
+
+The answer is that the delete is the claim. `Resume` already stands the instance
+up and then deletes its store row, one shot. With one server that delete was
+bookkeeping, the row was spent and nobody else could see it. With two servers
+the same statement becomes an election. The delete reports how many rows it
+removed, and the server whose delete removed one owns the instance. The server
+whose delete removed zero was beaten to the row, and it knows so the moment the
+statement returns.
+
+The race window is narrow and it is real: both servers can call the runtime's
+resume and both can materialize an instance from the same row before either has
+deleted it, because reading the row and deleting it are two steps and nothing
+outside the store serializes two processes. So the design does not try to stop
+both from standing up. It lets both stand up and makes the delete decide, and
+because a delete against a row another process already removed removes nothing,
+exactly one of the two can win no matter how the two interleave. The loser
+breaks the copy it just built and answers NOT_FOUND, which is the same answer a
+spent or unknown token gets, and correctly so: a token another server has
+already claimed is spent from where the loser stands.
+
+The claim comes after the resume, not before, and that is what keeps the error
+semantics the earlier steps built. An unknown token has no row, the runtime's
+resume fails on it, and the client gets NOT_FOUND before any delete runs. A
+lying hash is refused by the runtime's resume for a shape that disagrees, and
+that refusal also lands before the store is touched, so it stays ABORTED. Both
+of the failures that must precede the store still precede it; the delete only
+arbitrates between two servers that both got a real instance out of a real row.
+The in process `_resume_lock` still stands, so within one server two resumes of
+one token still serialize as before. The store election is only for the case one
+lock cannot see, two servers.
+
+The honest cost is a wasted stand up. The loser reads the row, calls the
+runtime, builds a live instance, and then breaks it, all to discover it lost. It
+paid for an instance it never served. That is bounded, one wasted stand up per
+lost race, and rare, only when two servers resume one token in the same narrow
+window, which is not the normal path. It buys statelessness between replicas:
+there is no lease to renew, no fencing token to check, no registry of who holds
+what. The store file is the only thing two servers share, and the delete is the
+only word they exchange.

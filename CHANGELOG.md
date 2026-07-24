@@ -5,6 +5,38 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.5.2] the claimed row
+
+Two servers, one park store, one owner per token. v0.4.0 proved a parked
+session outlives its server; this milestone proves it outlives its server
+while another replica is already standing, and settles who owns a token
+when both reach for it at once. The delete is the claim: Resume stands the
+instance up and then deletes its row, the delete reports how many rows it
+removed, and only the replica whose delete removed one keeps the instance.
+The loser breaks the copy it built and answers NOT_FOUND, the same answer
+a spent token earns, because a token another replica claimed is spent from
+where the loser stands. No lease, no fencing, no registry: the store file
+is the only thing replicas share, and the delete is the only word they
+exchange.
+
+- make the delete the cross process claim in the bridge server: Resume
+  keeps its order, the runtime resume first and the delete second, so an
+  unknown token stays NOT_FOUND and a lying hash stays ABORTED before the
+  store is ever touched, and the rowcount now arbitrates between replicas
+  that both stood a copy up
+- pay the loser's cost honestly: a lost race is one wasted stand up, the
+  instance built, broken, and never served, bounded to the narrow window
+  where two replicas resume one token at the same moment
+- race it for real in the client: --race-resume fires Resume at two
+  servers behind one barrier, demands exactly one signed session and one
+  NOT_FOUND, and finishes the parked walk on the winner
+- gate the whole claim: test-grpc-failover stands two replicas on one
+  store, parks on the first, kills it with SIGKILL, resumes on the second,
+  then parks again, restarts the dead one, and races both for the token
+- write the replica story down where it lives: docs/bridge.md carries the
+  claim beside park and resume, interop/grpc/NOTES.md carries the step 3b
+  findings, and the README names the failover gate
+
 ## [v0.5.1] the bound predicate
 
 The store surface reads sets. `Store.query(S, column, value)` answers every

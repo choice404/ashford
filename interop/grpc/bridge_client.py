@@ -32,9 +32,11 @@ Exit status 0 means every check below held.
 """
 
 import argparse
+from concurrent import futures
 import string
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -177,6 +179,88 @@ def resume_walk(stub, token):
 
     check(wait_for_live(stub, 0, 5.0) is not None,
           "closing the resumed stream dropped its row")
+
+
+def race_resume(token, port, peer_port):
+    """Races two servers against the same parked token. One stream should
+    stand the contract up, and the other should see the sqlite DELETE already
+    spent by its peer."""
+    ch = grpc.insecure_channel(f"127.0.0.1:{port}")
+    peer_ch = grpc.insecure_channel(f"127.0.0.1:{peer_port}")
+    channels = (ch, peer_ch)
+    sessions = []
+    try:
+        for channel in channels:
+            grpc.channel_ready_future(channel).result(timeout=10)
+
+        stub = pb_grpc.PaymentServiceStub(ch)
+        peer_stub = pb_grpc.PaymentServiceStub(peer_ch)
+        barrier = threading.Barrier(2)
+
+        def attempt(one_stub):
+            barrier.wait()
+            try:
+                return Session(one_stub,
+                               pb.ResumeRequest(park_token=token),
+                               one_stub.Resume)
+            except grpc.RpcError as e:
+                return e
+
+        with futures.ThreadPoolExecutor(max_workers=2) as pool:
+            future = pool.submit(attempt, stub)
+            peer_future = pool.submit(attempt, peer_stub)
+            results = ((stub, future.result()),
+                       (peer_stub, peer_future.result()))
+
+        winners = [(one_stub, result) for one_stub, result in results
+                   if isinstance(result, Session)]
+        losers = [result for _, result in results
+                  if isinstance(result, grpc.RpcError)]
+        sessions = [result for _, result in results
+                    if isinstance(result, Session)]
+        check(len(winners) == 1 and len(losers) == 1 and
+              losers[0].code() == grpc.StatusCode.NOT_FOUND,
+              "exactly one replica claimed the park token")
+        if len(winners) != 1:
+            return
+
+        winner_stub, session = winners[0]
+        iid = session.instance_id
+        out = winner_stub.ValidateAmount(
+            pb.ValidateAmountRequest(instance_id=iid, amount=25.0))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the raced validation fulfilled")
+        partial = winner_stub.GetPartial(pb.PartialRequest(instance_id=iid))
+        check(partial.state == pb.PARTIAL and
+              list(partial.fulfilled) == ["Validation"],
+              "the raced validate_card latch crossed park and resume")
+
+        out = winner_stub.Charge(pb.ChargeRequest(instance_id=iid,
+                                                  card="4111 1111",
+                                                  amount=25.0))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the raced charge fulfilled")
+        out = winner_stub.NotifyUser(
+            pb.NotifyUserRequest(instance_id=iid, ok=True))
+        check(out.WhichOneof("result") == "ok" and out.ok is True,
+              "the raced notify_user fulfilled")
+        partial = winner_stub.GetPartial(pb.PartialRequest(instance_id=iid))
+        check(partial.state == pb.FULFILLED,
+              "the raced instance fulfilled")
+
+        session.close()
+        sessions.remove(session)
+        check(wait_for_live(winner_stub, 0, 5.0) is not None,
+              "closing the raced stream dropped its row")
+    except grpc.FutureTimeoutError:
+        print("[bridge_client] FAIL: server never came up", file=sys.stderr)
+        global _failures
+        _failures = 1
+    finally:
+        for session in sessions:
+            session.close()
+        for channel in channels:
+            channel.close()
 
 
 def walk(stub, legacy_ttl, port):
@@ -407,17 +491,27 @@ def main():
     ap.add_argument("--legacy-ttl", type=float, default=2.0,
                     help="the idle timer step 1's server ran, kept only as "
                          "the yardstick the new checks are measured against")
+    ap.add_argument("--peer-port", type=int, default=50258,
+                    help="the second server port for --race-resume")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--park-walk", action="store_true",
                       help="park one partly progressed session and print its token")
     mode.add_argument("--resume-walk", metavar="TOKEN",
                       help="resume TOKEN and finish its parked walk")
+    mode.add_argument("--race-resume", metavar="TOKEN",
+                      help="race two servers to resume TOKEN")
     mode.add_argument("--hold-session", action="store_true",
                       help="internal: open a session and hold it until killed")
     args = ap.parse_args()
 
     if args.hold_session:
         return hold_session(args.port, "EUR")
+    if args.race_resume:
+        race_resume(args.race_resume, args.port, args.peer_port)
+        if _failures:
+            return 1
+        print("[bridge_client] ok")
+        return 0
 
     with grpc.insecure_channel(f"127.0.0.1:{args.port}") as ch:
         try:

@@ -299,9 +299,11 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
             self.end_session(iid, "handler exit")
 
     def Resume(self, request, context):
-        """Stand one parked instance back up, consume its store row, and hold
-        its new session stream. The same token is kept so the next stream
-        termination parks the same session name again."""
+        """Stand one parked instance back up, claim its store row with the
+        DELETE, and hold its new session stream. The DELETE is the one shot
+        claim, including across replicas sharing the same park store. The
+        same token is kept so the next stream termination parks the same
+        session name again."""
         if not self._park_dsn:
             context.abort(grpc.StatusCode.FAILED_PRECONDITION,
                           "server runs without a park store")
@@ -311,8 +313,17 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
                 c = self._rt.resume(self._park_dsn, request.park_token,
                                     request.expected_hash)
                 with sqlite3.connect(self._park_dsn) as db:
-                    db.execute("DELETE FROM ash_park WHERE pkey = ?",
-                               (request.park_token.encode(),))
+                    cur = db.execute("DELETE FROM ash_park WHERE pkey = ?",
+                                     (request.park_token.encode(),))
+                if cur.rowcount == 0:
+                    try:
+                        c.break_()
+                    except AshError as e:
+                        if e.status != ASH_ERR_STATE:
+                            raise
+                    context.abort(
+                        grpc.StatusCode.NOT_FOUND,
+                        "park token was claimed by another replica")
                 inst = self._table.insert(c, request.park_token)
             except AshError as e:
                 _abort(context, e)
