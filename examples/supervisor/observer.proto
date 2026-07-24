@@ -1,0 +1,30 @@
+// The observer is the host's surface, not the contract's. state is the
+// contract's state name, and crashes is the store's answer.
+syntax = "proto3";
+package supervisor;
+
+service SupervisorObserver {
+  rpc ListServices(ListRequest) returns (ServiceList);
+  rpc GetService(GetRequest) returns (ServiceDetail);
+}
+
+message ListRequest {}
+
+message ServiceRow {
+  string name = 1;
+  string state = 2;
+  int64 pid = 3;
+  int64 run = 4;
+  int64 crashes = 5;
+}
+
+message ServiceList { repeated ServiceRow services = 1; }
+
+message GetRequest { string name = 1; }
+
+message ServiceDetail {
+  ServiceRow row = 1;
+  repeated string fulfilled = 2;
+  repeated string pending = 3;
+  repeated string broken = 4;
+}

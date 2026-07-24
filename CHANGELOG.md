@@ -5,6 +5,39 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.2] the watched service
+
+The supervisor answers questions from outside its process. With
+--grpc PORT it serves a small read only observer surface, two rpcs of its
+own and deliberately not the emitted contract surface, because an
+observer must not be able to sign, fulfill, or break anything. What
+crosses is the diagnosis the contract already keeps: the state name, the
+partial name lists, and the crash count off the Runs table, which is the
+argument the example exists to make, that a contract's lifecycle is worth
+watching because it is the service's own truth and not a status flag the
+host remembered to set.
+
+- serve the host's surface, not the contract's: observer.proto declares
+  ListServices and GetService, the supervisor serves them beside its poll
+  loop when asked and not a line of grpc otherwise, and the emitted
+  bridge surface stays unserved on purpose, with the reason written where
+  the flag is
+- keep the loop honest under readers: one lock guards the service tables
+  and only the tables, taken around snapshots and mutations and never
+  around a fulfillment or a bind callback, so a remote read can never
+  deadlock the runtime against its own host
+- read the diagnosis, not a cache: every row is the contract's answer at
+  the moment of the call, state_name off the instance, the partial names
+  off the partial surface, and the crash count through the same short
+  lived observer instance the restart budget uses
+- watch it from the outside: watch.py lists the services and details one,
+  one line per service and three name lists, and an unknown name is
+  NOT_FOUND with a nonzero exit
+- gate the whole read: test-supervisor-watch stands two services up, one
+  already through a crash and a restart, asserts the list and the detail
+  from another process, including the pending crashes pledge the partial
+  surface honestly names, and skips clean without grpcio
+
 ## [v0.6.1] the bounded read
 
 The query surface takes a bound. A trailing `limit(count)` after the

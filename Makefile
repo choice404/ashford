@@ -54,7 +54,7 @@ MODULE_SVC := $(OUT)/libservice.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover test-supervisor tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover test-supervisor test-supervisor-watch tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, and the store, with
@@ -357,6 +357,31 @@ test-supervisor: $(RT_SO) $(MODULE_SVC)
 	else \
 	    echo "[test-supervisor] python3 not found, skipping"; \
 	fi
+
+# The observer half of the flagship: a remote client watching the services
+# over the supervisor's own read-only surface. Deliberately not the emitted
+# contract surface: an observer must not be able to sign, fulfill, or break
+# anything, so the supervisor serves its own two rpcs and the contract's
+# diagnosis rides them, the state name, the partial name lists, and the
+# crash count off the store. Skips clean without grpcio like the bridge
+# gates.
+test-supervisor-watch: $(RT_SO) $(MODULE_SVC)
+	@py=""; \
+	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="$(GRPCVENV)/bin/python"; \
+	elif command -v python3 >/dev/null 2>&1 && \
+	     python3 -c "import grpc, grpc_tools" 2>/dev/null; then \
+	    py="python3"; \
+	fi; \
+	if [ -z "$$py" ]; then \
+	    echo "[test-supervisor-watch] grpcio not found, skipping (make grpc-venv)"; \
+	    exit 0; \
+	fi; \
+	mkdir -p $(GRPC_GEN); \
+	$$py -m grpc_tools.protoc -I examples/supervisor \
+	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
+	    examples/supervisor/observer.proto || exit 1; \
+	$$py examples/supervisor/test_watch.py
 
 test-python: $(RT_SO) $(MODULE) $(MODULE_PAY)
 	@if command -v python3 >/dev/null 2>&1; then \

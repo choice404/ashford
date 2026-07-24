@@ -160,6 +160,10 @@ The pieces compose into a working program. [examples/supervisor](examples/superv
 # two services up, one crashes into its budget, one survives a supervisor
 # restart through the park store and stops clean into Fulfilled
 make test-supervisor
+
+# the same services watched from another process over the supervisor's
+# read only observer surface: state, partial names, crash count
+make test-supervisor-watch
 ```
 
 ## Status

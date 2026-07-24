@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -47,6 +48,7 @@ class Supervisor:
         self.poll = poll
         self.running = {}
         self.starting = {}
+        self._runs_lock = threading.Lock()
         self._next_run = time.time_ns()
         self.park_requested = False
         self.stop_requested = False
@@ -87,7 +89,8 @@ class Supervisor:
     def bind_start(self, contract, _args):
         """Spawn only when the contract crosses its host-bound start pledge."""
         name = contract.vow("name")
-        run = self.starting.get(name)
+        with self._runs_lock:
+            run = self.starting.get(name)
         if run is None:
             return Err(-1)
         try:
@@ -104,7 +107,8 @@ class Supervisor:
 
     def bind_ready(self, contract, _args):
         """Health is intentionally boring here: a live pid is first pass."""
-        run = self.starting.get(contract.vow("name"))
+        with self._runs_lock:
+            run = self.starting.get(contract.vow("name"))
         if run is not None and self.alive(run.pid):
             return Ok(True)
         return Err(-1)
@@ -150,7 +154,8 @@ class Supervisor:
             "Service", vows={"name": name, "cmd": command, "dsn": self.dsn}
         )
         run = Run(name, command, contract, self.issue_run_id())
-        self.starting[name] = run
+        with self._runs_lock:
+            self.starting[name] = run
         try:
             started = contract.fulfill_sync("start")
             if not isinstance(started, Ok) or run.pid is None:
@@ -166,8 +171,10 @@ class Supervisor:
                 run.process.terminate()
             raise
         finally:
-            self.starting.pop(name, None)
-        self.running[name] = run
+            with self._runs_lock:
+                self.starting.pop(name, None)
+        with self._runs_lock:
+            self.running[name] = run
         return run
 
     def resume_or_start(self, name, command, resume):
@@ -183,7 +190,8 @@ class Supervisor:
         if saved is not None and self.alive(saved[0]):
             run = Run(name, command, contract, saved[1])
             run.pid = saved[0]
-            self.running[name] = run
+            with self._runs_lock:
+                self.running[name] = run
             print(f"[supervisor] resumed {name} pid {run.pid}", flush=True)
             return run
 
@@ -214,7 +222,8 @@ class Supervisor:
         return None
 
     def handle_dead(self, name, run):
-        self.running.pop(name, None)
+        with self._runs_lock:
+            self.running.pop(name, None)
         code = self.exit_code(run)
         if code is None:
             return
@@ -231,7 +240,9 @@ class Supervisor:
         self.restart_or_giveup(name, run.command, run, count)
 
     def poll_once(self):
-        for name, run in list(self.running.items()):
+        with self._runs_lock:
+            runs = list(self.running.items())
+        for name, run in runs:
             # A child that has exited but has not been reaped is a zombie;
             # kill(pid, 0) still says it exists. Popen.poll is the required
             # waitpid(WNOHANG) path for children this host owns.
@@ -240,13 +251,18 @@ class Supervisor:
                 self.handle_dead(name, run)
 
     def park_all(self):
-        for name, run in list(self.running.items()):
+        with self._runs_lock:
+            runs = list(self.running.items())
+        for name, run in runs:
             run.contract.park(self.dsn, name)
             print(f"[supervisor] parked {name}", flush=True)
-        self.running.clear()
+        with self._runs_lock:
+            self.running.clear()
 
     def stop_all(self):
-        for name, run in list(self.running.items()):
+        with self._runs_lock:
+            runs = list(self.running.items())
+        for name, run in runs:
             if self.alive(run.pid):
                 try:
                     os.kill(run.pid, signal.SIGTERM)
@@ -269,10 +285,15 @@ class Supervisor:
                 self.pidfile(name).unlink()
             except FileNotFoundError:
                 pass
-        self.running.clear()
+        with self._runs_lock:
+            self.running.clear()
 
     def loop(self):
-        while self.running:
+        while True:
+            with self._runs_lock:
+                has_running = bool(self.running)
+            if not has_running:
+                return
             if self.stop_requested:
                 self.stop_all()
                 return
@@ -280,8 +301,81 @@ class Supervisor:
                 self.park_all()
                 return
             self.poll_once()
-            if self.running:
+            with self._runs_lock:
+                has_running = bool(self.running)
+            if has_running:
                 time.sleep(self.poll)
+
+
+class GrpcUnavailable(RuntimeError):
+    """Separates an optional observer dependency from supervisor failures."""
+
+
+def observer_modules():
+    """Loads the optional observer only when its command line asks for it."""
+    try:
+        import grpc
+    except ImportError as error:
+        raise GrpcUnavailable("--grpc requires grpcio") from error
+    grpc_gen = ROOT / "target" / "grpc-gen"
+    sys.path.insert(0, str(grpc_gen))
+    try:
+        import observer_pb2 as pb
+        import observer_pb2_grpc as pb_grpc
+    except ImportError as error:
+        raise RuntimeError(
+            "--grpc requires generated observer stubs in target/grpc-gen"
+        ) from error
+    return grpc, pb, pb_grpc
+
+
+def start_observer(supervisor, port, grpc, pb, pb_grpc):
+    """Serves host facts without lending clients a contract handle.
+
+    The table lock only takes a stable set of Run objects. Contract reads and
+    the store-backed crash observer happen afterwards, because the runtime
+    serializes each instance and a callback must never wait on this lock.
+    """
+    from concurrent import futures
+
+    class Observer(pb_grpc.SupervisorObserverServicer):
+        def _run(self, name, context):
+            with supervisor._runs_lock:
+                run = supervisor.running.get(name)
+            if run is None:
+                context.abort(grpc.StatusCode.NOT_FOUND,
+                              f"unknown service {name}")
+            return run
+
+        @staticmethod
+        def _row(run):
+            saved = supervisor.read_pidfile(run.name)
+            pid = saved[0] if saved is not None else 0
+            return pb.ServiceRow(name=run.name,
+                                 state=run.contract.state_name().title(),
+                                 pid=pid,
+                                 run=run.run_id,
+                                 crashes=supervisor.crashes(run))
+
+        def ListServices(self, _request, _context):
+            with supervisor._runs_lock:
+                runs = list(supervisor.running.values())
+            return pb.ServiceList(services=[self._row(run) for run in runs])
+
+        def GetService(self, request, context):
+            run = self._run(request.name, context)
+            partial = run.contract.partial()
+            return pb.ServiceDetail(row=self._row(run),
+                                    fulfilled=partial.fulfilled,
+                                    pending=partial.pending,
+                                    broken=partial.broken)
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    pb_grpc.add_SupervisorObserverServicer_to_server(Observer(), server)
+    server.add_insecure_port(f"127.0.0.1:{port}")
+    server.start()
+    print(f"[supervisor] observing {port}", flush=True)
+    return server
 
 
 def service_spec(text):
@@ -300,11 +394,14 @@ def parse_args(argv=None):
     parser.add_argument("--max-crashes", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--poll", type=float, default=0.2)
+    parser.add_argument("--grpc", type=int, metavar="PORT")
     args = parser.parse_args(argv)
     if args.max_crashes < 0:
         parser.error("--max-crashes must be non-negative")
     if args.poll <= 0:
         parser.error("--poll must be positive")
+    if args.grpc is not None and not 1 <= args.grpc <= 65535:
+        parser.error("--grpc PORT must be between 1 and 65535")
     names = [name for name, _command in args.service]
     if len(names) != len(set(names)):
         parser.error("each --service NAME must be unique")
@@ -313,6 +410,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    grpc_parts = observer_modules() if args.grpc is not None else None
     with Runtime(OUT / "libashrt.so") as runtime:
         runtime.load(OUT / "libservice.ash.so")
         supervisor = Supervisor(runtime, args.dsn, args.piddir,
@@ -332,13 +430,23 @@ def main(argv=None):
         signal.signal(signal.SIGUSR1, request_stop)
         for name, command in args.service:
             supervisor.resume_or_start(name, command, args.resume)
-        supervisor.loop()
+        server = None
+        try:
+            if grpc_parts is not None:
+                server = start_observer(supervisor, args.grpc, *grpc_parts)
+            supervisor.loop()
+        finally:
+            if server is not None:
+                server.stop(0).wait()
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except GrpcUnavailable as error:
+        print(f"[supervisor] error {error}", file=sys.stderr, flush=True)
+        raise SystemExit(2)
     except (AshError, OSError, RuntimeError, sqlite3.Error) as error:
         print(f"[supervisor] error {error}", file=sys.stderr, flush=True)
         raise SystemExit(1)

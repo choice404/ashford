@@ -76,6 +76,31 @@ set, spawns `CMD`, and walks the instance. `--dsn` is the database the `Runs`
 table and the park store both live in, and `--piddir` is where the pidfiles are
 written for resume to find.
 
+## Watching it
+
+With `--grpc PORT` the supervisor serves a small read only observer surface,
+its own two rpcs and deliberately not the emitted contract surface: an
+observer must not be able to sign, fulfill, or break anything, so the
+contract's bridge stays unserved and the host serves its own. What crosses is
+the diagnosis the contract already keeps: the state name, the partial name
+lists, and the crash count off the `Runs` table.
+
+```text
+python examples/supervisor/watch.py --port 50259 list
+web Partial pid 4242 run 17 crashes 0
+
+python examples/supervisor/watch.py --port 50259 get web
+web Partial pid 4242 run 17 crashes 0
+fulfilled: start,ready
+pending: finish,crashes
+broken:
+```
+
+`make test-supervisor-watch` gates it: two services up, one already through a
+crash and a restart, the list and the detail read from outside the process,
+and an unknown name answered NOT_FOUND. It skips clean without grpcio, like
+the bridge gates.
+
 ## What this does not do
 
 This is a development supervisor, one rung up from a shell loop, not an init
