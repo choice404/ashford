@@ -5,6 +5,39 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.0] the standing service
+
+The first whole program. examples/supervisor is a process supervisor whose
+service state machine is a contract instance, one instance to one run, and
+the four states carry their operational meaning directly: Signed is
+starting, Partial is running, Fulfilled is a clean exit, Broken is a
+crash. Nothing in it is new machinery; it is the lifecycle, the abstract
+pledges, the store, the query surface, and park and resume, composed into
+a tool someone would actually run, which is what a flagship example is
+for.
+
+- write the state machine as policy: start and ready are abstract and the
+  host binds the spawn and the first health pass, finish records the run
+  on the store and latches Err on an unclean exit so the contract breaks
+  itself, and the requirements block says Partial is a running service in
+  three lines
+- count crashes with the query surface: the Runs table is shared across
+  every instance on one dsn, crashes() reads the unclean runs with one
+  predicate, service == name && clean == false, the name straight from
+  the vow, and the restart budget is the store's answer, not a counter in
+  the host
+- respect the lifecycle from the host: a Broken run refuses further
+  fulfillments, so the crash count is read through a short lived observer
+  instance that is broken as soon as it has answered, and the rule that
+  broke the run holds for the reader too
+- make the supervisor restart a park: SIGTERM parks every running
+  instance under its service name and leaves the processes standing,
+  --resume stands the instances back up and reattaches by pidfile, and
+  SIGUSR1 is the operator's clean stop, finish(0, clean) into Fulfilled
+- gate the whole story: test-supervisor drives two services, a flaky one
+  into its crash budget and a steady one through park, supervisor
+  restart, resume under the same pid, and a clean Fulfilled stop
+
 ## [v0.5.4] the ordered read
 
 The query surface answers in order. A trailing `asc(column)` or

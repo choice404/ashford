@@ -154,6 +154,14 @@ make test-store-python
 
 `make test-store` signs the `Ledger` against a temp file, reconciles the `Accounts` schema into it, and drives the loose store pledges: `open` writes a row, `balance` reads one back, and `set_balance` rewrites one, each a `Result` whose `Err` is the ledger's own business and never a store status. `make test-store-txn` drives the transactional `Transfer`, a good transfer that commits both writes and a bad one that rolls the whole episode back, reopening the file each time so the file is the witness. `make test-store-python` runs `interop/python/demo_ledger.py`, the store twin of the payment demos, which asserts the same outcomes from Python that the C hosts assert, proving the store stays invisible in the second language too.
 
+The pieces compose into a working program. [examples/supervisor](examples/supervisor) is a small process supervisor whose service state machine is a contract instance, one instance per run: Signed is starting, Partial is running, Fulfilled is a clean exit, Broken is a crash. The host binds the spawn and the health pass over abstract pledges, the run record and the crash count live on the store through the query surface, and a supervisor restart is a park and a resume, the service process surviving in between:
+
+```sh
+# two services up, one crashes into its budget, one survives a supervisor
+# restart through the park store and stops clean into Fulfilled
+make test-supervisor
+```
+
 ## Status
 
 The core language runs end to end. `ashc` carries the whole pipeline, lexer through type checker through codegen, over the full grammar in [docs/grammar.md](docs/grammar.md): contracts with vows, pledges, clauses, subcontracts, and requirements policies, records and sums, match, loops, propagation, imports with package visibility, and a first standard library under `lib/ashstd`. The C runtime enforces the lifecycle with per pledge latching, runs fulfillments on a worker pool, owns every allocation an instance makes, and reclaims it all at break. Contracts are discovered through the iname table by mangled name and shape hash, a C host drives everything through [docs/abi.md](docs/abi.md), Python does the same through ctypes with no C written, and `build --bin` links a standalone executable. Contracts run backed by a database: a `schema` is a vow, a `transactional` subcontract is a transaction, and a SQLite backend vendored into the runtime persists the rows, the store invisible across the boundary. An instance's durable state parks into a store row and resumes in another process, from the C surface and from inside the language alike. A golden and compile fail suite, sanitizer gates, a determinism gate, thread sanitizer gates over the pool, and store gates that sign a contract against a real SQLite file hold the line on every build.

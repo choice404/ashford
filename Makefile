@@ -50,10 +50,11 @@ MODULE_LANG := $(OUT)/liblang.ash.so
 MODULE_STD := $(OUT)/libstd_user.ash.so
 MODULE_LEDGER := $(OUT)/libledger.ash.so
 MODULE_LIFE := $(OUT)/liblifecycle.ash.so
+MODULE_SVC := $(OUT)/libservice.ash.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover test-supervisor tsan clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, and the store, with
@@ -341,6 +342,22 @@ test-std: $(MODULE_STD)
 # variant on purpose: the TSan runtime cannot be mixed into an
 # uninstrumented python3 process, so the concurrency surface stays covered
 # by the C tsan gate.
+$(MODULE_SVC): $(ASHC) examples/supervisor/service.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
+	$(ASHC) build examples/supervisor/service.ash
+
+# The flagship example gate: the supervisor whose service state machine is a
+# contract instance. The driver walks the whole story: two services come up
+# Partial, the flaky one crashes into Broken twice with its crash count read
+# off the shared Runs table and is given up, the steady one is parked when
+# the supervisor is terminated, survives as a process, is resumed by a fresh
+# supervisor under the same pid, and is stopped clean into Fulfilled.
+test-supervisor: $(RT_SO) $(MODULE_SVC)
+	@if command -v python3 >/dev/null 2>&1; then \
+	    python3 examples/supervisor/test_supervisor.py; \
+	else \
+	    echo "[test-supervisor] python3 not found, skipping"; \
+	fi
+
 test-python: $(RT_SO) $(MODULE) $(MODULE_PAY)
 	@if command -v python3 >/dev/null 2>&1; then \
 	    python3 interop/python/demo_payment.py; \
