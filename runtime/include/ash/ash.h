@@ -483,6 +483,11 @@ AshStatus ash_store_query_ordered(AshContract* c, const AshSchemaDesc* schema,
                                   const AshStoreTerm* terms, uint32_t nterms,
                                   uint32_t order_col, uint32_t order_desc,
                                   AshValue* out);
+/* query_ordered, with a nonnegative Int limit bound after every term. */
+AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
+                               const AshStoreTerm* terms, uint32_t nterms,
+                               uint32_t order_col, uint32_t order_desc,
+                               const AshValue* limit, AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

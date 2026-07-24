@@ -155,6 +155,48 @@ contract Ledger {
         }
     }
 
+    // The single owner of the account with the largest balance at or above a
+    // floor: Store.query reads the bounded form, desc(balance) ordering the
+    // matching rows largest first and limit(1) keeping only the head, and the
+    // pledge folds that lone owner into the answer. limit names its count behind
+    // the order, since a bound with no order ahead of it would cut an undefined
+    // row. A floor no account clears is a clean Ok(""), the empty page a fold
+    // that never runs, and only a backend failure leaves this Result as
+    // Err(StoreFailed).
+    pledge top_owner(min: Float) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, balance >= min, desc(balance), limit(1)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // The owners of the top k accounts by balance at or above a floor: the same
+    // bounded form with limit(k), the count a runtime parameter rather than a
+    // literal, so the bound is a value the caller supplies and never a constant
+    // the compiler read. desc(balance) orders the matching rows largest first
+    // and limit(k) keeps the leading k, and the pledge folds their owners into
+    // one string in that order. A count of zero is a clean Ok(""), a count past
+    // the matching rows folds every one, and only a backend failure leaves this
+    // Result as Err(StoreFailed).
+    pledge top_owners(min: Float, k: Int) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, balance >= min, desc(balance), limit(k)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the

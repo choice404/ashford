@@ -293,6 +293,29 @@ int main(void) {
         CHECK(ok_str(&r, ""),
               "owners_asc(100000.0) matches no row and is an ordered Ok(\"\")");
 
+        /* Store.query in its bounded form: a predicate, an order, then
+         * limit(count) capping the ordered page. desc(balance) orders the rows
+         * at or above 40, 999 bob, 250 alice, 60 ada, 40 ada, so top_owner keeps
+         * the single largest, limit(2) keeps bob then alice, limit(0) keeps
+         * nothing, and a limit past the page folds every matching owner. The
+         * count in top_owners is a runtime parameter, so the bound is a value the
+         * caller supplies and never a literal the compiler read. */
+        r = run(c, "top_owner", floor40, 1);
+        CHECK(ok_str(&r, "bob"),
+              "top_owner(40.0) keeps the single largest balance owner");
+        AshValue top2[2] = { float_val(40.0), int_val(2) };
+        r = run(c, "top_owners", top2, 2);
+        CHECK(ok_str(&r, "bobalice"),
+              "top_owners(40.0, 2) folds the two largest balance owners");
+        AshValue top0[2] = { float_val(40.0), int_val(0) };
+        r = run(c, "top_owners", top0, 2);
+        CHECK(ok_str(&r, ""),
+              "top_owners(40.0, 0) keeps no row and is Ok(\"\")");
+        AshValue top100[2] = { float_val(40.0), int_val(100) };
+        r = run(c, "top_owners", top100, 2);
+        CHECK(ok_str(&r, "bobaliceadaada"),
+              "top_owners(40.0, 100) folds every matching owner in order");
+
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }
 

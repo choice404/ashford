@@ -985,6 +985,36 @@ static char* store_sql_select_ordered(const AshSchemaDesc* s,
     return q;
 }
 
+/* SELECT c0, c1, ... FROM table WHERE c0 OP ?1 AND ... ORDER BY cN ASC LIMIT ?M. */
+static char* store_sql_select_page(const AshSchemaDesc* s,
+                                   const AshStoreTerm* terms,
+                                   uint32_t nterms,
+                                   uint32_t order_col,
+                                   uint32_t order_desc) {
+    static const char* ops[] = { "=", "<>", "<", "<=", ">", ">=" };
+    const char* dir = order_desc ? "DESC" : "ASC";
+    size_t need = 80 + strlen(s->table) + store_cols_span(s) +
+                  strlen(s->cols[order_col].name) + strlen(dir);
+    for (uint32_t i = 0; i < nterms; i++) {
+        need += strlen(s->cols[terms[i].col].name) + strlen(ops[terms[i].cmp]) + 24;
+    }
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT ");
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
+    n += (size_t)snprintf(q + n, need - n, " FROM %s WHERE ", s->table);
+    for (uint32_t i = 0; i < nterms; i++) {
+        n += (size_t)snprintf(q + n, need - n, "%s%s %s ?%u",
+                              i ? " AND " : "", s->cols[terms[i].col].name,
+                              ops[terms[i].cmp], i + 1);
+    }
+    snprintf(q + n, need - n, " ORDER BY %s %s LIMIT ?%u",
+             s->cols[order_col].name, dir, nterms + 1);
+    return q;
+}
+
 /* INSERT INTO table(c0, ...) VALUES(?, ...), every column bound positionally. */
 static char* store_sql_insert(const AshSchemaDesc* s) {
     size_t need = 48 + strlen(s->table) + store_cols_span(s) + (size_t)s->ncols * 3;
@@ -1179,6 +1209,48 @@ AshStatus ash_store_query_ordered(AshContract* c, const AshSchemaDesc* schema,
             AshStoreAlloc alloc = { instance_store_bytes, c };
             AshValue rows;
             st = ash_store_query(c->store, sql, params, nterms, cts, NULL,
+                                 schema->ncols, &alloc, &rows);
+            if (st == ASH_OK) st = store_ok(c, &rows, out);
+        }
+        free(sql);
+        free(cts);
+        free(params);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
+                               const AshStoreTerm* terms, uint32_t nterms,
+                               uint32_t order_col, uint32_t order_desc,
+                               const AshValue* limit, AshValue* out) {
+    if (!c || !schema || !terms || !limit || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (schema->ncols == 0 || nterms == 0) return ASH_ERR_TYPE;
+    for (uint32_t i = 0; i < nterms; i++) {
+        if (terms[i].col >= schema->ncols) return ASH_ERR_TYPE;
+        if (terms[i].cmp > ASH_CMP_GE) return ASH_ERR_TYPE;
+        if (!terms[i].value) return ASH_ERR_TYPE;
+        if (terms[i].value->ty != schema->cols[terms[i].col].ty) return ASH_ERR_TYPE;
+    }
+    if (order_col >= schema->ncols) return ASH_ERR_TYPE;
+    if (order_desc > 1) return ASH_ERR_TYPE;
+    if (limit->ty != ASH_TY_INT) return ASH_ERR_TYPE;
+    if (limit->as.i < 0) return ASH_ERR_TYPE;
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_select_page(schema, terms, nterms, order_col, order_desc);
+        uint32_t* cts = store_col_types(schema);
+        AshValue* params = (AshValue*)malloc((size_t)(nterms + 1) * sizeof(AshValue));
+        if (!sql || !cts || !params) {
+            st = ASH_ERR_OOM;
+        } else {
+            for (uint32_t i = 0; i < nterms; i++) params[i] = *terms[i].value;
+            params[nterms] = *limit;
+            AshStoreAlloc alloc = { instance_store_bytes, c };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, params, nterms + 1, cts, NULL,
                                  schema->ncols, &alloc, &rows);
             if (st == ASH_OK) st = store_ok(c, &rows, out);
         }

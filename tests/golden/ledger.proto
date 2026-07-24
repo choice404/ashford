@@ -12,7 +12,7 @@ package ashford.ledger;
 // lays its module out differently overrides this with protoc's M flags.
 option go_package = "ashbridge/ledgerpb";
 
-// contract Ledger, version 1, shape 0x79441c82d4c8f3fd.
+// contract Ledger, version 1, shape 0x663f8becc0eb3059.
 // The sign surface: one optional field per vow, and the shape check,
 // where 0 skips it and the wrapper's pinned hash enforces this build.
 message SignRequest {
@@ -148,6 +148,17 @@ message OwnersDescRequest {
   double min = 2;
 }
 
+message TopOwnerRequest {
+  uint64 instance_id = 1;
+  double min = 2;
+}
+
+message TopOwnersRequest {
+  uint64 instance_id = 1;
+  double min = 2;
+  int64 k = 3;
+}
+
 message DebitRequest {
   uint64 instance_id = 1;
   int64 id = 2;
@@ -204,6 +215,8 @@ service Ledger {
   rpc OwnedAbove(OwnedAboveRequest) returns (FloatLedgerErrorResult);
   rpc OwnersAsc(OwnersAscRequest) returns (StringLedgerErrorResult);
   rpc OwnersDesc(OwnersDescRequest) returns (StringLedgerErrorResult);
+  rpc TopOwner(TopOwnerRequest) returns (StringLedgerErrorResult);
+  rpc TopOwners(TopOwnersRequest) returns (StringLedgerErrorResult);
   rpc Debit(DebitRequest) returns (UnitLedgerErrorResult);
   rpc Credit(CreditRequest) returns (UnitLedgerErrorResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);

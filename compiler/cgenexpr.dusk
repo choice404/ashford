@@ -1045,6 +1045,43 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                 }
             }
         }
+        // The bounded form: a predicate, asc(column) or desc(column), then
+        // limit(count). The predicate lowers to the same term array the ordered
+        // form builds and the ordering column and direction read the same way;
+        // the count lowers into its own Int temporary the way a term value does,
+        // and its address rides the page primitive, which answers the leading
+        // rows of the ordered result the count keeps.
+        if e.c == 4 {
+            arr4, nterms4 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+            a2oe: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 2))
+            ocn: ExprNode = vec_get((*a).exprs, a2oe.a)
+            octext: string = ast_name(a, ocn.a)
+            iarg: ArgNode = vec_get((*a).args, vec_get((*a).kids, a2oe.b))
+            ie: ExprNode = vec_get((*a).exprs, iarg.expr)
+            mut ordcol: int64 = -1
+            mut oi: int64 = 0
+            while oi < rs.len {
+                f: FieldSig = sig_field((*g).sigs, rs.off, oi)
+                if f.name == ie.a { ordcol = oi }
+                oi = oi + 1
+            }
+            if ordcol < 0 {
+                cg_unsupported(g, e.lo, e.hi, "a Store.query ordered by an unknown column")
+                return bad_val(g)
+            }
+            mut descflag: string = "0u"
+            if str_eq(octext, "desc") { descflag = "1u" }
+            lce: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 3))
+            larg: ArgNode = vec_get((*a).args, vec_get((*a).kids, lce.b))
+            lval: CVal = gen_expr(g, larg.expr, ty_int(t))
+            nterms4_s: string = tmsg2(int_to_string(nterms4), "u, ")
+            ordcol4_s: string = tmsg2(int_to_string(ordcol), "u, ")
+            tail4: string = tmsg7(descflag, ", &", lval.cvar, ", &", out, ");", "")
+            callp: string = tmsg7(" = ash_store_query_page(cc, ", schref, ", ", arr4, ", ", nterms4_s, tmsg2(ordcol4_s, tail4))
+            cg_line(g, tmsg3("AshStatus ", st, callp))
+            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+        }
         // The second argument is a bare column name the checker already
         // resolved to a real schema field, so it lowers to that field's
         // declaration index, and the value lowers against the column's type.

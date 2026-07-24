@@ -5,6 +5,36 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.1] the bounded read
+
+The query surface takes a bound. A trailing `limit(count)` after the
+order caps the ordered form of `Store.query` at `count` rows: the count
+is an ordinary Int expression, a literal or a value the pledge computed,
+bound into the prepared statement as the last positional parameter like
+every other value. A bound without an order is refused at compile time
+with its reason in the diagnostic, because the rows a bound cuts are
+defined only once an order says which come first; a negative count is
+refused at runtime rather than read the way SQLite would read it, as no
+bound at all. Disjunction, negation, aggregation, and an offset stay on
+the leaves out list with their names on them.
+
+- check the bound where the order lives: limit is a reserved spelling in
+  the fourth position and nowhere else, a fourth argument that is not
+  limit(count), a count that is not an Int, and a limit in the order's
+  place each get a named diagnostic, and the two, three, and ordered
+  forms stay byte for byte what they were
+- lower onto one runtime primitive: ash_store_query_page appends LIMIT as
+  the parameter after the terms, refuses a null, non Int, or negative
+  count before the mutex, and never concatenates the count into the text
+- prove the count is a value: top_owner bounds with a literal one and
+  top_owners bounds with its own Int parameter, the same emitted call
+  carrying a temp in one and the argument slot in the other, both walked
+  in the store gate against a zero bound, a tight bound, and a bound
+  wider than the table
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  the bounded form joins the operation table, and the leaves out list
+  narrows to what one bounded ordered conjunction cannot spell
+
 ## [v0.6.0] the standing service
 
 The first whole program. examples/supervisor is a process supervisor whose

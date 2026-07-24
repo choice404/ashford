@@ -563,6 +563,44 @@ func check_query_order(tc: *Tc, rs: RecSig, sname: int64, callid: int64) -> void
     }
 }
 
+// The bare callee name of an argument when it is a call through a bare
+// identifier, or the empty string otherwise. The ordered and bounded forms of
+// Store.query read their asc, desc, and limit suffixes this way, a call whose
+// callee names the suffix and whose argument the form then checks against the
+// schema or against Int.
+func query_suffix_name(tc: *Tc, xid: int64) -> string {
+    a: *Ast = (*tc).ast
+    xe: ExprNode = vec_get((*a).exprs, xid)
+    if xe.kind != xk_call() { return "" }
+    cn: ExprNode = vec_get((*a).exprs, xe.a)
+    if cn.kind != xk_ident() { return "" }
+    return ast_name(a, cn.a)
+}
+
+// The fourth argument of the bounded Store.query, limit(count): a call to limit
+// naming exactly one count, an Int the runtime reads to cap the ordered page.
+// The count is a value, a literal or a bound parameter alike, so it is inferred
+// against Int the way a comparison's value is, and a count that is not an Int is
+// refused. limit rides only the fourth slot, behind an order, and names no
+// column, so its argument is the one Int the page keeps. A negative count is a
+// runtime refusal, not a compile time one, since the count need not be a
+// literal the checker can read.
+func check_query_limit(tc: *Tc, callid: int64) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    ce: ExprNode = vec_get((*a).exprs, callid)
+    if ce.c != 1 {
+        tc_emit(tc, ce.lo, ce.hi, "the fourth argument of Store.query is limit(count)")
+        return
+    }
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, ce.b))
+    ae: ExprNode = vec_get((*a).exprs, arg.expr)
+    at: int64 = infer_expr(tc, arg.expr, ty_int(t))
+    if !compat(t, ty_int(t), at) {
+        tc_emit(tc, ae.lo, ae.hi, "the argument of limit is an Int")
+    }
+}
+
 // One Store.* operation: find, query, insert, update, or delete, each naming a
 // schema declared in the same contract. The first argument is the schema name,
 // read as a bare identifier rather than inferred as a value, and the rest are
@@ -635,6 +673,17 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
             a1e: ExprNode = vec_get((*a).exprs, a1.expr)
             a2: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 2))
             a2e: ExprNode = vec_get((*a).exprs, a2.expr)
+            // A limit in the third slot with no ordering ahead of it is refused
+            // by name: a bound cuts the page an order fixes, so a bounded query
+            // that never named an order would keep an undefined row. The
+            // predicate and the count still walk their own checks so their
+            // faults surface beside this one.
+            if str_eq(query_suffix_name(tc, a2.expr), "limit") {
+                check_query_pred(tc, rs, sc.name, a1.expr)
+                check_query_limit(tc, a2.expr)
+                tc_emit(tc, a2e.lo, a2e.hi, "a bounded Store.query names its order")
+                return ty_result(t, ty_list(t, row_ty), err_ty)
+            }
             mut a2_order: bool = false
             if a2e.kind == xk_call() {
                 occ: ExprNode = vec_get((*a).exprs, a2e.a)
@@ -652,6 +701,41 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
                 }
                 return ty_result(t, ty_list(t, row_ty), err_ty)
             }
+        }
+        // The bounded form: a predicate, then asc(column) or desc(column), then
+        // limit(count). It is the ordered form with a cap, so the order names
+        // the row sequence and the bound keeps only its leading rows; a bound
+        // without an order would cut an undefined row, so the fourth slot is
+        // meaningful only behind the third. The predicate and the order walk the
+        // same checks the ordered form runs, and the fourth argument names limit
+        // with one Int count. The answer is still every kept row, so the result
+        // carries a list.
+        if e.c == 4 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            a2: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 2))
+            a2e: ExprNode = vec_get((*a).exprs, a2.expr)
+            a3: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 3))
+            a3e: ExprNode = vec_get((*a).exprs, a3.expr)
+            check_query_pred(tc, rs, sc.name, a1.expr)
+            mut a2_order: bool = false
+            if a2e.kind == xk_call() {
+                occ: ExprNode = vec_get((*a).exprs, a2e.a)
+                if occ.kind == xk_ident() {
+                    octext: string = ast_name(a, occ.a)
+                    if str_eq(octext, "asc") || str_eq(octext, "desc") { a2_order = true }
+                }
+            }
+            if a2_order {
+                check_query_order(tc, rs, sc.name, a2.expr)
+            } else {
+                tc_emit(tc, a2e.lo, a2e.hi, "the third argument of Store.query is asc(column) or desc(column)")
+            }
+            if str_eq(query_suffix_name(tc, a3.expr), "limit") {
+                check_query_limit(tc, a3.expr)
+            } else {
+                tc_emit(tc, a3e.lo, a3e.hi, "the fourth argument of Store.query is limit(count)")
+            }
+            return ty_result(t, ty_list(t, row_ty), err_ty)
         }
         // query binds a column to a value: the count is checked first, then the
         // second argument is read as a bare column name resolved against the
