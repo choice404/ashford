@@ -5,6 +5,38 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.5.3] the composed predicate
+
+The query surface composes. `Store.query(S, predicate)` takes comparisons,
+`==`, `!=`, `<`, `<=`, `>`, `>=`, joined with `&&`, beside the column and
+value equality form v0.5.1 shipped: the left side of every comparison is a
+bare column name the checker resolves against the schema at compile time,
+never a variable, the right side is an ordinary expression checked against
+that column's declared type, and the whole predicate lowers onto one
+prepared statement with every value positionally bound. No rows stays an
+Ok of an empty list. Ordering, disjunction, negation, and aggregation stay
+on the leaves out list with their names on them.
+
+- check the predicate where the schema lives: the checker walks the `&&`
+  chain, refuses `||` by name, refuses a left side that is not a column
+  name, an unknown column, and a value whose type disagrees with the
+  column, each with a named diagnostic, and the three argument equality
+  form stays byte for byte what it was
+- lower onto one runtime primitive: ash_store_query_where takes an array
+  of terms, column index, comparison, and value, builds the select from
+  the compiler owned schema descriptor with the operator text from a fixed
+  table, and binds every value as a parameter, never concatenated
+- prove the left side is a column: the Ledger's owned_above pledge spells
+  `owner == owner && balance >= min`, the left owner the schema's column
+  and the right owner the pledge's parameter, and the emitted call carries
+  the resolved column index beside the bound argument
+- walk both shapes in the gate: rich counts rows over one comparison,
+  owned_above folds balances over two, both proven in the store gate
+  against rows above, below, and on the boundary
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  the operation table carries the predicate form beside the equality form,
+  and the leaves out list narrows to what conjunction cannot spell
+
 ## [v0.5.2] the claimed row
 
 Two servers, one park store, one owner per token. v0.4.0 proved a parked

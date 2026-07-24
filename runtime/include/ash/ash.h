@@ -456,6 +456,27 @@ AshStatus ash_store_find(AshContract* c, const AshSchemaDesc* schema,
 AshStatus ash_store_query_eq(AshContract* c, const AshSchemaDesc* schema,
                              uint32_t col, const AshValue* value,
                              AshValue* out);
+
+/* One comparison term for query_where. Comparisons are ANDed in declaration
+ * order and every value is bound as a positional parameter. */
+typedef enum AshStoreCmp {
+    ASH_CMP_EQ = 0,
+    ASH_CMP_NE = 1,
+    ASH_CMP_LT = 2,
+    ASH_CMP_LE = 3,
+    ASH_CMP_GT = 4,
+    ASH_CMP_GE = 5,
+} AshStoreCmp;
+
+typedef struct AshStoreTerm {
+    uint32_t col;          /* index into the schema's columns */
+    uint32_t cmp;          /* an AshStoreCmp */
+    const AshValue* value; /* compared against the column, always bound */
+} AshStoreTerm;
+
+AshStatus ash_store_query_where(AshContract* c, const AshSchemaDesc* schema,
+                                const AshStoreTerm* terms, uint32_t nterms,
+                                AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

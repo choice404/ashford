@@ -12,7 +12,7 @@ package ashford.ledger;
 // lays its module out differently overrides this with protoc's M flags.
 option go_package = "ashbridge/ledgerpb";
 
-// contract Ledger, version 1, shape 0xb0fc069117efaab4.
+// contract Ledger, version 1, shape 0xbad71ad9c4dc8ee5.
 // The sign surface: one optional field per vow, and the shape check,
 // where 0 skips it and the wrapper's pinned hash enforces this build.
 message SignRequest {
@@ -73,6 +73,15 @@ message BoolLedgerErrorResult {
   }
 }
 
+// Result<Int, LedgerError>: the contract's own Err is a value, not a
+// transport error.
+message IntLedgerErrorResult {
+  oneof result {
+    int64 ok = 1;
+    LedgerError err = 2;
+  }
+}
+
 // The Ok of a pledge that answers with nothing; the message is the value.
 message Unit {}
 
@@ -107,6 +116,17 @@ message SetBalanceRequest {
 message OwnedTotalRequest {
   uint64 instance_id = 1;
   string owner = 2;
+}
+
+message RichRequest {
+  uint64 instance_id = 1;
+  double min = 2;
+}
+
+message OwnedAboveRequest {
+  uint64 instance_id = 1;
+  string owner = 2;
+  double min = 3;
 }
 
 message DebitRequest {
@@ -161,6 +181,8 @@ service Ledger {
   rpc Open(OpenRequest) returns (BoolLedgerErrorResult);
   rpc SetBalance(SetBalanceRequest) returns (BoolLedgerErrorResult);
   rpc OwnedTotal(OwnedTotalRequest) returns (FloatLedgerErrorResult);
+  rpc Rich(RichRequest) returns (IntLedgerErrorResult);
+  rpc OwnedAbove(OwnedAboveRequest) returns (FloatLedgerErrorResult);
   rpc Debit(DebitRequest) returns (UnitLedgerErrorResult);
   rpc Credit(CreditRequest) returns (UnitLedgerErrorResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);

@@ -75,6 +75,15 @@ static int ok_true(const AshValue* r) {
     return p->ty == ASH_TY_BOOL && p->as.b == 1;
 }
 
+/* An Ok(Int) result, its value read out for comparison. */
+static int ok_int(const AshValue* r, int64_t* out) {
+    if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
+    const AshValue* p = (const AshValue*)r->as.box;
+    if (p->ty != ASH_TY_INT) return 0;
+    *out = p->as.i;
+    return 1;
+}
+
 /* An Ok(Float) result, its value read out for comparison. */
 static int ok_float(const AshValue* r, double* out) {
     if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
@@ -219,6 +228,38 @@ int main(void) {
         r = run(c, "owned_total", who_none, 1);
         CHECK(ok_float(&r, &bal) && bal == 0.0,
               "owned_total of an owner with no rows is Ok(0.0)");
+
+        /* Store.query in its predicate form. The table now holds 1/alice 250,
+         * 3/injection 5, 10/ada 40, 11/ada 60, and 12/bob 999. rich compares
+         * the balance column against a floor with '>=' and counts every account
+         * that clears it across all owners; owned_above joins two comparisons
+         * with &&, the owner column bound to a name and the balance column
+         * against a floor, and folds the matching balances into one sum. */
+        int64_t cnt = 0;
+        AshValue rich100[1] = { float_val(100.0) };
+        r = run(c, "rich", rich100, 1);
+        CHECK(ok_int(&r, &cnt) && cnt == 2,
+              "rich(100.0) counts the two accounts at or above 100");
+        AshValue rich40[1] = { float_val(40.0) };
+        r = run(c, "rich", rich40, 1);
+        CHECK(ok_int(&r, &cnt) && cnt == 4,
+              "rich(40.0) counts the four accounts at or above 40");
+        AshValue rich10k[1] = { float_val(10000.0) };
+        r = run(c, "rich", rich10k, 1);
+        CHECK(ok_int(&r, &cnt) && cnt == 0,
+              "rich(10000.0) counts none and is Ok(0)");
+
+        /* owned_above proves the left of '==' is the owner column and never the
+         * owner parameter that shares its name: only ada's rows are considered,
+         * and of those only the balance at or above the floor is folded. */
+        AshValue above_ada[2] = { str_val("ada"), float_val(50.0) };
+        r = run(c, "owned_above", above_ada, 2);
+        CHECK(ok_float(&r, &bal) && bal == 60.0,
+              "owned_above of ada at 50 folds only her 60 balance");
+        AshValue above_ada_hi[2] = { str_val("ada"), float_val(1000.0) };
+        r = run(c, "owned_above", above_ada_hi, 2);
+        CHECK(ok_float(&r, &bal) && bal == 0.0,
+              "owned_above of ada at 1000 matches no row and is Ok(0.0)");
 
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }

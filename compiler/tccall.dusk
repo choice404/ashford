@@ -468,15 +468,78 @@ func is_store_ns(tc: *Tc, base_id: int64) -> bool {
     return g.kind != gk_contract()
 }
 
+// One comparison term of a Store.query predicate: its left side is a bare
+// column name resolved against the schema, never a value the way the equality
+// form's column never is, and its right side is a value checked against that
+// column's own declared type. Every comparison operator is allowed on every
+// scalar column, String ordering among them.
+func check_query_term(tc: *Tc, rs: RecSig, sname: int64, x: ExprNode) -> void {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    le: ExprNode = vec_get((*a).exprs, x.b)
+    if le.kind != xk_ident() {
+        tc_emit(tc, le.lo, le.hi, "the left side of a Store.query comparison is a column name")
+        infer_expr(tc, x.c, -1)
+        return
+    }
+    mut col_ty: int64 = ty_unknown(t)
+    mut found_col: bool = false
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*tc).sigs, rs.off, i)
+        if f.name == le.a {
+            col_ty = f.ty
+            found_col = true
+        }
+        i = i + 1
+    }
+    if !found_col {
+        tc_emit(tc, le.lo, le.hi, tmsg5("no column '", ast_name(a, le.a), "' in schema '", ast_name(a, sname), "'"))
+        infer_expr(tc, x.c, -1)
+        return
+    }
+    re: ExprNode = vec_get((*a).exprs, x.c)
+    at: int64 = infer_expr(tc, x.c, col_ty)
+    if !compat(t, col_ty, at) {
+        tc_emit(tc, re.lo, re.hi, tmsg_types(tc, "the value of a Store.query comparison expects ", col_ty, ", got ", at))
+    }
+}
+
+// The predicate that is the second argument of the two argument Store.query: a
+// comparison is one term, a && joins two predicates and each side recurses, and
+// a || or any other shape is refused with the form the argument should have
+// taken. The walk mirrors the codegen that counts the same terms.
+func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64) -> void {
+    a: *Ast = (*tc).ast
+    x: ExprNode = vec_get((*a).exprs, xid)
+    if x.kind == xk_binary() {
+        op: int64 = x.a
+        if op == bop_and() {
+            check_query_pred(tc, rs, sname, x.b)
+            check_query_pred(tc, rs, sname, x.c)
+            return
+        }
+        if op == bop_or() {
+            tc_emit(tc, x.lo, x.hi, "Store.query joins comparisons with &&, not ||")
+            return
+        }
+        if op == bop_eq() || op == bop_ne() || op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() {
+            check_query_term(tc, rs, sname, x)
+            return
+        }
+    }
+    tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with &&")
+}
+
 // One Store.* operation: find, query, insert, update, or delete, each naming a
 // schema declared in the same contract. The first argument is the schema name,
 // read as a bare identifier rather than inferred as a value, and the rest are
 // the key, column, or row the operation binds. A row is the schema's record, so
 // find yields Result<Option<Row>, StoreError>, query yields Result<List<Row>,
 // StoreError>, and the write forms yield Result<Unit, StoreError>; a store
-// failure rides that Result's Err, the surface's one new value. query binds one
-// column to one value with equality and answers every matching row; comparison
-// operators and conjunction are later steps.
+// failure rides that Result's Err, the surface's one new value. query answers
+// every matching row, either from the equality shorthand of a column and a
+// value or from a predicate of comparisons joined with &&.
 func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     a: *Ast = (*tc).ast
     t: *TyArena = (*tc).ty
@@ -517,6 +580,17 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
         if rs.len > 0 { pk_ty = sig_field((*tc).sigs, rs.off, 0).ty }
     }
     if str_eq(op, "query") {
+        // query answers every matching row, so the result carries a list. It
+        // reads one of two shapes. The two argument form is a predicate: a
+        // comparison, or comparisons joined with &&, each comparing a bare
+        // column resolved against the schema to a value of that column's type.
+        // The three argument form is the equality shorthand a column, a value
+        // that binds one column with '=='.
+        if e.c == 2 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            check_query_pred(tc, rs, sc.name, a1.expr)
+            return ty_result(t, ty_list(t, row_ty), err_ty)
+        }
         // query binds a column to a value: the count is checked first, then the
         // second argument is read as a bare column name resolved against the
         // schema, and the third is checked against that column's own type. The

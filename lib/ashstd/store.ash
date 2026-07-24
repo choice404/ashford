@@ -12,14 +12,20 @@
 //
 //   Store.find(S, key)             -> Result<Option<Row>, StoreError>
 //   Store.query(S, column, value)  -> Result<List<Row>, StoreError>
+//   Store.query(S, predicate)      -> Result<List<Row>, StoreError>
 //   Store.insert(S, row)           -> Result<Unit, StoreError>
 //   Store.update(S, key, row)      -> Result<Unit, StoreError>
 //   Store.delete(S, key)           -> Result<Unit, StoreError>
 //
-// Store.query is the bound predicate form, and in this release it binds one
-// column to one value with equality and answers every row that matches;
-// comparison operators and conjunction are later steps. Every operation returns
-// a Result so a store failure is a value in the surface's own error type. The
+// Store.query is the bound predicate form, and it reads two shapes over one
+// schema. The three argument shape is the equality shorthand, a column and a
+// value, and answers every row whose column equals the value. The two argument
+// shape is a predicate: a comparison, or comparisons joined with &&, where each
+// comparison tests a column with ==, !=, <, <=, >, or >= against a value.
+// Every comparison names its column on the left as a bare name resolved against
+// the schema at compile time, never a value, and query answers every row the
+// whole predicate accepts. Every operation returns a Result so a store failure
+// is a value in the surface's own error type. The
 // backend failing the runtime, a connection lost, a disk with no room, a
 // constraint the backend refused, rides back as the ASH_ERR_STORE status
 // through the wait the host already reads, never folded into a contract's own

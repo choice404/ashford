@@ -78,6 +78,45 @@ contract Ledger {
         }
     }
 
+    // The number of accounts holding at least a given balance: Store.query reads
+    // the predicate form, comparing the balance column against the floor with
+    // '>=', and answers every row that clears it. The pledge counts them, a
+    // floor no account clears a clean Ok(0), and only a backend failure leaves
+    // this Result as Err(StoreFailed) for the status channel.
+    pledge rich(min: Float) -> Result<Int, LedgerError> {
+        return match Store.query(Accounts, balance >= min) {
+            Ok(rows) -> {
+                let mut n = 0
+                for row in rows {
+                    n = n + 1
+                }
+                Ok(n)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // The total one owner holds in accounts at or above a floor: Store.query
+    // reads a two term predicate, the owner column bound to the owner parameter
+    // and the balance column cleared against the floor, and folds the matching
+    // balances into one sum. The owner on the left of '==' is the column and the
+    // owner on the right is the parameter; sharing the name is deliberate, since
+    // the left of a comparison is always a column resolved against the schema
+    // and never a value. An owner with no matching row is a clean Ok(0.0), and
+    // only a backend failure leaves this Result as Err(StoreFailed).
+    pledge owned_above(owner: String, min: Float) -> Result<Float, LedgerError> {
+        return match Store.query(Accounts, owner == owner && balance >= min) {
+            Ok(rows) -> {
+                let mut sum = 0.0
+                for row in rows {
+                    sum = sum + row.balance
+                }
+                Ok(sum)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the

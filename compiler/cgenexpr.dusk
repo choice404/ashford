@@ -870,6 +870,47 @@ func cg_arg_expr(g: *Cg, e: ExprNode, i: int64) -> int64 {
     return arg.expr
 }
 
+// The comparison operator of a Store.query term as its runtime enum spelling.
+func cg_cmp_name(op: int64) -> string {
+    if op == bop_eq() { return "ASH_CMP_EQ" }
+    if op == bop_ne() { return "ASH_CMP_NE" }
+    if op == bop_lt() { return "ASH_CMP_LT" }
+    if op == bop_le() { return "ASH_CMP_LE" }
+    if op == bop_gt() { return "ASH_CMP_GT" }
+    return "ASH_CMP_GE"
+}
+
+// Walks a Store.query predicate the checker already validated, lowering each
+// comparison's value into its own temporary and pushing one AshStoreTerm
+// initializer, { column index, comparison, &value }, in left to right order. A
+// && recurses both sides; a comparison is one term whose column resolves to the
+// same schema field index the checker read.
+func cg_query_terms(g: *Cg, rs: RecSig, xid: int64, terms: *Vector<string>) -> void {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    x: ExprNode = vec_get((*a).exprs, xid)
+    if x.a == bop_and() {
+        cg_query_terms(g, rs, x.b, terms)
+        cg_query_terms(g, rs, x.c, terms)
+        return
+    }
+    le: ExprNode = vec_get((*a).exprs, x.b)
+    mut colidx: int64 = -1
+    mut col_ty: int64 = ty_unknown(t)
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*g).sigs, rs.off, i)
+        if f.name == le.a {
+            colidx = i
+            col_ty = f.ty
+        }
+        i = i + 1
+    }
+    val: CVal = gen_expr(g, x.c, col_ty)
+    entry: string = tmsg7("{ ", int_to_string(colidx), "u, ", cg_cmp_name(x.a), ", &", val.cvar, " }")
+    vec_push(terms, entry)
+}
+
 // A Store.* operation lowered onto its runtime primitive. The schema name is a
 // bare identifier, resolved to the emitted descriptor entry and never lowered
 // as a value; the key and row lower against the types the schema fixes. The
@@ -909,6 +950,34 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         return CVal { cvar: out, ty: ty_result(t, ty_option(t, row_ty), err_ty) }
     }
     if str_eq(op, "query") {
+        if e.c == 2 {
+            // The predicate form: each comparison's value lowers into its own
+            // temporary and one AshStoreTerm rides an array beside it, and the
+            // where primitive answers every row the whole predicate accepts.
+            terms: *Vector<string> = alloc(vec_new())
+            cg_query_terms(g, rs, cg_arg_expr(g, e, 1), terms)
+            arr: string = cg_tmp(g)
+            line: *StringBuilder = alloc(sb_new())
+            sb_push(line, "AshStoreTerm ")
+            sb_push(line, arr)
+            sb_push(line, "[] = { ")
+            mut ti: int64 = 0
+            while ti < vec_len(terms) {
+                if ti > 0 { sb_push(line, ", ") }
+                sb_push(line, vec_get(terms, ti))
+                ti = ti + 1
+            }
+            sb_push(line, " };")
+            text: string = substring(sb_cstr(line), 0, sb_size(line))
+            sb_free(line)
+            free(line)
+            cg_line(g, text)
+            free(text)
+            callw: string = tmsg7(" = ash_store_query_where(cc, ", schref, ", ", arr, ", ", int_to_string(vec_len(terms)), tmsg5("u, &", out, ");", "", ""))
+            cg_line(g, tmsg3("AshStatus ", st, callw))
+            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+        }
         // The second argument is a bare column name the checker already
         // resolved to a real schema field, so it lowers to that field's
         // declaration index, and the value lowers against the column's type.
