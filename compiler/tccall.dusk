@@ -615,7 +615,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     t: *TyArena = (*tc).ty
     op: string = ast_name(a, mname)
     err_ty: int64 = ty_named(t, "StoreError")
-    if !str_eq(op, "find") && !str_eq(op, "query") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
+    if !str_eq(op, "find") && !str_eq(op, "query") && !str_eq(op, "count") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
         walk_args(tc, e.b, e.c)
         tc_emit(tc, e.lo, e.hi, tmsg3("Store has no operation '", op, "'"))
         return ty_unknown(t)
@@ -768,6 +768,23 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
         }
         check_store_arg(tc, e, 2, col_ty, "the value")
         return ty_result(t, ty_list(t, row_ty), err_ty)
+    }
+    if str_eq(op, "count") {
+        // count answers how many rows a predicate accepts without materializing
+        // any of them, so the result carries an Int. It names a schema and one
+        // predicate, the two argument form's own: a comparison, or comparisons
+        // joined with &&, each comparing a bare column resolved against the
+        // schema to a value of that column's type. Any other arity is refused by
+        // the shape the call should have taken; the predicate walks the same
+        // check the query predicate does, so its faults surface beside it.
+        if e.c != 2 {
+            tc_emit(tc, e.lo, e.hi, "Store.count takes a schema and a predicate")
+        }
+        if e.c >= 2 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            check_query_pred(tc, rs, sc.name, a1.expr)
+        }
+        return ty_result(t, ty_int(t), err_ty)
     }
     // The argument shapes per operation. The count is checked first, then each
     // trailing argument against the key or row type the schema fixes.

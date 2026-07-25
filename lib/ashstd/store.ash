@@ -16,6 +16,7 @@
 //   Store.query(S, predicate, asc(column))  -> Result<List<Row>, StoreError>
 //   Store.query(S, predicate, desc(column)) -> Result<List<Row>, StoreError>
 //   Store.query(S, predicate, desc(column), limit(n)) -> Result<List<Row>, StoreError>
+//   Store.count(S, predicate)      -> Result<Int, StoreError>   (rows not materialized)
 //   Store.insert(S, row)           -> Result<Unit, StoreError>
 //   Store.update(S, key, row)      -> Result<Unit, StoreError>
 //   Store.delete(S, key)           -> Result<Unit, StoreError>
@@ -37,6 +38,9 @@
 // order ahead of it would cut an undefined row, so a limit named without one is
 // refused at compile time; the count is a value, a literal or a bound parameter
 // alike, and a negative count is a runtime refusal, not a compile time one.
+// Store.count reads that same two argument predicate and answers how many rows
+// pass it as an Int, the rows never materialized into the process: the store
+// counts them behind the boundary and hands back only the number.
 // Every operation returns a Result so a store failure
 // is a value in the surface's own error type. The
 // backend failing the runtime, a connection lost, a disk with no room, a

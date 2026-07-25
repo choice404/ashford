@@ -5,6 +5,36 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.3] the counted read
+
+The store answers how many. `Store.count(S, predicate)` takes the same
+predicate the query forms take and answers `Result<Int, StoreError>`,
+counted where the rows live: SELECT COUNT(*) rides the same prepared
+statement discipline, every value a bound parameter, and no row is ever
+materialized, so a pledge that only needs the number never pays for the
+list. The two counts the codebase already had stop scanning: the Ledger's
+rich and the supervisor's crashes keep their signatures and their gate
+values and lose their folds, which is the point of an aggregate, the
+answer moves to the store and the pledge keeps only the question.
+
+- check the count where the query lives: Store.count takes exactly a
+  schema and a predicate, any other arity refused by name, and the
+  predicate walks the same checker path as query, so every predicate
+  diagnostic holds unchanged
+- lower onto one runtime primitive: ash_store_count_where builds the
+  count from the schema descriptor and the fixed operator table, decodes
+  the single scalar through a scratch allocator freed before the call
+  returns, and answers the Ok(Int) Result every read form answers, with
+  nothing left on the instance heap but the boxed count
+- retire the folds without moving the surface: rich counts through the
+  store with the same Result<Int, LedgerError> it always answered, and
+  the supervisor's crashes counts its unclean runs the same way, the
+  restart budget now the store's own arithmetic
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  count joins the operation table with its no materialization promise,
+  and the leaves out list narrows to the aggregates it names, sum,
+  average, min, max, and grouping
+
 ## [v0.6.2] the watched service
 
 The supervisor answers questions from outside its process. With

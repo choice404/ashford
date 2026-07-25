@@ -57,22 +57,16 @@ contract Service {
         return Ok(landed)
     }
 
-    // The number of unclean runs this service has on record, counted with one
-    // predicate read: every Runs row whose service is this instance's name and
+    // The number of unclean runs this service has on record: Store.count reads
+    // one predicate, every Runs row whose service is this instance's name and
     // whose clean column is false. The name comes straight from the vow and the
     // comparison lowers onto the prepared statement, so the count is the store's
-    // answer, not a scan in the pledge. A store failure is Err(75); no unclean
-    // run is a clean Ok(0). The supervisor reads this to decide whether a
-    // service has crashed too many times to restart.
+    // own answer and the rows never materialize into the pledge. A store failure
+    // is Err(75); no unclean run is a clean Ok(0). The supervisor reads this to
+    // decide whether a service has crashed too many times to restart.
     pledge crashes() -> Result<Int, Int> {
-        return match Store.query(Runs, service == name && clean == false) {
-            Ok(rows) -> {
-                let mut n = 0
-                for row in rows {
-                    n = n + 1
-                }
-                Ok(n)
-            }
+        return match Store.count(Runs, service == name && clean == false) {
+            Ok(n) -> Ok(n)
             _ -> Err(75)
         }
     }

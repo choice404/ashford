@@ -488,6 +488,11 @@ AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
                                const AshStoreTerm* terms, uint32_t nterms,
                                uint32_t order_col, uint32_t order_desc,
                                const AshValue* limit, AshValue* out);
+/* query_where, answering only how many rows match, as the Ok(Int) Result
+ * every read form answers, with no row ever materialized. */
+AshStatus ash_store_count_where(AshContract* c, const AshSchemaDesc* schema,
+                                const AshStoreTerm* terms, uint32_t nterms,
+                                AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

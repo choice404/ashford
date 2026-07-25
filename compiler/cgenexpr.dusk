@@ -1107,6 +1107,18 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
     }
+    if str_eq(op, "count") {
+        // count answers how many rows the predicate accepts without
+        // materializing any of them, so the predicate lowers to the same term
+        // array the where form builds and the count primitive reads it, landing
+        // the Int the surface promised in the fresh temporary. The value is not
+        // a list but the count itself, its Result Ok the primitive wraps.
+        arrc, ntermsc := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+        callc: string = tmsg7(" = ash_store_count_where(cc, ", schref, ", ", arrc, ", ", int_to_string(ntermsc), tmsg5("u, &", out, ");", "", ""))
+        cg_line(g, tmsg3("AshStatus ", st, callc))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        return CVal { cvar: out, ty: ty_result(t, ty_int(t), err_ty) }
+    }
     if str_eq(op, "insert") {
         row: CVal = gen_expr(g, cg_arg_expr(g, e, 1), row_ty)
         call2: string = tmsg5(" = ash_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))

@@ -847,6 +847,39 @@ static uint8_t* instance_store_bytes(void* ctx, uint64_t n) {
     return ash_bytes((AshContract*)ctx, n);
 }
 
+typedef struct StoreScratchBlock {
+    struct StoreScratchBlock* next;
+    union {
+        long double ld;
+        void* ptr;
+        int64_t i;
+    } align;
+} StoreScratchBlock;
+
+typedef struct StoreScratchAlloc {
+    StoreScratchBlock* blocks;
+} StoreScratchAlloc;
+
+static uint8_t* scratch_store_bytes(void* ctx, uint64_t n) {
+    if (n > SIZE_MAX - sizeof(StoreScratchBlock)) return NULL;
+    StoreScratchAlloc* scratch = (StoreScratchAlloc*)ctx;
+    StoreScratchBlock* block = (StoreScratchBlock*)malloc(sizeof(StoreScratchBlock) + (size_t)n);
+    if (!block) return NULL;
+    block->next = scratch->blocks;
+    scratch->blocks = block;
+    return (uint8_t*)(block + 1);
+}
+
+static void scratch_store_free(StoreScratchAlloc* scratch) {
+    StoreScratchBlock* block = scratch->blocks;
+    while (block) {
+        StoreScratchBlock* next = block->next;
+        free(block);
+        block = next;
+    }
+    scratch->blocks = NULL;
+}
+
 /* Opens the store connection at sign and reconciles every schema against the
  * live database in the same call, the whole store side of sign. A store-backed
  * contract, one with at least one schema, binds a database named by its dsn
@@ -948,6 +981,27 @@ static char* store_sql_select_where(const AshSchemaDesc* s,
     for (uint32_t i = 0; i < s->ncols; i++)
         n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
     n += (size_t)snprintf(q + n, need - n, " FROM %s WHERE ", s->table);
+    for (uint32_t i = 0; i < nterms; i++) {
+        n += (size_t)snprintf(q + n, need - n, "%s%s %s ?%u",
+                              i ? " AND " : "", s->cols[terms[i].col].name,
+                              ops[terms[i].cmp], i + 1);
+    }
+    return q;
+}
+
+/* SELECT COUNT(*) FROM table WHERE c0 OP ?1 AND ..., every term bound. */
+static char* store_sql_count_where(const AshSchemaDesc* s,
+                                   const AshStoreTerm* terms,
+                                   uint32_t nterms) {
+    static const char* ops[] = { "=", "<>", "<", "<=", ">", ">=" };
+    size_t need = 48 + strlen(s->table);
+    for (uint32_t i = 0; i < nterms; i++) {
+        need += strlen(s->cols[terms[i].col].name) + strlen(ops[terms[i].cmp]) + 24;
+    }
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT COUNT(*) FROM %s WHERE ", s->table);
     for (uint32_t i = 0; i < nterms; i++) {
         n += (size_t)snprintf(q + n, need - n, "%s%s %s ?%u",
                               i ? " AND " : "", s->cols[terms[i].col].name,
@@ -1256,6 +1310,64 @@ AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
         }
         free(sql);
         free(cts);
+        free(params);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_count_where(AshContract* c, const AshSchemaDesc* schema,
+                                const AshStoreTerm* terms, uint32_t nterms,
+                                AshValue* out) {
+    if (!c || !schema || !terms || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (schema->ncols == 0 || nterms == 0) return ASH_ERR_TYPE;
+    for (uint32_t i = 0; i < nterms; i++) {
+        if (terms[i].col >= schema->ncols) return ASH_ERR_TYPE;
+        if (terms[i].cmp > ASH_CMP_GE) return ASH_ERR_TYPE;
+        if (!terms[i].value) return ASH_ERR_TYPE;
+        if (terms[i].value->ty != schema->cols[terms[i].col].ty) return ASH_ERR_TYPE;
+    }
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_count_where(schema, terms, nterms);
+        AshValue* params = (AshValue*)malloc((size_t)nterms * sizeof(AshValue));
+        if (!sql || !params) {
+            st = ASH_ERR_OOM;
+        } else {
+            for (uint32_t i = 0; i < nterms; i++) params[i] = *terms[i].value;
+            uint32_t count_types[1] = { ASH_TY_INT };
+            StoreScratchAlloc scratch = { NULL };
+            AshStoreAlloc alloc = { scratch_store_bytes, &scratch };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, params, nterms, count_types, NULL,
+                                 1, &alloc, &rows);
+            if (st == ASH_OK) {
+                if (rows.ty != ASH_TY_LIST || rows.as.list.len != 1 || !rows.as.list.data) {
+                    st = ASH_ERR_STORE;
+                } else {
+                    AshValue* rec = (AshValue*)rows.as.list.data;
+                    if (rec[0].ty != ASH_TY_RECORD || rec[0].as.list.len != 1 ||
+                        !rec[0].as.list.data) {
+                        st = ASH_ERR_STORE;
+                    } else {
+                        AshValue* field = (AshValue*)rec[0].as.list.data;
+                        if (field[0].ty != ASH_TY_INT) {
+                            st = ASH_ERR_STORE;
+                        } else {
+                            AshValue count;
+                            memset(&count, 0, sizeof(count));
+                            count.ty = ASH_TY_INT;
+                            count.as.i = field[0].as.i;
+                            st = store_ok(c, &count, out);
+                        }
+                    }
+                }
+            }
+            scratch_store_free(&scratch);
+        }
+        free(sql);
         free(params);
     }
     pthread_mutex_unlock(&c->mu);

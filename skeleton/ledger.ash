@@ -78,20 +78,16 @@ contract Ledger {
         }
     }
 
-    // The number of accounts holding at least a given balance: Store.query reads
-    // the predicate form, comparing the balance column against the floor with
-    // '>=', and answers every row that clears it. The pledge counts them, a
-    // floor no account clears a clean Ok(0), and only a backend failure leaves
-    // this Result as Err(StoreFailed) for the status channel.
+    // The number of accounts holding at least a given balance: Store.count
+    // clears the balance column against the floor with '>=' and answers how many
+    // rows pass, the count the store's own answer with the rows never
+    // materialized into the process. A floor no account clears is a clean Ok(0),
+    // and only a backend failure leaves this Result as Err(StoreFailed) for the
+    // status channel.
     pledge rich(min: Float) -> Result<Int, LedgerError> {
-        return match Store.query(Accounts, balance >= min) {
-            Ok(rows) -> {
-                let mut n = 0
-                for row in rows {
-                    n = n + 1
-                }
-                Ok(n)
-            }
+        // count is answered by the store; the rows never enter the process.
+        return match Store.count(Accounts, balance >= min) {
+            Ok(n) -> Ok(n)
             _ -> Err(StoreFailed)
         }
     }
