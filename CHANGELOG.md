@@ -5,6 +5,42 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.5] the either predicate
+
+The predicate learns or. A `Store.query` predicate now joins comparisons
+with `&&` and `||`, `&&` binding tighter as everywhere in the language,
+and the compiler normalizes the whole tree into an or of and groups
+before the program runs: the terms flatten in order, the group lengths
+ride beside them, and one prepared statement carries every group
+parenthesized with every value still a bound parameter. A pure
+conjunction keeps its existing lowering byte for byte, proven against
+the emitted C, so nothing already compiled moves. `Store.count` and
+`Store.sum` keep their conjunction only rule and their exact refusal for
+now; the aggregates learn or when their groups do.
+
+- let or into the checker where and lives: check_query_pred carries an
+  allow_or switch, the three query forms allow it, count and sum refuse
+  it with the same words they always used, and every other predicate
+  diagnostic holds unchanged
+- normalize at compile time: disjunction distributes over conjunction
+  into or of and groups in codegen, a shared comparison re lowered per
+  group because a pure expression re emitted is simpler than a temp
+  shared across groups
+- lower onto one runtime primitive: ash_store_select takes the flat
+  terms, the group lengths, an optional order, and an optional bound
+  that still requires the order, builds every group parenthesized from
+  the schema descriptor, and answers rows on the instance like every
+  read
+- walk the tails and the mix in the gate: extremes reads both ends of
+  the balances in one ordered or, folding the injection owner string
+  through a group untouched, and notable counts a mixed group, an owner
+  conjunction or a vip floor, with a row satisfying both disjuncts
+  counted once because sql or is row membership, not addition
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  the predicate reads comparisons joined with && and ||, count and sum
+  say conjunction only, and the leaves out list narrows to negation,
+  disjunction under the aggregates, and the rest it names
+
 ## [v0.6.4] the summed read
 
 The store answers how much. `Store.sum(S, column, predicate)` sums one

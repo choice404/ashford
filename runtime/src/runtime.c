@@ -1093,6 +1093,51 @@ static char* store_sql_select_page(const AshSchemaDesc* s,
     return q;
 }
 
+/* SELECT c0, c1, ... FROM table WHERE (g0) OR (g1), optionally ordered and bounded. */
+static char* store_sql_select_any(const AshSchemaDesc* s,
+                                  const AshStoreTerm* terms,
+                                  const uint32_t* group_lens,
+                                  uint32_t ngroups,
+                                  uint32_t total_terms,
+                                  uint32_t order_col,
+                                  uint32_t order_desc,
+                                  uint32_t bounded) {
+    static const char* ops[] = { "=", "<>", "<", "<=", ">", ">=" };
+    const uint32_t ordered = order_col != ASH_STORE_NO_ORDER;
+    const char* dir = order_desc ? "DESC" : "ASC";
+    size_t need = 80 + strlen(s->table) + store_cols_span(s) + (size_t)ngroups * 8;
+    if (ordered) need += strlen(s->cols[order_col].name) + strlen(dir) + 16;
+    if (bounded) need += 24;
+    for (uint32_t i = 0; i < total_terms; i++) {
+        need += strlen(s->cols[terms[i].col].name) + strlen(ops[terms[i].cmp]) + 24;
+    }
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    uint32_t term_i = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT ");
+    for (uint32_t i = 0; i < s->ncols; i++)
+        n += (size_t)snprintf(q + n, need - n, "%s%s", i ? ", " : "", s->cols[i].name);
+    n += (size_t)snprintf(q + n, need - n, " FROM %s WHERE ", s->table);
+    for (uint32_t g = 0; g < ngroups; g++) {
+        n += (size_t)snprintf(q + n, need - n, "%s(", g ? " OR " : "");
+        for (uint32_t i = 0; i < group_lens[g]; i++) {
+            const AshStoreTerm* term = &terms[term_i];
+            n += (size_t)snprintf(q + n, need - n, "%s%s %s ?%u",
+                                  i ? " AND " : "", s->cols[term->col].name,
+                                  ops[term->cmp], term_i + 1);
+            term_i++;
+        }
+        n += (size_t)snprintf(q + n, need - n, ")");
+    }
+    if (ordered) {
+        n += (size_t)snprintf(q + n, need - n, " ORDER BY %s %s",
+                              s->cols[order_col].name, dir);
+    }
+    if (bounded) snprintf(q + n, need - n, " LIMIT ?%u", total_terms + 1);
+    return q;
+}
+
 /* INSERT INTO table(c0, ...) VALUES(?, ...), every column bound positionally. */
 static char* store_sql_insert(const AshSchemaDesc* s) {
     size_t need = 48 + strlen(s->table) + store_cols_span(s) + (size_t)s->ncols * 3;
@@ -1329,6 +1374,64 @@ AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
             AshStoreAlloc alloc = { instance_store_bytes, c };
             AshValue rows;
             st = ash_store_query(c->store, sql, params, nterms + 1, cts, NULL,
+                                 schema->ncols, &alloc, &rows);
+            if (st == ASH_OK) st = store_ok(c, &rows, out);
+        }
+        free(sql);
+        free(cts);
+        free(params);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_select(AshContract* c, const AshSchemaDesc* schema,
+                           const AshStoreTerm* terms,
+                           const uint32_t* group_lens, uint32_t ngroups,
+                           uint32_t order_col, uint32_t order_desc,
+                           const AshValue* limit, AshValue* out) {
+    if (!c || !schema || !terms || !group_lens || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (schema->ncols == 0 || ngroups == 0) return ASH_ERR_TYPE;
+    uint32_t total_terms = 0;
+    for (uint32_t g = 0; g < ngroups; g++) {
+        if (group_lens[g] == 0) return ASH_ERR_TYPE;
+        if (UINT32_MAX - total_terms < group_lens[g]) return ASH_ERR_TYPE;
+        total_terms += group_lens[g];
+    }
+    for (uint32_t i = 0; i < total_terms; i++) {
+        if (terms[i].col >= schema->ncols) return ASH_ERR_TYPE;
+        if (terms[i].cmp > ASH_CMP_GE) return ASH_ERR_TYPE;
+        if (!terms[i].value) return ASH_ERR_TYPE;
+        if (terms[i].value->ty != schema->cols[terms[i].col].ty) return ASH_ERR_TYPE;
+    }
+    uint32_t bounded = limit != NULL;
+    if (order_col == ASH_STORE_NO_ORDER) {
+        if (bounded) return ASH_ERR_TYPE;
+    } else {
+        if (order_col >= schema->ncols) return ASH_ERR_TYPE;
+        if (order_desc > 1) return ASH_ERR_TYPE;
+    }
+    if (bounded) {
+        if (limit->ty != ASH_TY_INT) return ASH_ERR_TYPE;
+        if (limit->as.i < 0) return ASH_ERR_TYPE;
+        if (total_terms == UINT32_MAX) return ASH_ERR_TYPE;
+    }
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = store_sql_select_any(schema, terms, group_lens, ngroups, total_terms,
+                                         order_col, order_desc, bounded);
+        uint32_t* cts = store_col_types(schema);
+        AshValue* params = (AshValue*)malloc((size_t)(total_terms + bounded) * sizeof(AshValue));
+        if (!sql || !cts || !params) {
+            st = ASH_ERR_OOM;
+        } else {
+            for (uint32_t i = 0; i < total_terms; i++) params[i] = *terms[i].value;
+            if (bounded) params[total_terms] = *limit;
+            AshStoreAlloc alloc = { instance_store_bytes, c };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, params, total_terms + bounded, cts, NULL,
                                  schema->ncols, &alloc, &rows);
             if (st == ASH_OK) st = store_ok(c, &rows, out);
         }

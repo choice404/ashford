@@ -939,6 +939,165 @@ func cg_build_term_array(g: *Cg, rs: RecSig, xid: int64) -> (string, int64) {
     return (arr, vec_len(terms))
 }
 
+// Whether a Store.query predicate carries a ||. A pure && predicate keeps the
+// where, ordered, and page lowerings the golden pins; a predicate with even one
+// || normalizes to disjunctive normal form and rides the select primitive
+// instead, so the two paths never share a byte.
+func cg_pred_has_or(g: *Cg, xid: int64) -> bool {
+    a: *Ast = (*g).ast
+    x: ExprNode = vec_get((*a).exprs, xid)
+    if x.kind == xk_binary() {
+        if x.a == bop_or() { return true }
+        if x.a == bop_and() {
+            if cg_pred_has_or(g, x.b) { return true }
+            return cg_pred_has_or(g, x.c)
+        }
+    }
+    return false
+}
+
+// The disjunctive normal form of a Store.query predicate as an OR of AND-groups,
+// each group a list of comparison expression ids. A comparison is one group of
+// one term; a && multiplies the two sides, every left group concatenated with
+// every right group; a || unions the two sides' groups. The checker already
+// proved every leaf a comparison, so the walk reads only &&, ||, and comparison
+// nodes. A comparison shared across groups, the way a && over a || repeats it,
+// rides its id in each group and lowers its value once per group at emit.
+func cg_dnf(g: *Cg, xid: int64) -> *Vector<*Vector<int64>> {
+    a: *Ast = (*g).ast
+    x: ExprNode = vec_get((*a).exprs, xid)
+    if x.kind == xk_binary() {
+        if x.a == bop_or() {
+            left: *Vector<*Vector<int64>> = cg_dnf(g, x.b)
+            right: *Vector<*Vector<int64>> = cg_dnf(g, x.c)
+            mut ri: int64 = 0
+            while ri < vec_len(right) {
+                vec_push(left, vec_get(right, ri))
+                ri = ri + 1
+            }
+            return left
+        }
+        if x.a == bop_and() {
+            left: *Vector<*Vector<int64>> = cg_dnf(g, x.b)
+            right: *Vector<*Vector<int64>> = cg_dnf(g, x.c)
+            out: *Vector<*Vector<int64>> = alloc(vec_new())
+            mut li: int64 = 0
+            while li < vec_len(left) {
+                lg: *Vector<int64> = vec_get(left, li)
+                mut rj: int64 = 0
+                while rj < vec_len(right) {
+                    rg: *Vector<int64> = vec_get(right, rj)
+                    grp: *Vector<int64> = alloc(vec_new())
+                    mut ki: int64 = 0
+                    while ki < vec_len(lg) {
+                        vec_push(grp, vec_get(lg, ki))
+                        ki = ki + 1
+                    }
+                    mut mi: int64 = 0
+                    while mi < vec_len(rg) {
+                        vec_push(grp, vec_get(rg, mi))
+                        mi = mi + 1
+                    }
+                    vec_push(out, grp)
+                    rj = rj + 1
+                }
+                li = li + 1
+            }
+            return out
+        }
+    }
+    grp: *Vector<int64> = alloc(vec_new())
+    vec_push(grp, xid)
+    single: *Vector<*Vector<int64>> = alloc(vec_new())
+    vec_push(single, grp)
+    return single
+}
+
+// One comparison of a DNF group lowered into its own AshStoreTerm initializer,
+// { column index, comparison, &value }. The left side is the bare column the
+// checker resolved to a schema field, so it lowers to that field's declaration
+// index, and the value lowers against the column's type into a fresh temporary
+// the initializer borrows. This is the where form's leaf, read one comparison
+// at a time so a group can hold any run of them.
+func cg_select_term(g: *Cg, rs: RecSig, xid: int64) -> string {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    x: ExprNode = vec_get((*a).exprs, xid)
+    le: ExprNode = vec_get((*a).exprs, x.b)
+    mut colidx: int64 = -1
+    mut col_ty: int64 = ty_unknown(t)
+    mut i: int64 = 0
+    while i < rs.len {
+        f: FieldSig = sig_field((*g).sigs, rs.off, i)
+        if f.name == le.a {
+            colidx = i
+            col_ty = f.ty
+        }
+        i = i + 1
+    }
+    val: CVal = gen_expr(g, x.c, col_ty)
+    return tmsg7("{ ", int_to_string(colidx), "u, ", cg_cmp_name(x.a), ", &", val.cvar, " }")
+}
+
+// Emits one C array declaration, 'TYPE arr[] = { item, item };', from a vector
+// of initializer strings the caller already formatted. The flat term array and
+// the group-length array of a select both ride this one spelling.
+func cg_emit_init_array(g: *Cg, decl: string, arr: string, items: *Vector<string>) -> void {
+    line: *StringBuilder = alloc(sb_new())
+    sb_push(line, decl)
+    sb_push(line, arr)
+    sb_push(line, "[] = { ")
+    mut i: int64 = 0
+    while i < vec_len(items) {
+        if i > 0 { sb_push(line, ", ") }
+        sb_push(line, vec_get(items, i))
+        i = i + 1
+    }
+    sb_push(line, " };")
+    text: string = substring(sb_cstr(line), 0, sb_size(line))
+    sb_free(line)
+    free(line)
+    cg_line(g, text)
+    free(text)
+}
+
+// A Store.query predicate that carries a || lowered onto ash_store_select. The
+// predicate normalizes to disjunctive normal form and its groups flatten, group
+// by group, into one AshStoreTerm array; a parallel uint32_t array holds each
+// group's length, so the primitive reads group i as the group_lens[i] terms
+// after the groups before it. ordcol_s is a column index with its 'u' suffix
+// when the query is ordered or ASH_STORE_NO_ORDER when it is not, dir_s is the
+// direction the same way, and limref is the address of an Int temporary when the
+// query is bounded or NULL when it is not. Each comparison's value lowers into
+// its own temporary, a term repeated across groups re-lowering its value, so the
+// array initializers borrow live values.
+func cg_store_select(g: *Cg, rs: RecSig, xid: int64, schref: string, out: string, st: string, ordcol_s: string, dir_s: string, limref: string) -> void {
+    dnf: *Vector<*Vector<int64>> = cg_dnf(g, xid)
+    terms: *Vector<string> = alloc(vec_new())
+    lens: *Vector<string> = alloc(vec_new())
+    mut gi: int64 = 0
+    while gi < vec_len(dnf) {
+        grp: *Vector<int64> = vec_get(dnf, gi)
+        mut ti: int64 = 0
+        while ti < vec_len(grp) {
+            vec_push(terms, cg_select_term(g, rs, vec_get(grp, ti)))
+            ti = ti + 1
+        }
+        vec_push(lens, tmsg2(int_to_string(vec_len(grp)), "u"))
+        gi = gi + 1
+    }
+    tarr: string = cg_tmp(g)
+    cg_emit_init_array(g, "AshStoreTerm ", tarr, terms)
+    garr: string = cg_tmp(g)
+    cg_emit_init_array(g, "uint32_t ", garr, lens)
+    ng: string = int_to_string(vec_len(dnf))
+    head: string = tmsg7("AshStatus ", st, " = ash_store_select(cc, ", schref, ", ", tarr, ", ")
+    mid: string = tmsg7(garr, ", ", ng, "u, ", ordcol_s, ", ", dir_s)
+    tail: string = tmsg7(", ", limref, ", &", out, ");", "", "")
+    cg_line(g, tmsg3(head, mid, tail))
+    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+}
+
 // A Store.* operation lowered onto its runtime primitive. The schema name is a
 // bare identifier, resolved to the emitted descriptor entry and never lowered
 // as a value; the key and row lower against the types the schema fixes. The
@@ -979,6 +1138,14 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
     }
     if str_eq(op, "query") {
         if e.c == 2 {
+            // A predicate carrying a || normalizes to disjunctive normal form and
+            // rides the select primitive; a pure && predicate keeps the where
+            // lowering byte for byte.
+            pred2: int64 = cg_arg_expr(g, e, 1)
+            if cg_pred_has_or(g, pred2) {
+                cg_store_select(g, rs, pred2, schref, out, st, "ASH_STORE_NO_ORDER", "0u", "NULL")
+                return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+            }
             // The predicate form: each comparison's value lowers into its own
             // temporary and one AshStoreTerm rides an array beside it, and the
             // where primitive answers every row the whole predicate accepts.
@@ -1018,7 +1185,6 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                 if ocn.kind == xk_ident() {
                     octext: string = ast_name(a, ocn.a)
                     if str_eq(octext, "asc") || str_eq(octext, "desc") {
-                        arr2, nterms2 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
                         iarg: ArgNode = vec_get((*a).args, vec_get((*a).kids, a2oe.b))
                         ie: ExprNode = vec_get((*a).exprs, iarg.expr)
                         mut ordcol: int64 = -1
@@ -1034,6 +1200,16 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                         }
                         mut descflag: string = "0u"
                         if str_eq(octext, "desc") { descflag = "1u" }
+                        // A || in the predicate normalizes to DNF and rides the
+                        // select primitive, ordered by the same column; a pure &&
+                        // predicate keeps the ordered lowering byte for byte.
+                        pred3: int64 = cg_arg_expr(g, e, 1)
+                        if cg_pred_has_or(g, pred3) {
+                            ordcol_sel: string = tmsg2(int_to_string(ordcol), "u")
+                            cg_store_select(g, rs, pred3, schref, out, st, ordcol_sel, descflag, "NULL")
+                            return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+                        }
+                        arr2, nterms2 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
                         nterms_s: string = tmsg2(int_to_string(nterms2), "u, ")
                         ordcol_s: string = tmsg2(int_to_string(ordcol), "u, ")
                         tail: string = tmsg5(descflag, ", &", out, ");", "")
@@ -1052,7 +1228,6 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         // and its address rides the page primitive, which answers the leading
         // rows of the ordered result the count keeps.
         if e.c == 4 {
-            arr4, nterms4 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
             a2oe: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 2))
             ocn: ExprNode = vec_get((*a).exprs, a2oe.a)
             octext: string = ast_name(a, ocn.a)
@@ -1073,6 +1248,19 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             if str_eq(octext, "desc") { descflag = "1u" }
             lce: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 3))
             larg: ArgNode = vec_get((*a).args, vec_get((*a).kids, lce.b))
+            // A || in the predicate normalizes to DNF and rides the select
+            // primitive, ordered and bounded by the same column and count; a pure
+            // && predicate keeps the page lowering byte for byte. The count lowers
+            // into its own Int temporary either way, its address the limit.
+            pred4: int64 = cg_arg_expr(g, e, 1)
+            if cg_pred_has_or(g, pred4) {
+                lvalsel: CVal = gen_expr(g, larg.expr, ty_int(t))
+                ordcol_sel4: string = tmsg2(int_to_string(ordcol), "u")
+                limref4: string = tmsg3("&", lvalsel.cvar, "")
+                cg_store_select(g, rs, pred4, schref, out, st, ordcol_sel4, descflag, limref4)
+                return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
+            }
+            arr4, nterms4 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
             lval: CVal = gen_expr(g, larg.expr, ty_int(t))
             nterms4_s: string = tmsg2(int_to_string(nterms4), "u, ")
             ordcol4_s: string = tmsg2(int_to_string(ordcol), "u, ")

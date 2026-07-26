@@ -316,6 +316,55 @@ int main(void) {
         CHECK(ok_str(&r, "bobaliceadaada"),
               "top_owners(40.0, 100) folds every matching owner in order");
 
+        /* Store.query in its disjunctive form: a predicate that joins
+         * comparisons with '||' as well as '&&'. The compiler normalizes the
+         * predicate to an OR of AND-groups and the store answers every row
+         * either side accepts, the tails merged into one set. The table holds
+         * 1/alice 250, 3/injection 5, 10/ada 40, 11/ada 60, and 12/bob 999.
+         * extremes(10.0, 500.0) keeps the rows at or below 10 or at or above
+         * 500, so account 3 (balance 5) and account 12 (balance 999), orders
+         * them ascending, 5 then 999, and folds their owners, the injection
+         * string then bob; the middle three are excluded by both tails. */
+        AshValue ext_lohi[2] = { float_val(10.0), float_val(500.0) };
+        r = run(c, "extremes", ext_lohi, 2);
+        CHECK(ok_str(&r, "'); DROP TABLE Accounts; --bob"),
+              "extremes(10.0, 500.0) folds the low and high tails by ascending balance");
+
+        /* A range that spans every balance leaves both tails empty: nothing is
+         * at or below 0 and nothing at or above 100000, so the disjunction
+         * accepts no row and the ordered fold never runs. */
+        AshValue ext_none[2] = { float_val(0.0), float_val(100000.0) };
+        r = run(c, "extremes", ext_none, 2);
+        CHECK(ok_str(&r, ""),
+              "extremes(0.0, 100000.0) matches neither tail and is an ordered Ok(\"\")");
+
+        /* notable counts the rows a '||' predicate accepts, a two comparison
+         * AND-group ored with a lone comparison, since count itself joins only
+         * with '&&' and so cannot read the disjunction. '&&' binds the owner
+         * group tighter than the '||' that widens it. notable("ada", 50.0,
+         * 900.0) accepts ada's own accounts at or above 50, account 11 (balance
+         * 60), or anyone at or above 900, account 12 (bob 999), two distinct
+         * rows. */
+        AshValue not_ada[3] = { str_val("ada"), float_val(50.0), float_val(900.0) };
+        r = run(c, "notable", not_ada, 3);
+        CHECK(ok_int(&r, &cnt) && cnt == 2,
+              "notable(ada, 50, 900) counts ada's 60 and bob's 999");
+
+        /* A row that satisfies both disjuncts is still one row: bob's 999 clears
+         * his own floor of 50 and the vip mark of 500 alike, so the union counts
+         * it once, never twice. */
+        AshValue not_bob[3] = { str_val("bob"), float_val(50.0), float_val(500.0) };
+        r = run(c, "notable", not_bob, 3);
+        CHECK(ok_int(&r, &cnt) && cnt == 1,
+              "notable(bob, 50, 500) counts bob's 999 once though it clears both disjuncts");
+
+        /* A predicate no account satisfies is a clean Ok(0), the empty list a
+         * fold that never runs. */
+        AshValue not_none[3] = { str_val("nobody"), float_val(50.0), float_val(10000.0) };
+        r = run(c, "notable", not_none, 3);
+        CHECK(ok_int(&r, &cnt) && cnt == 0,
+              "notable(nobody, 50, 10000) matches no row and is Ok(0)");
+
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }
 

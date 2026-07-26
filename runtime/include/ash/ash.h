@@ -499,6 +499,17 @@ AshStatus ash_store_count_where(AshContract* c, const AshSchemaDesc* schema,
 AshStatus ash_store_sum_where(AshContract* c, const AshSchemaDesc* schema,
                               uint32_t sum_col, const AshStoreTerm* terms,
                               uint32_t nterms, AshValue* out);
+
+#define ASH_STORE_NO_ORDER UINT32_MAX
+
+/* Selects rows matching an OR of AND groups. Every group owns its next terms
+ * and is parenthesized. order_col may be ASH_STORE_NO_ORDER for backend order;
+ * a nonnegative Int limit may be supplied only when an order is supplied. */
+AshStatus ash_store_select(AshContract* c, const AshSchemaDesc* schema,
+                           const AshStoreTerm* terms,
+                           const uint32_t* group_lens, uint32_t ngroups,
+                           uint32_t order_col, uint32_t order_desc,
+                           const AshValue* limit, AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

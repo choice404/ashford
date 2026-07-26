@@ -189,6 +189,53 @@ contract Ledger {
         }
     }
 
+    // The owners of the accounts at the two ends of the balance range, listed by
+    // ascending balance: Store.query reads a predicate that joins two
+    // comparisons with '||', the balance at or below a low water mark or at or
+    // above a high one, so a row passes when it sits in either tail. asc(balance)
+    // fixes the order over the whole matching set, low balances first, and the
+    // pledge folds the owners of the returned rows into one string in that order.
+    // '||' widens the predicate the way '&&' narrows it, and query answers every
+    // row either side of the disjunction accepts, the two tails merged into one
+    // ordered list. A range that no account falls outside is a clean Ok(""), the
+    // empty list a fold that never runs, and only a backend failure leaves this
+    // Result as Err(StoreFailed).
+    pledge extremes(lo: Float, hi: Float) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, balance <= lo || balance >= hi, asc(balance)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // How many accounts are notable, either one owner's own holdings at or above
+    // a floor or anyone's holdings at or above a higher mark: Store.query reads a
+    // predicate that ors a two comparison group, the owner bound to a name and
+    // the balance cleared against the floor, with a lone balance comparison
+    // against the vip mark, so '&&' binds the owner group tighter than the '||'
+    // that widens it. count answers only '&&' predicates, so this one rides
+    // query, and the pledge folds a running total over the returned rows into the
+    // count. A predicate no account satisfies is a clean Ok(0), the empty list a
+    // fold that never runs, and only a backend failure leaves this Result as
+    // Err(StoreFailed).
+    pledge notable(who: String, floor: Float, vip: Float) -> Result<Int, LedgerError> {
+        return match Store.query(Accounts, (owner == who && balance >= floor) || balance >= vip) {
+            Ok(rows) -> {
+                let mut n = 0
+                for row in rows {
+                    n = n + 1
+                }
+                Ok(n)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the
