@@ -1,8 +1,8 @@
-# Ashford Language Specification
+# Geas Language Specification
 
 ## Status
 
-This is the language reference for Ashford, a statically typed, contract
+This is the language reference for Geas, a statically typed, contract
 oriented language that sits between other languages. A program declares
 contracts, other languages sign and fulfill them across the C ABI, and a shared
 runtime enforces the terms. This document describes the language as it stands
@@ -12,15 +12,15 @@ match and error propagation, value semantics with one named exception for a
 signed instance, a package aware module system, a first standard library, and
 the interop surface that is the point of the language, a foreign host driving a
 contract through the ABI with no generated bindings. Where this spec states a
-rule, the rule is the one `ashc` enforces and the runtime holds.
+rule, the rule is the one `geas` enforces and the runtime holds.
 
-Ashford is built in three layers. Layer 1, the core language and the in process
+Geas is built in three layers. Layer 1, the core language and the in process
 runtime, is complete. Layer 2, the network runtime, runs: the same contracts
 served over a socket and fulfilled across a machine boundary with the host code
 unchanged. Layer 3, the store runtime, contracts backed by a database, is in
 progress; the store surface is described here and marked where it is still
-landing. The compiler is `ashc`, source files end in `.ash`, a compiled module
-ends in `.ash.so`, and the runtime is a shared C library, `libashrt`.
+landing. The compiler is `geas`, source files end in `.geas`, a compiled module
+ends in `.geas.so`, and the runtime is a shared C library, `libgeasrt`.
 
 ---
 
@@ -54,7 +54,7 @@ ends in `.ash.so`, and the runtime is a shared C library, `libashrt`.
   language boundary. A failure is a value the caller matches on.
 - Interop is the primary goal. The runtime owns every heap allocation that
   crosses a boundary, data passes by value in both directions, and a reference
-  is copied on entry and written back on return, never held by Ashford.
+  is copied on entry and written back on return, never held by Geas.
 - The runtime enforces the terms. A contract's shape, its vows, its fulfillment
   policy, and its version are checked at the boundary, so a mismatch is a
   descriptive error and never silent corruption.
@@ -70,11 +70,11 @@ is a package.
 An `import` names a module by a dotted path:
 
 ```text
-import ashstd.math
-import ashstd.collections
+import std.math
+import std.collections
 ```
 
-A dotted path resolves beside the root file first and then under `ASH_HOME`. A
+A dotted path resolves beside the root file first and then under `GEAS_HOME`. A
 directory is a package and a file is a module within it. Every imported file
 parses into one shared tree, with each file's spans mapped back to its own
 source so a diagnostic names the right place. A cycle in the import graph and a
@@ -94,7 +94,7 @@ signature.
 
 ## Contracts
 
-A contract is the unit of Ashford. It groups the state a signing locks, the
+A contract is the unit of Geas. It groups the state a signing locks, the
 commitments a host fulfills, the internal methods those commitments share, and
 the policy that decides when the whole is fulfilled, partially fulfilled, or
 broken.
@@ -421,7 +421,7 @@ The single exception to value semantics is a signed instance, described next.
 
 ## Provisional Clauses
 
-A provisional clause is Ashford's trait: a named set of clause signatures a
+A provisional clause is Geas's trait: a named set of clause signatures a
 contract can promise to satisfy.
 
 ```text
@@ -485,7 +485,7 @@ worker, so nested calls cannot starve the pool.
 
 ## Standalone Programs
 
-Ashford is a language you can compile straight to an executable. A program
+Geas is a language you can compile straight to an executable. A program
 declares exactly one `Main` contract with a `run` pledge over `List<String>`
 returning `Result<Int, E>`:
 
@@ -504,7 +504,7 @@ contract Main {
 }
 ```
 
-`ashc build --bin` links it into a real program: the generated wrapper signs
+`geas build --bin` links it into a real program: the generated wrapper signs
 `Main`, hands `argv` to `run` as a `List<String>`, and maps the result onto the
 process exit code. `Ok(n)` becomes the exit code, and an `Err` renders itself to
 stderr and exits 1. A `--bin` module still emits every contract in the file, not
@@ -514,13 +514,13 @@ stderr and exits 1. A `--bin` module still emits every contract in the file, not
 
 ## The Standard Library
 
-A first standard library lives under `lib/ashstd` and is pulled in with `import`:
+A first standard library lives under `lib/std` and is pulled in with `import`:
 
-- **`ashstd.math`**: overflow checked arithmetic pledges and an epsilon vow.
-- **`ashstd.strings`** and **`ashstd.collections`**: string and list helpers
+- **`std.math`**: overflow checked arithmetic pledges and an epsilon vow.
+- **`std.strings`** and **`std.collections`**: string and list helpers
   shaped to what the language expresses today.
-- **`ashstd.errors`**: common error sums for the `E` slot.
-- **`ashstd.traits`**: the provisional clauses, `Comparable`, `Loggable`, and
+- **`std.errors`**: common error sums for the `E` slot.
+- **`std.traits`**: the provisional clauses, `Comparable`, `Loggable`, and
   `Serializable`.
 
 A module lends another its record and sum shapes, its error sums, its provisional
@@ -531,7 +531,7 @@ declared in another, fulfill its pledges, and break it.
 
 ## Interop and the ABI
 
-This is the reason the language exists. A compiled `.ash.so` module carries
+This is the reason the language exists. A compiled `.geas.so` module carries
 descriptor tables that spell every contract, every pledge and its signature, and
 every vow and its default. When the runtime loads the module it registers all of
 it in the iname table, and a foreign host drives a contract through a handful of
@@ -544,18 +544,18 @@ mangled name that bakes in the contract, the pledge, a 64 bit FNV-1a hash of the
 type signature, and the version. A host looks a contract up by that name, and
 because the name carries the shape hash, a version mismatch is a clean error at
 discovery time. The table supports lookup by exact mangled name, ordered
-enumeration, and a canonical one line per entry dump. `ash_runtime_freeze` makes
+enumeration, and a canonical one line per entry dump. `geas_runtime_freeze` makes
 the table immutable: after it, loading, registering, and binding refuse, while
 signing and fulfilling continue.
 
 The mangled name has the form
-`__ash_ash_{contract}_{symbol}_{sighash}_v{n}`, and `ashc emit-header` writes the
+`__geas_ash_{contract}_{symbol}_{sighash}_v{n}`, and `geas emit-header` writes the
 shape hash and every mangled name as C defines so a host resolves against
 generated names instead of string literals.
 
 ### Values
 
-Every value that crosses the boundary is an `AshValue`, a tagged union whose
+Every value that crosses the boundary is an `GeasValue`, a tagged union whose
 layout is fixed and documented. Integers, floats, strings, lists, tuples, maps,
 records, sums, options, and results each have a pinned representation. A string
 is a fat value, a pointer and a byte length, UTF-8, no terminator. A list, a
@@ -566,7 +566,7 @@ tuple, a record, and a map all ride one array arm with different rules.
 The runtime owns every heap allocation that crosses the line. Arguments are deep
 copied onto the instance on entry, on the caller's thread, so a host buffer
 rewritten after the call changes nothing. Results are owned by the instance and
-die at its break. A host never frees what Ashford returns, and Ashford never
+die at its break. A host never frees what Geas returns, and Geas never
 holds a pointer into host memory after a call returns.
 
 ### The pledge frame
@@ -575,8 +575,8 @@ Every pledge crosses the boundary in one uniform frame, compiled bodies and host
 bound implementations alike:
 
 ```c
-AshStatus (*AshPledgeFn)(void* ctx, const AshValue* args, size_t nargs,
-                         AshValue* out);
+GeasStatus (*GeasPledgeFn)(void* ctx, const GeasValue* args, size_t nargs,
+                         GeasValue* out);
 ```
 
 `ctx` is the signed instance the fulfillment runs against, and its allocation
@@ -585,8 +585,8 @@ the frame and dispatches, and the network layer serializes the same frame.
 
 ### Futures
 
-Fulfillment is a future. `ash_pledge_fulfill` returns a handle and
-`ash_future_wait` collects the outcome exactly once; a synchronous form fuses the
+Fulfillment is a future. `geas_pledge_fulfill` returns a handle and
+`geas_future_wait` collects the outcome exactly once; a synchronous form fuses the
 two. The ABI never promises where the body runs, on the caller's thread, on a
 worker pool, or across a socket, so a host that waits on a future is unaffected
 when the origin of the answer changes.
@@ -618,7 +618,7 @@ a compiled body, and satisfies the abstract pledge so the contract can sign.
 ### Two languages, one contract
 
 The repository proves the claim with C and with Python. `skeleton/host.c` links
-`libashrt` and speaks the ABI header. `interop/python/ashford.py` is a ctypes
+`libgeasrt` and speaks the ABI header. `interop/python/geas.py` is a ctypes
 binding written against the ABI reference alone, no header parsed and no stubs
 generated. Both hosts sign the same contracts, override the same vows, bind the
 same abstract pledges, and read the same partial surface. The contract is the
@@ -685,7 +685,7 @@ pledge debit(id: Int, amount: Float) -> Result<Unit, LedgerError> {
 and bind every value positionally, never by concatenation, so a value carrying
 SQL is a value and nothing else. The first column of a schema is its primary key.
 A backend failure that the runtime cannot complete, a lost connection, a full
-disk, a refused constraint, is the status `ASH_ERR_STORE` delivered through the
+disk, a refused constraint, is the status `GEAS_ERR_STORE` delivered through the
 fulfillment; a contract's own rules stay values in its own error type.
 `Store.query` and a partial record form of `update` are still landing.
 
@@ -712,13 +712,13 @@ no uncommitted write survives a break and no connection outlives its instance.
 
 ## The Bridge
 
-Across processes the same contracts speak gRPC, and Ashford keeps no wire of
-its own. `ashc emit-proto` writes the wire surface, one typed rpc per pledge
+Across processes the same contracts speak gRPC, and Geas keeps no wire of
+its own. `geas emit-proto` writes the wire surface, one typed rpc per pledge
 and a signing stream whose lifetime is the instance's, plus the session
 wrappers protoc cannot write; a server is ordinary host code holding the
 runtime over the C ABI, and a client in any gRPC language builds from the
 emitted artifacts with stock tooling. A pledge's `Err` crosses as a value on
-an OK rpc, an Ashford status crosses as a gRPC code, the shape hash pins both
+an OK rpc, a Geas status crosses as a gRPC code, the shape hash pins both
 ends to one contract, and a park store lets a session survive its stream, its
 client, and its server. The bridge adds no language surface; it is the same
 contracts, one emitted file wider. The canonical little endian value encoding

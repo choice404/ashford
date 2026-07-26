@@ -8,7 +8,7 @@
 // grammar's defaults synthesized as trees: fulfill when every subcontract
 // and every loose pledge is fulfilled, partial when at least one subcontract
 // is, break when everything is broken, the broken half spelled through
-// ASH_ATOM_BROKEN atoms since a source atom can only test fulfilled-ness.
+// GEAS_ATOM_BROKEN atoms since a source atom can only test fulfilled-ness.
 // A line the source did not write emits no array; length zero is the
 // runtime's constant false. Everything here is deterministic in declaration
 // order, so two builds of one source stay byte identical.
@@ -39,15 +39,15 @@ export struct ReqEmit {
 }
 
 func op_name(op: int64) -> string {
-    if op == 0 { return "ASH_REQ_ATOM" }
-    if op == 1 { return "ASH_REQ_NOT" }
-    if op == 2 { return "ASH_REQ_AND" }
-    return "ASH_REQ_OR"
+    if op == 0 { return "GEAS_REQ_ATOM" }
+    if op == 1 { return "GEAS_REQ_NOT" }
+    if op == 2 { return "GEAS_REQ_AND" }
+    return "GEAS_REQ_OR"
 }
 
 func kind_name(kind: int64) -> string {
-    if kind == 1 { return "ASH_ATOM_BROKEN" }
-    return "ASH_ATOM_FULFILLED"
+    if kind == 1 { return "GEAS_ATOM_BROKEN" }
+    return "GEAS_ATOM_FULFILLED"
 }
 
 // One emitted atom row: the item's name spelled as a C literal or NULL for
@@ -63,7 +63,7 @@ func emit_atom_row(g: *Cg, name: string, is_null: bool, kind: int64, sub: int64,
 // (op, atom) pairs. Nothing is emitted for an empty program.
 func emit_ops(g: *Cg, cname: string, tag: string, ops: *Vector<int64>) -> void {
     if vec_len(ops) == 0 { return }
-    cg_top(g, tmsg7("static const AshReqOp k_", cname, "_", tag, "[] = {", "", ""))
+    cg_top(g, tmsg7("static const GeasReqOp k_", cname, "_", tag, "[] = {", "", ""))
     mut i: int64 = 0
     while i < vec_len(ops) {
         op: int64 = vec_get(ops, i)
@@ -173,7 +173,7 @@ func emit_source_block(g: *Cg, cid: int64, cname: string, rbid: int64, sub_ids: 
 
     natoms: int64 = vec_len(names)
     if natoms > 0 {
-        cg_top(g, tmsg3("static const AshReqAtom k_", cname, "_atoms[] = {"))
+        cg_top(g, tmsg3("static const GeasReqAtom k_", cname, "_atoms[] = {"))
         mut i: int64 = 0
         while i < natoms {
             nm: int64 = vec_get(names, i)
@@ -230,7 +230,7 @@ func emit_default_block(g: *Cg, cname: string, sub_ids: *Vector<int64>, sub_name
         return ReqEmit { nsubs: ns, natoms: 0, has_reqs: false, nfulfill: 0, npartial: 0, nbreak: 0 }
     }
 
-    cg_top(g, tmsg3("static const AshReqAtom k_", cname, "_atoms[] = {"))
+    cg_top(g, tmsg3("static const GeasReqAtom k_", cname, "_atoms[] = {"))
     mut pass: int64 = 0
     while pass < 2 {
         mut s: int64 = 0

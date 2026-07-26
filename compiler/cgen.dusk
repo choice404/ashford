@@ -3,9 +3,9 @@
 // function per clause, a static thunk per compiled pledge body in the
 // uniform frame, the vow and pledge descriptor tables, one contract
 // descriptor per contract with its shape hash and version baked in, and the
-// single exported ash_module_register. Internal contracts emit nothing at
+// single exported geas_module_register. Internal contracts emit nothing at
 // all, which is what keeps them out of the descriptor and iname story.
-// The emitted C includes ash/ash.h and nothing else defines a layout.
+// The emitted C includes geas/geas.h and nothing else defines a layout.
 //
 // The shape hash is FNV-1a 64 of the contract's canonical signature string:
 // the contract name, then every vow and every pledge in declaration order,
@@ -231,7 +231,7 @@ func vow_default_text(g: *Cg, v: VowNode, tyid: int64) -> string {
 func emit_vows(g: *Cg, cid: int64, cname: string, vows: *Vector<VowInfo>) -> void {
     a: *Ast = (*g).ast
     if vec_len(vows) == 0 { return }
-    cg_top(g, tmsg3("static const AshVowDesc k_", cname, "_vows[] = {"))
+    cg_top(g, tmsg3("static const GeasVowDesc k_", cname, "_vows[] = {"))
     mut i: int64 = 0
     while i < vec_len(vows) {
         v: VowNode = vec_get((*a).vows, vec_get(vows, i).vid)
@@ -245,7 +245,7 @@ func emit_vows(g: *Cg, cid: int64, cname: string, vows: *Vector<VowInfo>) -> voi
         }
         if carriable {
             mut has_default: string = "0"
-            mut init_text: string = "{ .ty = ASH_TY_UNIT, .tag = 0, .as = { .i = 0 } }"
+            mut init_text: string = "{ .ty = GEAS_TY_UNIT, .tag = 0, .as = { .i = 0 } }"
             if v.init >= 0 {
                 has_default = "1"
                 init_text = vow_default_text(g, v, vs.ty)
@@ -261,9 +261,9 @@ func emit_vows(g: *Cg, cid: int64, cname: string, vows: *Vector<VowInfo>) -> voi
     cg_top(g, "")
 }
 
-// Emits the schema descriptor tables of one contract: one AshSchemaCol array
+// Emits the schema descriptor tables of one contract: one GeasSchemaCol array
 // per schema, its columns in declaration order at their scalar tags, then one
-// AshSchemaDesc array the contract descriptor points at. A contract with no
+// GeasSchemaDesc array the contract descriptor points at. A contract with no
 // schema emits nothing and reads as not store-backed, the zero the descriptor
 // tail defaults to. The row shape is read back from the schema's RecSig, the
 // same one the row record and the shape hash share, so the descriptor and the
@@ -277,7 +277,7 @@ func emit_schemas(g: *Cg, cid: int64, cname: string, schemas: *Vector<int64>) ->
         sc: SchemaNode = vec_get((*a).schemas, vec_get(schemas, i))
         sname: string = ast_name(a, sc.name)
         rs: RecSig = sig_rec(s, sc.name)
-        cg_top(g, tmsg7("static const AshSchemaCol k_", cname, "_", sname, "_cols[] = {", "", ""))
+        cg_top(g, tmsg7("static const GeasSchemaCol k_", cname, "_", sname, "_cols[] = {", "", ""))
         mut ci: int64 = 0
         while ci < rs.len {
             f: FieldSig = sig_field(s, rs.off, ci)
@@ -289,7 +289,7 @@ func emit_schemas(g: *Cg, cid: int64, cname: string, schemas: *Vector<int64>) ->
         cg_top(g, "")
         i = i + 1
     }
-    cg_top(g, tmsg3("static const AshSchemaDesc k_", cname, "_schemas[] = {"))
+    cg_top(g, tmsg3("static const GeasSchemaDesc k_", cname, "_schemas[] = {"))
     mut j: int64 = 0
     while j < vec_len(schemas) {
         sc2: SchemaNode = vec_get((*a).schemas, vec_get(schemas, j))
@@ -327,7 +327,7 @@ func emit_thunk(g: *Cg, cid: int64, info: PlInfo, mangled: string) -> void {
     }
 
     cg_push_scope(g)
-    cg_line(g, tmsg3("if (nargs != ", int_to_string(pl.params_len), ") return ASH_ERR_TYPE;"))
+    cg_line(g, tmsg3("if (nargs != ", int_to_string(pl.params_len), ") return GEAS_ERR_TYPE;"))
     mut i: int64 = 0
     while i < pl.params_len {
         f: FieldNode = vec_get((*a).fields, vec_get((*a).kids, pl.params_off + i))
@@ -336,7 +336,7 @@ func emit_thunk(g: *Cg, cid: int64, info: PlInfo, mangled: string) -> void {
         tag: string = cg_tag_of(g, pt)
         idx: string = int_to_string(i)
         if str_len(tag) > 0 {
-            cg_line(g, tmsg7("if (args[", idx, "].ty != ", tag, ") return ASH_ERR_TYPE;", "", ""))
+            cg_line(g, tmsg7("if (args[", idx, "].ty != ", tag, ") return GEAS_ERR_TYPE;", "", ""))
         }
         cg_declare(g, f.name, tmsg3("args[", idx, "]"), pt)
         i = i + 1
@@ -344,16 +344,16 @@ func emit_thunk(g: *Cg, cid: int64, info: PlInfo, mangled: string) -> void {
     gen_block(g, pl.body)
     cg_pop_scope(g)
 
-    cg_top(g, tmsg3("static AshStatus ", mangled, "(void* ctx, const AshValue* args, size_t nargs,"))
-    cg_top(g, "                           AshValue* out) {")
-    cg_top(g, "    AshContract* cc = (AshContract*)ctx;")
+    cg_top(g, tmsg3("static GeasStatus ", mangled, "(void* ctx, const GeasValue* args, size_t nargs,"))
+    cg_top(g, "                           GeasValue* out) {")
+    cg_top(g, "    GeasContract* cc = (GeasContract*)ctx;")
     cg_top(g, "    (void)cc;")
     cg_top(g, "    (void)args;")
     body_text: string = substring(sb_cstr((*g).body), 0, sb_size((*g).body))
     sb_push((*g).out, body_text)
     free(body_text)
-    cg_top(g, "    out->ty = ASH_TY_UNIT;")
-    cg_top(g, "    return ASH_OK;")
+    cg_top(g, "    out->ty = GEAS_TY_UNIT;")
+    cg_top(g, "    return GEAS_OK;")
     cg_top(g, "}")
     cg_top(g, "")
 
@@ -411,14 +411,14 @@ func emit_clause(g: *Cg, cid: int64, cname: string, clid: int64) -> void {
     cg_pop_scope(g)
 
     fname: string = cg_clause_fn(cname, ast_name(a, cl.name))
-    cg_top(g, tmsg3("static AshStatus ", fname, "(AshContract* cc, const AshValue* args, AshValue* out) {"))
+    cg_top(g, tmsg3("static GeasStatus ", fname, "(GeasContract* cc, const GeasValue* args, GeasValue* out) {"))
     cg_top(g, "    (void)cc;")
     cg_top(g, "    (void)args;")
     body_text: string = substring(sb_cstr((*g).body), 0, sb_size((*g).body))
     sb_push((*g).out, body_text)
     free(body_text)
-    cg_top(g, "    out->ty = ASH_TY_UNIT;")
-    cg_top(g, "    return ASH_OK;")
+    cg_top(g, "    out->ty = GEAS_TY_UNIT;")
+    cg_top(g, "    return GEAS_OK;")
     cg_top(g, "}")
     cg_top(g, "")
     free(fname)
@@ -456,7 +456,7 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     while ci < vec_len(clauses) {
         cl0: ClauseNode = vec_get((*a).clauses, vec_get(clauses, ci))
         proto: string = cg_clause_fn(cname, ast_name(a, cl0.name))
-        cg_top(g, tmsg3("static AshStatus ", proto, "(AshContract* cc, const AshValue* args, AshValue* out);"))
+        cg_top(g, tmsg3("static GeasStatus ", proto, "(GeasContract* cc, const GeasValue* args, GeasValue* out);"))
         free(proto)
         ci = ci + 1
     }
@@ -502,7 +502,7 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     emit_vows(g, cid, cname, vows)
 
     if vec_len(pls) > 0 {
-        cg_top(g, tmsg3("static const AshPledgeDesc k_", cname, "_pledges[] = {"))
+        cg_top(g, tmsg3("static const GeasPledgeDesc k_", cname, "_pledges[] = {"))
         mut j: int64 = 0
         while j < vec_len(pls) {
             info2: PlInfo = vec_get(pls, j)
@@ -551,7 +551,7 @@ func emit_contract(g: *Cg, cid: int64) -> void {
         while sk < vec_len(sub_ids) {
             stx2: SubNode = vec_get((*a).subs, vec_get(sub_ids, sk))
             mut bit: string = "0"
-            if stx2.transactional { bit = "ASH_SUB_TRANSACTIONAL" }
+            if stx2.transactional { bit = "GEAS_SUB_TRANSACTIONAL" }
             cg_top(g, tmsg3("    ", bit, ","))
             sk = sk + 1
         }
@@ -577,7 +577,7 @@ func emit_contract(g: *Cg, cid: int64) -> void {
     if re.nbreak > 0 { rb_ref = tmsg3("k_", cname, "_rb") }
     mut has_reqs_text: string = "0"
     if re.has_reqs { has_reqs_text = "1" }
-    cg_top(g, tmsg3("static const AshContractDesc k_", cname, " = {"))
+    cg_top(g, tmsg3("static const GeasContractDesc k_", cname, " = {"))
     cg_top(g, tmsg5("    \"", cname, "\", 0x", hex, "ULL,"))
     free(hex)
     cg_top(g, tmsg7("    ", int_to_string(version), ", ", int_to_string(vec_len(pls)), ", ", pl_ref, ","))
@@ -598,8 +598,8 @@ func emit_contract(g: *Cg, cid: int64) -> void {
 // caller discards it when errors arrived in the vector.
 export func cgen_module(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *Vector<Located>) -> string {
     g: *Cg = cg_new(a, r, s, t, errors)
-    cg_top(g, "/* generated by ashc, do not edit */")
-    cg_top(g, "#include <ash/ash.h>")
+    cg_top(g, "/* generated by geas, do not edit */")
+    cg_top(g, "#include <geas/geas.h>")
     cg_top(g, "")
     decls: *Vector<DeclNode> = (*a).decls
     mut i: int64 = 0
@@ -616,17 +616,17 @@ export func cgen_module(a: *Ast, r: *Resolved, s: *Sigs, t: *TyArena, errors: *V
         }
         i = i + 1
     }
-    cg_top(g, "AshStatus ash_module_register(AshRuntime* rt) {")
+    cg_top(g, "GeasStatus geas_module_register(GeasRuntime* rt) {")
     cg_top(g, "    (void)rt;")
-    cg_top(g, "    AshStatus st = ASH_OK;")
+    cg_top(g, "    GeasStatus st = GEAS_OK;")
     mut j: int64 = 0
     while j < vec_len(decls) {
         d2: DeclNode = vec_get(decls, j)
         if d2.kind == dk_contract() {
             c: ContractNode = vec_get((*a).contracts, d2.id)
             if !c.internal {
-                cg_top(g, tmsg3("    st = ash_register_contract(rt, &k_", ast_name(a, c.name), ");"))
-                cg_top(g, "    if (st != ASH_OK) return st;")
+                cg_top(g, tmsg3("    st = geas_register_contract(rt, &k_", ast_name(a, c.name), ");"))
+                cg_top(g, "    if (st != GEAS_OK) return st;")
             }
         }
         j = j + 1

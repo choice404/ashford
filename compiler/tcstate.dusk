@@ -1,4 +1,4 @@
-// tcstate: the shared state of the ashford type checker and its scope stack.
+// tcstate: the shared state of the geas type checker and its scope stack.
 // One Tc rides through every body: the tables the earlier passes built, the
 // contract and return type of the body being walked, the loop depth for break
 // and continue, and the fault vector diagnostics land in. Scopes are a stack

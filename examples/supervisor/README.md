@@ -1,11 +1,11 @@
 # supervisor
 
 A small process supervisor, written to show one thing: a contract's lifecycle
-read as the lifecycle of a real process. `service.ash` declares a `Service`
+read as the lifecycle of a real process. `service.geas` declares a `Service`
 contract whose four states are the four states of a service, and one contract
 instance is one run of that service. The Python in `supervisor.py` is the host.
 It spawns processes, watches them, and drives each instance through its states
-with the same five calls every Ashford host uses.
+with the same five calls every Geas host uses.
 
 ## The state machine
 
@@ -18,7 +18,7 @@ The contract state is the service state, with no translation layer in between.
 | Fulfilled      | clean exit    | the run finished on an `Ok`, all three latched |
 | Broken         | crashed       | a latch broke before the clean finish |
 
-The `requirements` block in `service.ash` is where this is written down, and it
+The `requirements` block in `service.geas` is where this is written down, and it
 is the whole of it. `start` and `ready` are abstract: the host spawns the
 process and runs the first health pass, then binds the two pledges to what it
 saw. `finish` and `crashes` are in the language. `finish` writes the run's row
@@ -63,7 +63,7 @@ make test-supervisor
 By hand, build the contract first and then drive it with the host:
 
 ```text
-ashc build examples/supervisor/service.ash
+geas build examples/supervisor/service.geas
 python examples/supervisor/supervisor.py \
     --dsn file:target/supervisor.db \
     --piddir target/supervisor-pids \

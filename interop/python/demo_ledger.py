@@ -2,10 +2,10 @@
 generated. It is the store twin of demo_payment.py and demo_remote.py, and it
 carries the product claim into durable storage: the same host surface that
 signed a local contract and a remote one signs a contract backed by a SQLite
-file, and the database never shows through ctypes. ashford.py speaks the
+file, and the database never shows through ctypes. geas.py speaks the
 documented ABI and the store is invisible to it, which is the whole point.
 
-The contract is skeleton/ledger.ash, its Accounts schema reconciled at sign and
+The contract is skeleton/ledger.geas, its Accounts schema reconciled at sign and
 its loose store pledges open, balance, and set_balance beside the transactional
 Transfer subcontract of debit and credit. This demo drives the ground the C
 hosts cover in tests/runtime/test_store_ledger.c and test_store_txn.c: sign
@@ -25,15 +25,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import ashford
-from ashford import ASH_ERR_STATE, ASH_SIGNED, AshError, Err, Ok, Runtime
+import geas
+from geas import GEAS_ERR_STATE, GEAS_SIGNED, GeasError, Err, Ok, Runtime
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "target" / "ashc-out"
-LIBRT = OUT / "libashrt.so"
-LEDGER = OUT / "libledger.ash.so"
+OUT = ROOT / "target" / "geas-out"
+LIBRT = OUT / "libgeasrt.so"
+LEDGER = OUT / "libledger.geas.so"
 
-# LedgerError as skeleton/ledger.ash declares it, in declaration order:
+# LedgerError as skeleton/ledger.geas declares it, in declaration order:
 # NoSuchAccount, StoreFailed, Insufficient. A payload-free sum variant decodes
 # to (tag, []), the variant's declaration index and its empty field list, so the
 # ledger's own errors read back through the same shape any declared sum does.
@@ -69,7 +69,7 @@ def seed_and_read(rt, dsn):
     set_balance rewrites one, each a Result whose Err is the ledger's own
     business. It seeds accounts 1 and 2 at 100 for the transfer that follows."""
     c = rt.sign("Ledger", vows={"dsn": dsn})
-    check(c.state() == ASH_SIGNED, "seed instance signed")
+    check(c.state() == GEAS_SIGNED, "seed instance signed")
     check(c.vow("dsn") == dsn, "dsn override landed")
 
     check(c.fulfill_sync("open", 1, "alice", 100.0) == Ok(True), "open account 1")
@@ -101,7 +101,7 @@ def seed_and_read(rt, dsn):
 def good_transfer(rt, dsn):
     """A transfer that commits: debit and credit both latch Ok, the subcontract
     completes, the transaction commits, and both balances move. A second call to
-    either resolved transactional pledge is ASH_ERR_STATE, the once-only law a
+    either resolved transactional pledge is GEAS_ERR_STATE, the once-only law a
     committed transaction earns."""
     c = rt.sign("Ledger", vows={"dsn": dsn})
     check(c.fulfill_sync("debit", 1, 30.0) == Ok(None), "debit 30 from 1 is Ok")
@@ -110,15 +110,15 @@ def good_transfer(rt, dsn):
     try:
         c.fulfill_sync("debit", 1, 30.0)
         check(False, "re-calling a committed transactional pledge did not fail")
-    except AshError as e:
-        check(e.status == ASH_ERR_STATE,
-              "re-calling a committed transactional pledge is ASH_ERR_STATE")
+    except GeasError as e:
+        check(e.status == GEAS_ERR_STATE,
+              "re-calling a committed transactional pledge is GEAS_ERR_STATE")
     try:
         c.fulfill_sync("credit", 2, 30.0)
         check(False, "re-calling the other committed pledge did not fail")
-    except AshError as e:
-        check(e.status == ASH_ERR_STATE,
-              "re-calling the other committed pledge is ASH_ERR_STATE")
+    except GeasError as e:
+        check(e.status == GEAS_ERR_STATE,
+              "re-calling the other committed pledge is GEAS_ERR_STATE")
     c.break_()
 
     # The file reflects both writes: 1 fell to 70, 2 rose to 130.
@@ -143,7 +143,7 @@ def failed_transfer(rt, dsn):
 
 def overdraft_is_business(rt, dsn):
     """The line between the contract and the store: an overdraft is the ledger's
-    own rule, Err(Insufficient) returned as a value with an ASH_OK delivery,
+    own rule, Err(Insufficient) returned as a value with an GEAS_OK delivery,
     never a store status. The transaction rolls back and the balance is unmoved."""
     c = rt.sign("Ledger", vows={"dsn": dsn})
     out = c.fulfill_sync("debit", 1, 1000.0)

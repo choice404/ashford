@@ -2,7 +2,7 @@
 the C ABI, asserting the same answers, with the session now held as a stream.
 
 This is the measurement. demo_payment.py signs an instance in process and
-reads its partial surface through ctypes; this client never touches libashrt,
+reads its partial surface through ctypes; this client never touches libgeasrt,
 holds no handle, and knows the instance only by a uint64 the server issued on
 a stream it keeps open. If the two agree pledge for pledge and state for
 state, the session model carries the contract across a process boundary.
@@ -349,8 +349,8 @@ def walk(stub, legacy_ttl, port):
         check([(e.pledge, e.err) for e in p.errors] == [("charge", 41)],
               "the automatic break kept the Err payload readable")
 
-        # Fulfillment against a broken instance is ASH_ERR_STATE, which is the
-        # one Ashford status this walk turns into a gRPC error.
+        # Fulfillment against a broken instance is GEAS_ERR_STATE, which is the
+        # one Geas status this walk turns into a gRPC error.
         expect_code(lambda: stub.ValidateCard(
             pb.ValidateCardRequest(instance_id=c2, card="4111 1111")),
             grpc.StatusCode.FAILED_PRECONDITION,

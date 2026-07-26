@@ -1,4 +1,4 @@
-// resolve: name resolution for ashford, the first checking pass over a parsed
+// resolve: name resolution for geas, the first checking pass over a parsed
 // file. It builds the symbol tables the type checker reads: the file global
 // namespace of records, sums, sum variants, provisional clauses, and
 // contracts; one member namespace per contract where vows, pledges, clauses,

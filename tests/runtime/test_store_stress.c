@@ -5,7 +5,7 @@
  * credit the other as one transactional episode, and tear the instance down.
  * The point is not that every transfer lands. Two connections writing one file
  * arbitrate through SQLite's own locking, and the loser of a race surfaces
- * ASH_ERR_STORE rather than a half written episode, exactly the failure the
+ * GEAS_ERR_STORE rather than a half written episode, exactly the failure the
  * milestone pins; a transfer can also refuse itself, an overdraft that is the
  * ledger's own Err. The point is that every transfer is whole either way: it
  * commits both writes or it rolls both back, so the money in the pool is a
@@ -14,8 +14,8 @@
  * the seed to the last unit, which can only hold if no episode ever committed a
  * debit without its credit or a credit without its debit.
  *
- * Every fulfillment is checked to deliver one of exactly three ways, an ASH_OK
- * commit, an ASH_OK business Err, or an ASH_ERR_STORE the backend raised; any
+ * Every fulfillment is checked to deliver one of exactly three ways, an GEAS_OK
+ * commit, an GEAS_OK business Err, or an GEAS_ERR_STORE the backend raised; any
  * other status is a bug and fails the gate. The connection sits under the
  * instance lock, single threaded by construction, so the runtime adds no store
  * lock and this storm is what TSan watches for a race in the pool, the waiters,
@@ -23,7 +23,7 @@
  * instance the storm signs is proven reclaimed at its break, and once under
  * ThreadSanitizer so the concurrency is proven race free. */
 
-#include <ash/ash.h>
+#include <geas/geas.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -33,7 +33,7 @@
 
 /* The pool, the workers, and the transfers per worker. One instance is signed
  * per transfer, and the runtime tracks every instance it ever signs in a fixed
- * table freed at shutdown, ASH_MAX_INSTANCES entries, so a broken instance holds
+ * table freed at shutdown, GEAS_MAX_INSTANCES entries, so a broken instance holds
  * its slot for the life of the runtime and a run of signs is bounded by that
  * cap, not by how many instances are live at once. The storm is sized to stay
  * inside the cap with margin: NTHREADS * NITERS transfers plus a seed and two
@@ -46,69 +46,69 @@
 
 static int g_fail = 0;
 static const char* g_dsn;
-static AshRuntime* g_rt;
+static GeasRuntime* g_rt;
 
 static void fail(const char* what) {
     fprintf(stderr, "[test_store_stress] FAIL: %s\n", what);
     g_fail = 1;
 }
 
-static AshValue int_val(int64_t i) {
-    AshValue v;
+static GeasValue int_val(int64_t i) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_INT;
+    v.ty = GEAS_TY_INT;
     v.as.i = i;
     return v;
 }
 
-static AshValue float_val(double f) {
-    AshValue v;
+static GeasValue float_val(double f) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_FLOAT;
+    v.ty = GEAS_TY_FLOAT;
     v.as.f = f;
     return v;
 }
 
-static AshValue str_val(const char* s) {
-    AshValue v;
+static GeasValue str_val(const char* s) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_STRING;
+    v.ty = GEAS_TY_STRING;
     v.as.s.ptr = (uint8_t*)s;
     v.as.s.len = strlen(s);
     return v;
 }
 
-static AshContract* sign_ledger(AshStatus* st_out) {
-    AshVowBinding ovr = { "dsn", str_val(g_dsn) };
-    AshContract* c = NULL;
-    AshStatus st = ash_contract_sign(g_rt, "Ledger", &ovr, 1, 0, &c);
+static GeasContract* sign_ledger(GeasStatus* st_out) {
+    GeasVowBinding ovr = { "dsn", str_val(g_dsn) };
+    GeasContract* c = NULL;
+    GeasStatus st = geas_contract_sign(g_rt, "Ledger", &ovr, 1, 0, &c);
     if (st_out) *st_out = st;
     return c;
 }
 
 /* An Ok result, either arm read by tag: tag 0 is a commit worthy Ok, tag 1 is
- * the ledger's own Err. Called only on an ASH_OK delivery. */
-static int result_is_ok(const AshValue* r) {
-    return r->ty == ASH_TY_RESULT && r->tag == 0;
+ * the ledger's own Err. Called only on an GEAS_OK delivery. */
+static int result_is_ok(const GeasValue* r) {
+    return r->ty == GEAS_TY_RESULT && r->tag == 0;
 }
 
-/* Classifies one pledge delivery. An ASH_OK is a value, an Ok to go on or a
- * business Err to abort; an ASH_ERR_STORE is the backend's refusal, the
+/* Classifies one pledge delivery. An GEAS_OK is a value, an Ok to go on or a
+ * business Err to abort; an GEAS_ERR_STORE is the backend's refusal, the
  * contended loser; anything else is unexpected and fails the gate. Returns 1
- * when the delivery was an ASH_OK Ok, so the caller proceeds to the credit. */
-static int step(AshContract* c, const char* name, const AshValue* args,
+ * when the delivery was an GEAS_OK Ok, so the caller proceeds to the credit. */
+static int step(GeasContract* c, const char* name, const GeasValue* args,
                 size_t nargs, int* did_store_err) {
-    AshValue out;
+    GeasValue out;
     memset(&out, 0, sizeof(out));
-    AshStatus st = ash_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out);
-    if (st == ASH_OK) {
+    GeasStatus st = geas_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out);
+    if (st == GEAS_OK) {
         return result_is_ok(&out);
     }
-    if (st == ASH_ERR_STORE) {
+    if (st == GEAS_ERR_STORE) {
         *did_store_err = 1;
         return 0;
     }
-    fail("a transfer pledge delivered neither ASH_OK nor ASH_ERR_STORE");
+    fail("a transfer pledge delivered neither GEAS_OK nor GEAS_ERR_STORE");
     return 0;
 }
 
@@ -133,23 +133,23 @@ static void* run_worker(void* arg) {
         if (dst == src) dst = (dst + 1) % NACCTS;
         double amount = (double)(rand_r(&w->seed) % 100 + 1);
 
-        AshStatus ss = ASH_OK;
-        AshContract* c = sign_ledger(&ss);
-        if (ss == ASH_ERR_OOM) {
+        GeasStatus ss = GEAS_OK;
+        GeasContract* c = sign_ledger(&ss);
+        if (ss == GEAS_ERR_OOM) {
             /* the runtime's instance table is full for this run's lifetime, the
              * documented cap and not a store failure; stop clean so the
              * conservation check stands over the transfers that did run. */
-            if (c) ash_contract_break(c);
+            if (c) geas_contract_break(c);
             break;
         }
-        if (!c || ash_contract_state(c) != ASH_SIGNED) {
+        if (!c || geas_contract_state(c) != GEAS_SIGNED) {
             fail("a worker could not sign an instance");
-            if (c) ash_contract_break(c);
+            if (c) geas_contract_break(c);
             continue;
         }
         int store_err = 0;
-        AshValue d[2] = { int_val(src + 1), float_val(amount) };
-        AshValue cr[2] = { int_val(dst + 1), float_val(amount) };
+        GeasValue d[2] = { int_val(src + 1), float_val(amount) };
+        GeasValue cr[2] = { int_val(dst + 1), float_val(amount) };
         if (step(c, "debit", d, 2, &store_err)) {
             if (step(c, "credit", cr, 2, &store_err)) {
                 w->committed++;
@@ -163,7 +163,7 @@ static void* run_worker(void* arg) {
         } else {
             w->business_abort++;
         }
-        ash_contract_break(c);
+        geas_contract_break(c);
     }
     return NULL;
 }
@@ -171,41 +171,41 @@ static void* run_worker(void* arg) {
 /* The whole pool's balance on the main thread, one fresh read instance, so the
  * committed file is the witness. */
 static double pool_total(void) {
-    AshContract* c = sign_ledger(NULL);
-    if (!c || ash_contract_state(c) != ASH_SIGNED) {
+    GeasContract* c = sign_ledger(NULL);
+    if (!c || geas_contract_state(c) != GEAS_SIGNED) {
         fail("could not sign a read instance for the total");
-        if (c) ash_contract_break(c);
+        if (c) geas_contract_break(c);
         return -1.0;
     }
     double total = 0.0;
     for (int i = 0; i < NACCTS; i++) {
-        AshValue key[1] = { int_val(i + 1) };
-        AshValue out;
+        GeasValue key[1] = { int_val(i + 1) };
+        GeasValue out;
         memset(&out, 0, sizeof(out));
-        AshStatus st = ash_pledge_fulfill_sync(c, "balance", key, 1, NULL, 0,
+        GeasStatus st = geas_pledge_fulfill_sync(c, "balance", key, 1, NULL, 0,
                                                &out);
-        if (st != ASH_OK || out.ty != ASH_TY_RESULT || out.tag != 0 ||
+        if (st != GEAS_OK || out.ty != GEAS_TY_RESULT || out.tag != 0 ||
             !out.as.box) {
             fail("a balance read for the total did not deliver a value");
             break;
         }
-        const AshValue* p = (const AshValue*)out.as.box;
-        if (p->ty != ASH_TY_FLOAT) {
+        const GeasValue* p = (const GeasValue*)out.as.box;
+        if (p->ty != GEAS_TY_FLOAT) {
             fail("a balance for the total was not a float");
             break;
         }
         total += p->as.f;
     }
-    ash_contract_break(c);
+    geas_contract_break(c);
     return total;
 }
 
 int main(void) {
-    if (ash_runtime_init(NULL, &g_rt) != ASH_OK || !g_rt) {
+    if (geas_runtime_init(NULL, &g_rt) != GEAS_OK || !g_rt) {
         fprintf(stderr, "[test_store_stress] FAIL: runtime init\n");
         return 1;
     }
-    if (ash_module_load(g_rt, "target/ashc-out/libledger.ash.so") != ASH_OK) {
+    if (geas_module_load(g_rt, "target/geas-out/libledger.geas.so") != GEAS_OK) {
         fprintf(stderr, "[test_store_stress] FAIL: load ledger module\n");
         return 1;
     }
@@ -223,22 +223,22 @@ int main(void) {
 
     /* ---- seed the pool with a known total ---- */
 
-    AshContract* seed = sign_ledger(NULL);
-    if (seed && ash_contract_state(seed) == ASH_SIGNED) {
+    GeasContract* seed = sign_ledger(NULL);
+    if (seed && geas_contract_state(seed) == GEAS_SIGNED) {
         for (int i = 0; i < NACCTS; i++) {
-            AshValue a[3] = { int_val(i + 1), str_val("acct"),
+            GeasValue a[3] = { int_val(i + 1), str_val("acct"),
                               float_val(SEED_EACH) };
-            AshValue out;
+            GeasValue out;
             memset(&out, 0, sizeof(out));
-            if (ash_pledge_fulfill_sync(seed, "open", a, 3, NULL, 0, &out) !=
-                ASH_OK) {
+            if (geas_pledge_fulfill_sync(seed, "open", a, 3, NULL, 0, &out) !=
+                GEAS_OK) {
                 fail("seed insert did not commit");
             }
         }
-        ash_contract_break(seed);
+        geas_contract_break(seed);
     } else {
         fail("could not sign the seed instance");
-        if (seed) ash_contract_break(seed);
+        if (seed) geas_contract_break(seed);
     }
 
     double before = pool_total();
@@ -275,7 +275,7 @@ int main(void) {
             "%ld store abort; total %.0f -> %.0f\n",
             committed, business, store, before, after);
 
-    ash_runtime_shutdown(g_rt);
+    geas_runtime_shutdown(g_rt);
     unlink(db_path);
 
     if (g_fail) {

@@ -1,4 +1,4 @@
-// ast: the parse order arena AST for ashford, one arena per node shape and one
+// ast: the parse order arena AST for geas, one arena per node shape and one
 // shared kids arena of int64 for every variable length list, stored as an
 // (off, len) slice. Expr, Stmt, Type, and Pattern are tagged fixed slot nodes
 // whose slots are read by kind; the declaration forms of docs/grammar.md each

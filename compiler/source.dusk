@@ -1,4 +1,4 @@
-// source: loading an .ash file into a buffer the rest of the compiler reads. A
+// source: loading an .geas file into a buffer the rest of the compiler reads. A
 // Source owns the whole file text as one heap buffer plus its true byte length,
 // so a scan covers every byte even when the file holds an embedded NUL, and the
 // path it came from so a diagnostic can name its file. The read is wrapped so a

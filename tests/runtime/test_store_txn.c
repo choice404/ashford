@@ -7,14 +7,14 @@
  * credit against a missing account, rolls the whole episode back so the debit
  * that already ran leaves nothing durable and the balance is exactly what it was
  * before. A second call to a pledge whose episode already resolved is
- * ASH_ERR_STATE, the once-only law a committed transaction earns. A break after
+ * GEAS_ERR_STATE, the once-only law a committed transaction earns. A break after
  * a debit and before its credit rolls the open transaction back, so no half
  * written episode survives the teardown. Every assertion that a write did or did
  * not persist reopens the file in a fresh instance and reads it, so the file,
  * not a live cache, is the witness. Runs under ASan and LSan so every instance
  * allocation is proven reclaimed at break and shutdown. */
 
-#include <ash/ash.h>
+#include <geas/geas.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -31,26 +31,26 @@ static int g_fail = 0;
         }                                                          \
     } while (0)
 
-static AshValue int_val(int64_t i) {
-    AshValue v;
+static GeasValue int_val(int64_t i) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_INT;
+    v.ty = GEAS_TY_INT;
     v.as.i = i;
     return v;
 }
 
-static AshValue float_val(double f) {
-    AshValue v;
+static GeasValue float_val(double f) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_FLOAT;
+    v.ty = GEAS_TY_FLOAT;
     v.as.f = f;
     return v;
 }
 
-static AshValue str_val(const char* s) {
-    AshValue v;
+static GeasValue str_val(const char* s) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_STRING;
+    v.ty = GEAS_TY_STRING;
     v.as.s.ptr = (uint8_t*)s;
     v.as.s.len = strlen(s);
     return v;
@@ -58,74 +58,74 @@ static AshValue str_val(const char* s) {
 
 /* Fulfills one pledge synchronously, checks the delivery status, and hands back
  * the result value. */
-static AshValue run(AshContract* c, const char* name, const AshValue* args,
+static GeasValue run(GeasContract* c, const char* name, const GeasValue* args,
                     size_t nargs) {
-    AshValue out;
+    GeasValue out;
     memset(&out, 0, sizeof(out));
-    CHECK(ash_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out) == ASH_OK,
+    CHECK(geas_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out) == GEAS_OK,
           name);
     return out;
 }
 
 /* The delivery status of one synchronous fulfillment, the value discarded; the
- * once-only path returns ASH_ERR_STATE here. */
-static AshStatus run_status(AshContract* c, const char* name,
-                            const AshValue* args, size_t nargs) {
-    AshValue out;
+ * once-only path returns GEAS_ERR_STATE here. */
+static GeasStatus run_status(GeasContract* c, const char* name,
+                            const GeasValue* args, size_t nargs) {
+    GeasValue out;
     memset(&out, 0, sizeof(out));
-    return ash_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out);
+    return geas_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out);
 }
 
 /* An Ok(Unit) result, the shape a transfer pledge answers on success. */
-static int ok_unit(const AshValue* r) {
-    return r->ty == ASH_TY_RESULT && r->tag == 0;
+static int ok_unit(const GeasValue* r) {
+    return r->ty == GEAS_TY_RESULT && r->tag == 0;
 }
 
 /* An Ok(Float) result, its value read out for comparison. */
-static int ok_float(const AshValue* r, double* out) {
-    if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
-    const AshValue* p = (const AshValue*)r->as.box;
-    if (p->ty != ASH_TY_FLOAT) return 0;
+static int ok_float(const GeasValue* r, double* out) {
+    if (r->ty != GEAS_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)r->as.box;
+    if (p->ty != GEAS_TY_FLOAT) return 0;
     *out = p->as.f;
     return 1;
 }
 
 /* Whether a Result is an Err, the contract's own error surfacing as a value. */
-static int is_err(const AshValue* r) {
-    return r->ty == ASH_TY_RESULT && r->tag == 1;
+static int is_err(const GeasValue* r) {
+    return r->ty == GEAS_TY_RESULT && r->tag == 1;
 }
 
 /* Signs a fresh Ledger instance against the temp file, the schema validated into
  * the existing table each time. */
-static AshContract* sign_ledger(AshRuntime* rt, AshVowBinding* dsn_ovr) {
-    AshContract* c = NULL;
-    CHECK(ash_contract_sign(rt, "Ledger", dsn_ovr, 1, 0, &c) == ASH_OK,
+static GeasContract* sign_ledger(GeasRuntime* rt, GeasVowBinding* dsn_ovr) {
+    GeasContract* c = NULL;
+    CHECK(geas_contract_sign(rt, "Ledger", dsn_ovr, 1, 0, &c) == GEAS_OK,
           "sign Ledger");
-    CHECK(c && ash_contract_state(c) == ASH_SIGNED, "Ledger signed");
+    CHECK(c && geas_contract_state(c) == GEAS_SIGNED, "Ledger signed");
     return c;
 }
 
 /* Reads one account's balance through the loose balance pledge, a fresh instance
  * so the read sees the committed file and never a live episode's buffer. */
-static double read_balance(AshRuntime* rt, AshVowBinding* dsn_ovr, int64_t id) {
-    AshContract* c = sign_ledger(rt, dsn_ovr);
+static double read_balance(GeasRuntime* rt, GeasVowBinding* dsn_ovr, int64_t id) {
+    GeasContract* c = sign_ledger(rt, dsn_ovr);
     double bal = -1.0;
     if (c) {
-        AshValue key[1] = { int_val(id) };
-        AshValue r = run(c, "balance", key, 1);
+        GeasValue key[1] = { int_val(id) };
+        GeasValue r = run(c, "balance", key, 1);
         CHECK(ok_float(&r, &bal), "balance reads a value");
-        ash_contract_break(c);
+        geas_contract_break(c);
     }
     return bal;
 }
 
 int main(void) {
-    AshRuntime* rt = NULL;
-    if (ash_runtime_init(NULL, &rt) != ASH_OK || !rt) {
+    GeasRuntime* rt = NULL;
+    if (geas_runtime_init(NULL, &rt) != GEAS_OK || !rt) {
         fprintf(stderr, "[test_store_txn] FAIL: runtime init\n");
         return 1;
     }
-    CHECK(ash_module_load(rt, "target/ashc-out/libledger.ash.so") == ASH_OK,
+    CHECK(geas_module_load(rt, "target/geas-out/libledger.geas.so") == GEAS_OK,
           "load ledger module");
 
     char db_path[] = "target/ashtxn_XXXXXX";
@@ -137,39 +137,39 @@ int main(void) {
     close(fd);
     char dsn[80];
     snprintf(dsn, sizeof(dsn), "file:%s", db_path);
-    AshVowBinding dsn_ovr = { "dsn", str_val(dsn) };
+    GeasVowBinding dsn_ovr = { "dsn", str_val(dsn) };
 
     /* ---- seed two accounts through the loose, autocommit pledges ---- */
 
-    AshContract* seed = sign_ledger(rt, &dsn_ovr);
+    GeasContract* seed = sign_ledger(rt, &dsn_ovr);
     if (seed) {
-        AshValue a1[3] = { int_val(1), str_val("alice"), float_val(100.0) };
-        AshValue a2[3] = { int_val(2), str_val("bob"), float_val(100.0) };
-        AshValue r = run(seed, "open", a1, 3);
-        CHECK(r.ty == ASH_TY_RESULT && r.tag == 0, "open account 1");
+        GeasValue a1[3] = { int_val(1), str_val("alice"), float_val(100.0) };
+        GeasValue a2[3] = { int_val(2), str_val("bob"), float_val(100.0) };
+        GeasValue r = run(seed, "open", a1, 3);
+        CHECK(r.ty == GEAS_TY_RESULT && r.tag == 0, "open account 1");
         r = run(seed, "open", a2, 3);
-        CHECK(r.ty == ASH_TY_RESULT && r.tag == 0, "open account 2");
-        ash_contract_break(seed);
+        CHECK(r.ty == GEAS_TY_RESULT && r.tag == 0, "open account 2");
+        geas_contract_break(seed);
     }
 
     /* ---- a good transfer: both writes commit, both balances move ---- */
 
-    AshContract* c = sign_ledger(rt, &dsn_ovr);
+    GeasContract* c = sign_ledger(rt, &dsn_ovr);
     if (c) {
-        AshValue d[2] = { int_val(1), float_val(30.0) };
-        AshValue cr[2] = { int_val(2), float_val(30.0) };
-        AshValue r = run(c, "debit", d, 2);
+        GeasValue d[2] = { int_val(1), float_val(30.0) };
+        GeasValue cr[2] = { int_val(2), float_val(30.0) };
+        GeasValue r = run(c, "debit", d, 2);
         CHECK(ok_unit(&r), "debit 30 from 1 is Ok");
         r = run(c, "credit", cr, 2);
         CHECK(ok_unit(&r), "credit 30 to 2 is Ok");
 
         /* the episode has committed; a second call to a resolved pledge is
-         * ASH_ERR_STATE, the once-only law. */
-        CHECK(run_status(c, "debit", d, 2) == ASH_ERR_STATE,
-              "re-calling a committed transactional pledge is ASH_ERR_STATE");
-        CHECK(run_status(c, "credit", cr, 2) == ASH_ERR_STATE,
-              "re-calling the other committed pledge is ASH_ERR_STATE");
-        ash_contract_break(c);
+         * GEAS_ERR_STATE, the once-only law. */
+        CHECK(run_status(c, "debit", d, 2) == GEAS_ERR_STATE,
+              "re-calling a committed transactional pledge is GEAS_ERR_STATE");
+        CHECK(run_status(c, "credit", cr, 2) == GEAS_ERR_STATE,
+              "re-calling the other committed pledge is GEAS_ERR_STATE");
+        geas_contract_break(c);
     }
 
     /* the file reflects both writes: 1 fell to 70, 2 rose to 130. */
@@ -179,15 +179,15 @@ int main(void) {
     /* ---- a failed transfer: credit a missing account, the whole episode
      * rolls back so the debit that ran leaves nothing durable ---- */
 
-    AshContract* cb = sign_ledger(rt, &dsn_ovr);
+    GeasContract* cb = sign_ledger(rt, &dsn_ovr);
     if (cb) {
-        AshValue d[2] = { int_val(1), float_val(50.0) };
-        AshValue cr[2] = { int_val(99), float_val(50.0) };
-        AshValue r = run(cb, "debit", d, 2);
+        GeasValue d[2] = { int_val(1), float_val(50.0) };
+        GeasValue cr[2] = { int_val(99), float_val(50.0) };
+        GeasValue r = run(cb, "debit", d, 2);
         CHECK(ok_unit(&r), "debit 50 from 1 is Ok");
         r = run(cb, "credit", cr, 2);
         CHECK(is_err(&r), "credit to a missing account is Err");
-        ash_contract_break(cb);
+        geas_contract_break(cb);
     }
     /* the debit did not survive: 1 is still 70, byte for byte the pre-transfer
      * value. */
@@ -197,18 +197,18 @@ int main(void) {
     /* ---- a break mid episode: debit runs, then the contract is torn down
      * before the credit, and the open transaction rolls back ---- */
 
-    AshContract* ck = sign_ledger(rt, &dsn_ovr);
+    GeasContract* ck = sign_ledger(rt, &dsn_ovr);
     if (ck) {
-        AshValue d[2] = { int_val(1), float_val(25.0) };
-        AshValue r = run(ck, "debit", d, 2);
+        GeasValue d[2] = { int_val(1), float_val(25.0) };
+        GeasValue r = run(ck, "debit", d, 2);
         CHECK(ok_unit(&r), "debit 25 from 1 is Ok");
-        CHECK(ash_contract_break(ck) == ASH_OK, "break mid transaction");
+        CHECK(geas_contract_break(ck) == GEAS_OK, "break mid transaction");
     }
     /* no debit survived the break: 1 is still 70. */
     CHECK(read_balance(rt, &dsn_ovr, 1) == 70.0,
           "break before commit left no debit durable, 1 still 70");
 
-    ash_runtime_shutdown(rt);
+    geas_runtime_shutdown(rt);
     unlink(db_path);
 
     if (g_fail) {

@@ -4,8 +4,8 @@ live behind gRPC and found that it can, easily, and that the hard question is
 who ends it. Step 1 answered that with an idle timer. This one answers it with
 the connection, which is the answer the C ABI always had.
 
-The runtime side is unchanged and ordinary. ashford.py loads libashrt and
-libpayment.ash.so through ctypes, binds a Python charge over the abstract
+The runtime side is unchanged and ordinary. geas.py loads libgeasrt and
+libpayment.geas.so through ctypes, binds a Python charge over the abstract
 pledge exactly the way demo_payment.py does, and freezes. What sits above it is
 a table keyed by a server issued instance id, a lock per instance, and one
 rule.
@@ -26,7 +26,7 @@ Three lines this server holds, and they are the findings:
      NOT_FOUND. The id names an instance only for as long as the stream that
      issued it is up.
   2. A pledge's Err is a value. The contract answering Err(41) is a
-     BoolIntResult with the err arm set and an OK rpc status. Only an Ashford
+     BoolIntResult with the err arm set and an OK rpc status. Only a Geas
      status, a fulfillment that did not run, becomes a gRPC error.
   3. There is no timer in this file. Nothing here presumes anything about a
      client from how long it has been quiet, because it no longer has to
@@ -50,15 +50,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "interop" / "python"))
 sys.path.insert(0, str(ROOT / "target" / "grpc-gen"))
 
-import ashford  # noqa: E402
-from ashford import (ASH_ERR_NAME, ASH_ERR_STATE, ASH_ERR_TYPE,  # noqa: E402
-                     ASH_ERR_UNBOUND, ASH_ERR_VERSION, AshError, Err, Ok,
+import geas  # noqa: E402
+from geas import (GEAS_ERR_NAME, GEAS_ERR_STATE, GEAS_ERR_TYPE,  # noqa: E402
+                     GEAS_ERR_UNBOUND, GEAS_ERR_VERSION, GeasError, Err, Ok,
                      Runtime)
 
 import payment_bridge_pb2 as pb  # noqa: E402
 import payment_bridge_pb2_grpc as pb_grpc  # noqa: E402
 
-OUT = ROOT / "target" / "ashc-out"
+OUT = ROOT / "target" / "geas-out"
 
 # A session holds a worker thread for the instance's whole life, so the pool
 # has to be wide enough for every live session plus the pledge calls driving
@@ -66,24 +66,24 @@ OUT = ROOT / "target" / "ashc-out"
 # it is a real number, not a detail.
 MAX_WORKERS = 32
 
-# The status map, and the whole point of the split. An Ashford status is a
+# The status map, and the whole point of the split. An Geas status is a
 # transport or lifecycle failure: the fulfillment did not run. A contract's
 # own Err is a value that rides an OK rpc. This table says nothing about
 # business outcomes, only about calls that never reached a body.
 STATUS_TO_GRPC = {
-    ASH_ERR_STATE: grpc.StatusCode.FAILED_PRECONDITION,
-    ASH_ERR_NAME: grpc.StatusCode.NOT_FOUND,
-    ASH_ERR_TYPE: grpc.StatusCode.INVALID_ARGUMENT,
-    ASH_ERR_VERSION: grpc.StatusCode.ABORTED,
-    ASH_ERR_UNBOUND: grpc.StatusCode.FAILED_PRECONDITION,
+    GEAS_ERR_STATE: grpc.StatusCode.FAILED_PRECONDITION,
+    GEAS_ERR_NAME: grpc.StatusCode.NOT_FOUND,
+    GEAS_ERR_TYPE: grpc.StatusCode.INVALID_ARGUMENT,
+    GEAS_ERR_VERSION: grpc.StatusCode.ABORTED,
+    GEAS_ERR_UNBOUND: grpc.StatusCode.FAILED_PRECONDITION,
 }
 
 STATE_TO_PB = {
-    ashford.ASH_UNSIGNED: pb.UNSIGNED,
-    ashford.ASH_SIGNED: pb.SIGNED,
-    ashford.ASH_FULFILLED: pb.FULFILLED,
-    ashford.ASH_PARTIAL: pb.PARTIAL,
-    ashford.ASH_BROKEN: pb.BROKEN,
+    geas.GEAS_UNSIGNED: pb.UNSIGNED,
+    geas.GEAS_SIGNED: pb.SIGNED,
+    geas.GEAS_FULFILLED: pb.FULFILLED,
+    geas.GEAS_PARTIAL: pb.PARTIAL,
+    geas.GEAS_BROKEN: pb.BROKEN,
 }
 
 
@@ -164,16 +164,16 @@ def _break_quietly(inst):
     is not an error to reclaim."""
     try:
         inst.contract.break_()
-    except AshError as e:
-        if e.status != ASH_ERR_STATE:
+    except GeasError as e:
+        if e.status != GEAS_ERR_STATE:
             raise
 
 
 def _abort(context, err):
-    """Maps an Ashford status onto a gRPC code. Anything unmapped is
+    """Maps a Geas status onto a gRPC code. Anything unmapped is
     INTERNAL: the bridge does not invent a meaning it was not given."""
     code = STATUS_TO_GRPC.get(err.status, grpc.StatusCode.INTERNAL)
-    context.abort(code, f"ashford status {err.status}: {err}")
+    context.abort(code, f"geas status {err.status}: {err}")
 
 
 def _result_pb(value):
@@ -210,7 +210,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         with s.lock:
             try:
                 return _result_pb(s.contract.fulfill_sync(pledge, *args))
-            except AshError as e:
+            except GeasError as e:
                 _abort(context, e)
 
     def end_session(self, instance_id, reason):
@@ -232,8 +232,8 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
             if self._park_dsn:
                 try:
                     s.contract.park(self._park_dsn, s.park_token)
-                except AshError as e:
-                    if e.status == ASH_ERR_STATE:
+                except GeasError as e:
+                    if e.status == GEAS_ERR_STATE:
                         print(f"[bridge_server] session {instance_id} ended "
                               f"({reason}), explicit break left no heap to "
                               "park", flush=True)
@@ -275,7 +275,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         try:
             c = self._rt.sign("PaymentService", vows=vows,
                               expected_hash=request.expected_hash)
-        except AshError as e:
+        except GeasError as e:
             _abort(context, e)
 
         token = uuid.uuid4().hex if self._park_dsn else ""
@@ -313,19 +313,19 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
                 c = self._rt.resume(self._park_dsn, request.park_token,
                                     request.expected_hash)
                 with sqlite3.connect(self._park_dsn) as db:
-                    cur = db.execute("DELETE FROM ash_park WHERE pkey = ?",
+                    cur = db.execute("DELETE FROM geas_park WHERE pkey = ?",
                                      (request.park_token.encode(),))
                 if cur.rowcount == 0:
                     try:
                         c.break_()
-                    except AshError as e:
-                        if e.status != ASH_ERR_STATE:
+                    except GeasError as e:
+                        if e.status != GEAS_ERR_STATE:
                             raise
                     context.abort(
                         grpc.StatusCode.NOT_FOUND,
                         "park token was claimed by another replica")
                 inst = self._table.insert(c, request.park_token)
-            except AshError as e:
+            except GeasError as e:
                 _abort(context, e)
 
         iid = inst.instance_id
@@ -368,7 +368,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
             try:
                 p = s.contract.partial()
                 state = s.contract.state()
-            except AshError as e:
+            except GeasError as e:
                 _abort(context, e)
         errors = [pb.PledgeError(pledge=name, err=int(val))
                   for name, val in p.errors if val is not None]
@@ -379,7 +379,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
     def Break(self, request, context):
         """Breaks the instance but leaves the entry standing, which is the
         same choice step 1 made and it survives the move to streams intact. In
-        process, a broken handle still answers ASH_ERR_STATE to a fulfillment
+        process, a broken handle still answers GEAS_ERR_STATE to a fulfillment
         and still reads its partial surface, so the owner learns it broke.
         Dropping the row here would make a broken instance answer NOT_FOUND
         instead, indistinguishable from an id that never existed, and the
@@ -394,7 +394,7 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
         with s.lock:
             try:
                 _break_quietly(s)
-            except AshError as e:
+            except GeasError as e:
                 _abort(context, e)
         return pb.BreakReply()
 
@@ -408,8 +408,8 @@ class PaymentServicer(pb_grpc.PaymentServiceServicer):
 
 
 def serve(port, park_dsn=None):
-    rt = Runtime(OUT / "libashrt.so")
-    rt.load(OUT / "libpayment.ash.so")
+    rt = Runtime(OUT / "libgeasrt.so")
+    rt.load(OUT / "libpayment.geas.so")
     rt.bind("PaymentService.charge", charge)
     rt.freeze()
 

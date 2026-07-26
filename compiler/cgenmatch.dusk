@@ -7,7 +7,7 @@
 // contains no user statements, literal subexpressions aside, so that break
 // can never capture a loop break written in an arm body; the bodies
 // themselves sit in plain if blocks where break and continue still mean the
-// enclosing loop. Payload bindings hoist as zeroed AshValue locals above the
+// enclosing loop. Payload bindings hoist as zeroed GeasValue locals above the
 // test so the body reads them in scope. The checker proved exhaustiveness
 // and arm type agreement already; a match nothing catches leaves the zeroed
 // Unit result, a case a checked program cannot reach.
@@ -119,9 +119,9 @@ func gen_pat_test(g: *Cg, pid: int64, sval: string, sty: int64, binds: *Vector<P
         if str_len(fld) > 0 {
             cg_line(g, tmsg7("if (!(", sval, tmsg3(".as.", fld, " == "), lv.cvar, tmsg3(".as.", fld, ")) break;"), "", ""))
         } else if ty_get(t, sty).kind == tyk_str() {
-            cg_line(g, tmsg7("if (!ash_string_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
+            cg_line(g, tmsg7("if (!geas_string_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
         } else {
-            cg_line(g, tmsg7("if (!ash_value_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
+            cg_line(g, tmsg7("if (!geas_value_eq(&", sval, ", &", lv.cvar, ")) break;", "", ""))
         }
         return cur
     }
@@ -142,7 +142,7 @@ func gen_pat_test(g: *Cg, pid: int64, sval: string, sty: int64, binds: *Vector<P
             if p.kind == pk_err() { inner = n.b }
         }
         pv: string = cg_tmp(g)
-        cg_line(g, tmsg5("AshValue ", pv, " = *(const AshValue*)", sval, ".as.box;"))
+        cg_line(g, tmsg5("GeasValue ", pv, " = *(const GeasValue*)", sval, ".as.box;"))
         return gen_pat_test(g, p.a, pv, inner, binds, cur)
     }
     // A variant pattern with a payload list.
@@ -158,7 +158,7 @@ func gen_pat_test(g: *Cg, pid: int64, sval: string, sty: int64, binds: *Vector<P
         mut ft: int64 = ty_unknown(t)
         if i < cv2.len { ft = sig_field((*g).sigs, cv2.off, i).ty }
         pv2: string = cg_tmp(g)
-        cg_line(g, tmsg7("AshValue ", pv2, " = ((const AshValue*)", sval, ".as.list.data)[", tmsg2(int_to_string(i), "];"), ""))
+        cg_line(g, tmsg7("GeasValue ", pv2, " = ((const GeasValue*)", sval, ".as.list.data)[", tmsg2(int_to_string(i), "];"), ""))
         c = gen_pat_test(g, vec_get((*a).kids, p.b + i), pv2, ft, binds, c)
         i = i + 1
     }
@@ -208,7 +208,7 @@ func gen_arms(g: *Cg, e: ExprNode, s: CVal, rvar: string, i: int64, want: int64)
     mut j: int64 = 0
     while j < vec_len(binds2) {
         b: PBind = vec_get(binds2, j)
-        cg_line(g, tmsg3("AshValue ", b.cvar, " = {0};"))
+        cg_line(g, tmsg3("GeasValue ", b.cvar, " = {0};"))
         j = j + 1
     }
     hit: string = cg_tmp(g)

@@ -135,7 +135,7 @@ def main():
     if not grpc_ready():
         return 0
     gate = None
-    with tempfile.TemporaryDirectory(prefix="ashford-watch-") as temp:
+    with tempfile.TemporaryDirectory(prefix="geas-watch-") as temp:
         root = Path(temp)
         dsn = root / "supervisor.sqlite"
         piddir = root / "pids"

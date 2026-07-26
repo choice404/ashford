@@ -1,4 +1,4 @@
-"""A small process supervisor whose Ashford contract is its state machine.
+"""A small process supervisor whose Geas contract is its state machine.
 
 Each Service instance describes one run. Signed means the process is starting,
 Partial means it is running, Fulfilled is a clean exit, and Broken is a
@@ -19,10 +19,10 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "target" / "ashc-out"
+OUT = ROOT / "target" / "geas-out"
 sys.path.insert(0, str(ROOT / "interop" / "python"))
 
-from ashford import AshError, Err, Ok, Runtime
+from geas import GeasError, Err, Ok, Runtime
 
 
 class Run:
@@ -141,13 +141,13 @@ class Supervisor:
             # free of instances nobody is standing behind.
             try:
                 observer.break_()
-            except AshError:
+            except GeasError:
                 pass
 
     def consume_park(self, name):
         """resume reads the row; DELETE makes the successful claim one-shot."""
         with sqlite3.connect(self.dsn) as db:
-            db.execute("DELETE FROM ash_park WHERE pkey = ?", (name.encode(),))
+            db.execute("DELETE FROM geas_park WHERE pkey = ?", (name.encode(),))
 
     def sign_fresh(self, name, command):
         contract = self.runtime.sign(
@@ -182,7 +182,7 @@ class Supervisor:
             return self.sign_fresh(name, command)
         try:
             contract = self.runtime.resume(self.dsn, name)
-        except AshError:
+        except GeasError:
             return self.sign_fresh(name, command)
 
         self.consume_park(name)
@@ -411,8 +411,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     grpc_parts = observer_modules() if args.grpc is not None else None
-    with Runtime(OUT / "libashrt.so") as runtime:
-        runtime.load(OUT / "libservice.ash.so")
+    with Runtime(OUT / "libgeasrt.so") as runtime:
+        runtime.load(OUT / "libservice.geas.so")
         supervisor = Supervisor(runtime, args.dsn, args.piddir,
                                 args.max_crashes, args.poll)
         runtime.bind("Service.start", supervisor.bind_start)
@@ -447,6 +447,6 @@ if __name__ == "__main__":
     except GrpcUnavailable as error:
         print(f"[supervisor] error {error}", file=sys.stderr, flush=True)
         raise SystemExit(2)
-    except (AshError, OSError, RuntimeError, sqlite3.Error) as error:
+    except (GeasError, OSError, RuntimeError, sqlite3.Error) as error:
         print(f"[supervisor] error {error}", file=sys.stderr, flush=True)
         raise SystemExit(1)

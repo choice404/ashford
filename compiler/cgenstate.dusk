@@ -145,7 +145,7 @@ export func cg_lookup(g: *Cg, name: int64) -> CBind {
 // are unique across the program and member names within their contract.
 export func cg_clause_fn(cname: string, clname: string) -> string {
     b: *StringBuilder = alloc(sb_new())
-    sb_push(b, "ash_clause_")
+    sb_push(b, "geas_clause_")
     sb_push(b, cname)
     sb_push_char(b, 95)
     sb_push(b, clname)
@@ -155,34 +155,34 @@ export func cg_clause_fn(cname: string, clname: string) -> string {
     return out
 }
 
-// The AshTypeTag spelling of a checked type, or "" for a shape the ABI does
+// The GeasTypeTag spelling of a checked type, or "" for a shape the ABI does
 // not tag one to one, which the callers treat as no check or a build fault.
 // A named type resolves through the file's declarations: a record is
-// ASH_TY_RECORD, a sum is ASH_TY_SUM, anything else stays untagged. A
-// contract instance is the internal ASH_TY_INSTANCE; the checker keeps that
+// GEAS_TY_RECORD, a sum is GEAS_TY_SUM, anything else stays untagged. A
+// contract instance is the internal GEAS_TY_INSTANCE; the checker keeps that
 // tag out of every ABI position, so the thunk frame checks never meet it,
 // but a body local list of instances declares it as its element tag.
 export func cg_tag_of(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
-    if k == tyk_int() { return "ASH_TY_INT" }
-    if k == tyk_uint() { return "ASH_TY_UINT" }
-    if k == tyk_float() { return "ASH_TY_FLOAT" }
-    if k == tyk_bool() { return "ASH_TY_BOOL" }
-    if k == tyk_byte() { return "ASH_TY_BYTE" }
-    if k == tyk_char() { return "ASH_TY_CHAR" }
-    if k == tyk_str() { return "ASH_TY_STRING" }
-    if k == tyk_unit() { return "ASH_TY_UNIT" }
-    if k == tyk_list() { return "ASH_TY_LIST" }
-    if k == tyk_map() { return "ASH_TY_MAP" }
-    if k == tyk_tuple() { return "ASH_TY_TUPLE" }
-    if k == tyk_option() { return "ASH_TY_OPTION" }
-    if k == tyk_result() { return "ASH_TY_RESULT" }
+    if k == tyk_int() { return "GEAS_TY_INT" }
+    if k == tyk_uint() { return "GEAS_TY_UINT" }
+    if k == tyk_float() { return "GEAS_TY_FLOAT" }
+    if k == tyk_bool() { return "GEAS_TY_BOOL" }
+    if k == tyk_byte() { return "GEAS_TY_BYTE" }
+    if k == tyk_char() { return "GEAS_TY_CHAR" }
+    if k == tyk_str() { return "GEAS_TY_STRING" }
+    if k == tyk_unit() { return "GEAS_TY_UNIT" }
+    if k == tyk_list() { return "GEAS_TY_LIST" }
+    if k == tyk_map() { return "GEAS_TY_MAP" }
+    if k == tyk_tuple() { return "GEAS_TY_TUPLE" }
+    if k == tyk_option() { return "GEAS_TY_OPTION" }
+    if k == tyk_result() { return "GEAS_TY_RESULT" }
     if k == tyk_named() {
         cn: CNamed = cg_named(g, tyid)
-        if cn.kind == gk_record() { return "ASH_TY_RECORD" }
-        if cn.kind == gk_sum() { return "ASH_TY_SUM" }
+        if cn.kind == gk_record() { return "GEAS_TY_RECORD" }
+        if cn.kind == gk_sum() { return "GEAS_TY_SUM" }
     }
-    if k == tyk_contract() { return "ASH_TY_INSTANCE" }
+    if k == tyk_contract() { return "GEAS_TY_INSTANCE" }
     return ""
 }
 
@@ -236,7 +236,7 @@ export func cg_variant(g: *Cg, name: int64) -> CVariant {
     return CVariant { idx: -1, owner: -1, off: 0, len: 0, found: false }
 }
 
-// The AshValue union field a scalar of this type lives in, or "".
+// The GeasValue union field a scalar of this type lives in, or "".
 export func cg_field_of(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
     if k == tyk_int() { return "i" }

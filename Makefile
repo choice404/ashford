@@ -1,4 +1,4 @@
-# The M6 build. Five artifacts: the ashc binary built by the dusk toolchain,
+# The M6 build. Five artifacts: the geas binary built by the dusk toolchain,
 # the runtime shared library, the compiled hello and hello_v2 modules, and
 # the C host that drives them. make smoke runs the whole pipeline and is the
 # walking skeleton gate every later milestone keeps green. The runtime is
@@ -14,7 +14,7 @@
 DUSK    ?= dusk
 CC      ?= cc
 CFLAGS  ?= -Wall -Wextra -fPIC
-OUT     := target/ashc-out
+OUT     := target/geas-out
 
 # The runtime translation units a standalone gate compiles into its own binary,
 # the shared library split into sources: the runtime, its wire codec, and the
@@ -41,16 +41,16 @@ SQLITE_OBJ := $(OUT)/sqlite3.o
 SQLITE_FLAGS := -fPIC -w -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION \
     -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0
 
-RT_SO      := $(OUT)/libashrt.so
-ASHC       := target/dusk-out/ashc
-MODULE     := $(OUT)/libhello.ash.so
-MODULE_V2  := $(OUT)/libhello_v2.ash.so
-MODULE_PAY := $(OUT)/libpayment.ash.so
-MODULE_LANG := $(OUT)/liblang.ash.so
-MODULE_STD := $(OUT)/libstd_user.ash.so
-MODULE_LEDGER := $(OUT)/libledger.ash.so
-MODULE_LIFE := $(OUT)/liblifecycle.ash.so
-MODULE_SVC := $(OUT)/libservice.ash.so
+RT_SO      := $(OUT)/libgeasrt.so
+GEAS       := target/dusk-out/geas
+MODULE     := $(OUT)/libhello.geas.so
+MODULE_V2  := $(OUT)/libhello_v2.geas.so
+MODULE_PAY := $(OUT)/libpayment.geas.so
+MODULE_LANG := $(OUT)/liblang.geas.so
+MODULE_STD := $(OUT)/libstd_user.geas.so
+MODULE_LEDGER := $(OUT)/libledger.geas.so
+MODULE_LIFE := $(OUT)/liblifecycle.geas.so
+MODULE_SVC := $(OUT)/libservice.geas.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
@@ -70,52 +70,52 @@ $(SQLITE_OBJ): runtime/third_party/sqlite3.c runtime/third_party/sqlite3.h
 	@mkdir -p $(OUT)
 	$(CC) $(SQLITE_FLAGS) -I runtime/third_party -c runtime/third_party/sqlite3.c -o $(SQLITE_OBJ)
 
-$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c runtime/include/ash/ash.h runtime/include/ash/ash_abi.h runtime/include/ash/ash_wire.h runtime/include/ash/ash_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
+$(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c runtime/include/geas/geas.h runtime/include/geas/geas_abi.h runtime/include/geas/geas_wire.h runtime/include/geas/geas_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
 
-compiler: $(ASHC)
+compiler: $(GEAS)
 
-$(ASHC): $(wildcard compiler/*.dusk)
-	$(DUSK) build compiler/ashc.dusk
+$(GEAS): $(wildcard compiler/*.dusk)
+	$(DUSK) build compiler/geas.dusk
 
 module: $(MODULE)
 
-$(MODULE): $(ASHC) skeleton/hello.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/hello.ash
+$(MODULE): $(GEAS) skeleton/hello.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/hello.geas
 
-$(MODULE_V2): $(ASHC) skeleton/hello_v2.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/hello_v2.ash
+$(MODULE_V2): $(GEAS) skeleton/hello_v2.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/hello_v2.geas
 
-$(MODULE_PAY): $(ASHC) skeleton/payment.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/payment.ash
+$(MODULE_PAY): $(GEAS) skeleton/payment.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/payment.geas
 
-$(MODULE_LANG): $(ASHC) skeleton/lang.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/lang.ash
+$(MODULE_LANG): $(GEAS) skeleton/lang.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/lang.geas
 
-$(MODULE_STD): $(ASHC) skeleton/std_user.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/std_user.ash
+$(MODULE_STD): $(GEAS) skeleton/std_user.geas $(wildcard lib/std/*.geas) runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/std_user.geas
 
-$(MODULE_LEDGER): $(ASHC) skeleton/ledger.ash lib/ashstd/store.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/ledger.ash
+$(MODULE_LEDGER): $(GEAS) skeleton/ledger.geas lib/std/store.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/ledger.geas
 
-$(MODULE_LIFE): $(ASHC) skeleton/lifecycle.ash runtime/include/ash/ash_abi.h
-	$(ASHC) build skeleton/lifecycle.ash
+$(MODULE_LIFE): $(GEAS) skeleton/lifecycle.geas runtime/include/geas/geas_abi.h
+	$(GEAS) build skeleton/lifecycle.geas
 
-$(BIN_DEMO): $(ASHC) skeleton/main_demo.ash $(RT_SO) runtime/include/ash/ash_abi.h
-	$(ASHC) build --bin skeleton/main_demo.ash
+$(BIN_DEMO): $(GEAS) skeleton/main_demo.geas $(RT_SO) runtime/include/geas/geas_abi.h
+	$(GEAS) build --bin skeleton/main_demo.geas
 
 host: $(HOST)
 
 $(HOST): skeleton/host.c $(RT_SO)
-	$(CC) $(CFLAGS) -pthread -I runtime/include skeleton/host.c -L $(OUT) -lashrt \
+	$(CC) $(CFLAGS) -pthread -I runtime/include skeleton/host.c -L $(OUT) -lgeasrt \
 	    -Wl,-rpath,'$$ORIGIN' -o $(HOST)
 
 smoke: $(RT_SO) $(MODULE) $(HOST)
 	./$(HOST)
 
 # The leak gate. The runtime compiles straight into the host here so LSan sees
-# every allocation, and -rdynamic exports the ash_* symbols the dlopened
+# every allocation, and -rdynamic exports the geas_* symbols the dlopened
 # module resolves against. valgrind covers the same ground where installed.
 # The runtime's own unit gate: the deep value helpers, deep copy, and the
 # copy-in isolation the memory model promises. Compiled with the runtime in
@@ -143,7 +143,7 @@ test-wire:
 # and a negative corpus of a dead dsn, broken SQL, a wrong parameter count, and
 # a non scalar parameter, every refusal watched for leaks. The sqlite object is
 # uninstrumented for speed, which ASan tolerates, while store.c and the test are
-# under the sanitizer. RT_UNITS comes along for ash_value_eq; store.c is not in
+# under the sanitizer. RT_UNITS comes along for geas_value_eq; store.c is not in
 # it. Regenerate the golden with ./$(OUT)/test_store --emit tests/store after a
 # deliberate format change. Not folded into all yet; it is verified on its own.
 test-store-unit:
@@ -157,10 +157,10 @@ test-store-unit:
 # temp SQLite file, the schema reconciled into a fresh file, a row written and
 # read back, an update round tripped, a missing account answered as the
 # contract's own Err, an injection string bound as a value that leaves the table
-# standing, and the two refusal signs, a divergent schema (ASH_ERR_TYPE) and a
-# missing dsn vow (ASH_ERR_UNBOUND). The runtime, the driver, and the
+# standing, and the two refusal signs, a divergent schema (GEAS_ERR_TYPE) and a
+# missing dsn vow (GEAS_ERR_UNBOUND). The runtime, the driver, and the
 # uninstrumented sqlite object are compiled in so LSan watches every row that
-# lands on the instance to zero leaks; -rdynamic exports the ash_* symbols the
+# lands on the instance to zero leaks; -rdynamic exports the geas_* symbols the
 # dlopened module resolves against.
 test-store: $(MODULE_LEDGER) $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
@@ -173,7 +173,7 @@ test-store: $(MODULE_LEDGER) $(SQLITE_OBJ)
 # subcontract driven as one all-or-nothing episode. A good transfer commits both
 # writes and the file reflects the moved balances; a failed transfer rolls the
 # debit back so nothing durable survives; a second call to a resolved
-# transactional pledge is ASH_ERR_STATE; and a break mid transaction leaves no
+# transactional pledge is GEAS_ERR_STATE; and a break mid transaction leaves no
 # debit durable. Every persistence assertion reopens the file in a fresh
 # instance so the file, not a cache, is the witness.
 test-store-txn: $(MODULE_LEDGER) $(SQLITE_OBJ)
@@ -183,16 +183,16 @@ test-store-txn: $(MODULE_LEDGER) $(SQLITE_OBJ)
 	    -ldl -o $(OUT)/test_store_txn
 	./$(OUT)/test_store_txn
 
-# The S3 failure gate under ASan and LSan: ASH_ERR_STORE proven to be the store
+# The S3 failure gate under ASan and LSan: GEAS_ERR_STORE proven to be the store
 # failing the runtime and nothing else, and the business boundary proven to hold
 # against it. A read only connection made from a mode=ro dsn refuses every write
-# with ASH_ERR_STORE, a loose insert and a transactional debit both, the latter
+# with GEAS_ERR_STORE, a loose insert and a transactional debit both, the latter
 # rolled back; a duplicate primary key is the backend's own constraint refusal,
-# ASH_ERR_STORE and distinct from a value Err, and the table stands after it; a
+# GEAS_ERR_STORE and distinct from a value Err, and the table stands after it; a
 # contended writer that loses the file to an open transaction surfaces
-# ASH_ERR_STORE rather than a stall. The guard the milestone turns on is here
+# GEAS_ERR_STORE rather than a stall. The guard the milestone turns on is here
 # too: an overdraft is Err(Insufficient), the ledger's own rule as a value with
-# an ASH_OK delivery, never once a store status. Every persistence claim reopens
+# an GEAS_OK delivery, never once a store status. Every persistence claim reopens
 # the file in a fresh instance so the file is the witness.
 test-store-fail: $(MODULE_LEDGER) $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
@@ -220,7 +220,7 @@ test-store-crash: $(MODULE_LEDGER) $(SQLITE_OBJ)
 # The S3 concurrency gate under ASan and LSan: many worker threads sign one
 # Ledger instance per transfer, each its own connection to one shared file, and
 # storm the pool with transactional transfers. The loser of a write race is
-# ASH_ERR_STORE and an overdraft is a business Err, but every transfer is whole
+# GEAS_ERR_STORE and an overdraft is a business Err, but every transfer is whole
 # either way, so the money in the pool is conserved to the last unit no matter
 # how the races fall. The gate seeds a known total, runs the storm, and reads it
 # back on one thread: a drift is a half committed episode, and there is none.
@@ -235,7 +235,7 @@ test-store-stress: $(MODULE_LEDGER) $(SQLITE_OBJ)
 # instances on one file, so TSan watches the pool, the waiters, and the per
 # instance lock that keeps each connection single threaded. The dlopened module
 # and the uninstrumented sqlite object are tolerated the way every other TSan
-# gate tolerates them; -rdynamic exports the ash_* symbols the module resolves
+# gate tolerates them; -rdynamic exports the geas_* symbols the module resolves
 # against. Not in the default all gate because it stands up the store under a
 # sanitizer; run it explicitly.
 test-store-stress-tsan: $(MODULE_LEDGER) $(SQLITE_OBJ)
@@ -252,7 +252,7 @@ test-store-stress-tsan: $(MODULE_LEDGER) $(SQLITE_OBJ)
 # rolls a bad one back, and asserts the same outcomes the C hosts assert, proving
 # the store is invisible to a foreign host. Skips cleanly where python3 is not
 # installed. ASan is not needed here, the runtime is a subprocess and the C store
-# gates already watch its allocations; libashrt is the ordinary build.
+# gates already watch its allocations; libgeasrt is the ordinary build.
 test-store-python: $(RT_SO) $(MODULE_LEDGER)
 	@if command -v python3 >/dev/null 2>&1; then \
 	    python3 interop/python/demo_ledger.py; \
@@ -264,8 +264,8 @@ test-store-python: $(RT_SO) $(MODULE_LEDGER)
 # module walks sign, status(), the vow read through an instance, park,
 # break, and resume entirely inside the language and answers the stations
 # as one string; the host signs Driver, points park_dsn at a temp file, and
-# asserts the answer plus the two fault paths, a dead dsn as ASH_ERR_STORE
-# and an unparked key as ASH_ERR_NAME, riding the thunk's exit convention.
+# asserts the answer plus the two fault paths, a dead dsn as GEAS_ERR_STORE
+# and an unparked key as GEAS_ERR_NAME, riding the thunk's exit convention.
 test-lifecycle: $(MODULE_LIFE) $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
@@ -325,7 +325,7 @@ test-lang: $(MODULE_LANG)
 	./$(OUT)/test_lang
 
 # The standard library gate under ASan: the std_user module merges four
-# ashstd modules through the loader, and the host signs MathOps, ListOps,
+# std modules through the loader, and the host signs MathOps, ListOps,
 # and StdUser out of the one library, driving the integer and float
 # arithmetic, the list reductions and their Option answers, the error sums
 # in the Err box, and the sort that runs through an incorporated clause.
@@ -342,8 +342,8 @@ test-std: $(MODULE_STD)
 # variant on purpose: the TSan runtime cannot be mixed into an
 # uninstrumented python3 process, so the concurrency surface stays covered
 # by the C tsan gate.
-$(MODULE_SVC): $(ASHC) examples/supervisor/service.ash $(wildcard lib/ashstd/*.ash) runtime/include/ash/ash_abi.h
-	$(ASHC) build examples/supervisor/service.ash
+$(MODULE_SVC): $(GEAS) examples/supervisor/service.geas $(wildcard lib/std/*.geas) runtime/include/geas/geas_abi.h
+	$(GEAS) build examples/supervisor/service.geas
 
 # The flagship example gate: the supervisor whose service state machine is a
 # contract instance. The driver walks the whole story: two services come up
@@ -405,10 +405,10 @@ test-bin: $(BIN_DEMO)
 
 # The header gate: emit-header must reproduce the pinned golden byte for
 # byte, and the C smoke host compiles against nothing but that header and
-# ash.h, resolves the mangled name it spells, and signs under its hash.
-test-header: $(ASHC) $(MODULE) $(RT_SO)
-	$(ASHC) emit-header skeleton/hello.ash
-	diff tests/golden/hello.ash.h $(OUT)/hello.ash.h
+# geas.h, resolves the mangled name it spells, and signs under its hash.
+test-header: $(GEAS) $(MODULE) $(RT_SO)
+	$(GEAS) emit-header skeleton/hello.geas
+	diff tests/golden/hello.geas.h $(OUT)/hello.geas.h
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic \
 	    -I runtime/include -I $(OUT) \
 	    tests/runtime/test_header.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/test_header
@@ -426,63 +426,63 @@ test-header: $(ASHC) $(MODULE) $(RT_SO)
 # SignPledgeRequest disambiguation, with its wrapper pinning four session
 # types out of one file. The gauntlet's Map stays a named refusal, proven
 # here as a nonzero exit that writes nothing.
-test-proto: $(ASHC)
-	$(ASHC) emit-proto skeleton/payment.ash
+test-proto: $(GEAS)
+	$(GEAS) emit-proto skeleton/payment.geas
 	diff tests/golden/payment.proto $(OUT)/payment.proto
 	diff tests/golden/payment_session.go $(OUT)/payment_session.go
-	$(ASHC) emit-proto skeleton/hello.ash
+	$(GEAS) emit-proto skeleton/hello.geas
 	diff tests/golden/hello.proto $(OUT)/hello.proto
-	$(ASHC) emit-proto skeleton/ledger.ash
+	$(GEAS) emit-proto skeleton/ledger.geas
 	diff tests/golden/ledger.proto $(OUT)/ledger.proto
-	$(ASHC) emit-proto skeleton/main_demo.ash
+	$(GEAS) emit-proto skeleton/main_demo.geas
 	diff tests/golden/main_demo.proto $(OUT)/main_demo.proto
 	diff tests/golden/payment_session.ts $(OUT)/payment_session.ts
-	$(ASHC) emit-proto skeleton/std_user.ash
+	$(GEAS) emit-proto skeleton/std_user.geas
 	diff tests/golden/std_user.proto $(OUT)/std_user.proto
 	diff tests/golden/std_user_session.go $(OUT)/std_user_session.go
 	diff tests/golden/std_user_session.ts $(OUT)/std_user_session.ts
 	rm -f $(OUT)/lang.proto
-	! $(ASHC) emit-proto skeleton/lang.ash 2>/dev/null
+	! $(GEAS) emit-proto skeleton/lang.geas 2>/dev/null
 	test ! -f $(OUT)/lang.proto
 	@echo "[test-proto] ok"
 
 # The determinism gate: two builds of the same source must emit byte
 # identical module C, which is what keeps every mangled name and shape hash
 # in the iname story reproducible.
-test-determinism: $(ASHC) $(RT_SO)
+test-determinism: $(GEAS) $(RT_SO)
 	@mkdir -p $(OUT)
-	$(ASHC) build skeleton/hello.ash
+	$(GEAS) build skeleton/hello.geas
 	mv $(OUT)/hello.c $(OUT)/hello.c.first
-	$(ASHC) build skeleton/hello.ash
+	$(GEAS) build skeleton/hello.geas
 	diff $(OUT)/hello.c.first $(OUT)/hello.c
-	$(ASHC) build skeleton/hello_v2.ash
+	$(GEAS) build skeleton/hello_v2.geas
 	mv $(OUT)/hello_v2.c $(OUT)/hello_v2.c.first
-	$(ASHC) build skeleton/hello_v2.ash
+	$(GEAS) build skeleton/hello_v2.geas
 	diff $(OUT)/hello_v2.c.first $(OUT)/hello_v2.c
-	$(ASHC) build skeleton/payment.ash
+	$(GEAS) build skeleton/payment.geas
 	mv $(OUT)/payment.c $(OUT)/payment.c.first
-	$(ASHC) build skeleton/payment.ash
+	$(GEAS) build skeleton/payment.geas
 	diff $(OUT)/payment.c.first $(OUT)/payment.c
-	$(ASHC) build skeleton/lang.ash
+	$(GEAS) build skeleton/lang.geas
 	mv $(OUT)/lang.c $(OUT)/lang.c.first
-	$(ASHC) build skeleton/lang.ash
+	$(GEAS) build skeleton/lang.geas
 	diff $(OUT)/lang.c.first $(OUT)/lang.c
-	$(ASHC) build skeleton/std_user.ash
+	$(GEAS) build skeleton/std_user.geas
 	mv $(OUT)/std_user.c $(OUT)/std_user.c.first
-	$(ASHC) build skeleton/std_user.ash
+	$(GEAS) build skeleton/std_user.geas
 	diff $(OUT)/std_user.c.first $(OUT)/std_user.c
-	$(ASHC) build --bin skeleton/main_demo.ash
+	$(GEAS) build --bin skeleton/main_demo.geas
 	mv $(OUT)/main_demo.c $(OUT)/main_demo.c.first
 	mv $(OUT)/main_demo.main.c $(OUT)/main_demo.main.c.first
-	$(ASHC) build --bin skeleton/main_demo.ash
+	$(GEAS) build --bin skeleton/main_demo.geas
 	diff $(OUT)/main_demo.c.first $(OUT)/main_demo.c
 	diff $(OUT)/main_demo.main.c.first $(OUT)/main_demo.main.c
-	$(ASHC) emit-header skeleton/hello.ash
-	mv $(OUT)/hello.ash.h $(OUT)/hello.ash.h.first
-	$(ASHC) emit-header skeleton/hello.ash
-	diff $(OUT)/hello.ash.h.first $(OUT)/hello.ash.h
+	$(GEAS) emit-header skeleton/hello.geas
+	mv $(OUT)/hello.geas.h $(OUT)/hello.geas.h.first
+	$(GEAS) emit-header skeleton/hello.geas
+	diff $(OUT)/hello.geas.h.first $(OUT)/hello.geas.h
 	rm -f $(OUT)/hello.c.first $(OUT)/hello_v2.c.first $(OUT)/payment.c.first $(OUT)/lang.c.first $(OUT)/std_user.c.first
-	rm -f $(OUT)/main_demo.c.first $(OUT)/main_demo.main.c.first $(OUT)/hello.ash.h.first
+	rm -f $(OUT)/main_demo.c.first $(OUT)/main_demo.main.c.first $(OUT)/hello.geas.h.first
 	@echo "[determinism] ok"
 
 # The same concurrency surface under ThreadSanitizer: the stress gate and the
@@ -503,7 +503,7 @@ tsan: $(MODULE)
 # handle and knows its instance only by the uint64 the server issued. It
 # proves the walk demo_payment.py runs in process survives a process boundary
 # with the same answers, that a pledge's Err crosses as a value on an OK rpc
-# while an Ashford status crosses as a gRPC code, and that an instance lives
+# while a Geas status crosses as a gRPC code, and that an instance lives
 # exactly as long as the Session stream that issued it: a killed client's
 # instance is broken at once, and a client that holds its stream and says
 # nothing keeps its instance however long it stays quiet. Out of the all gate
@@ -555,7 +555,7 @@ test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
 	exit $$code
 
 # The step 2 gate: the same server, driven by a Go client built from nothing
-# but ashc's emitted artifacts. emit-proto writes the .proto and the session
+# but geas's emitted artifacts. emit-proto writes the .proto and the session
 # wrapper, protoc and its Go plugins turn the .proto into typed stubs, and
 # the client walks the whole payment lifecycle against the Python server,
 # session stream, pinned shape hash, value Err, and the dead client's
@@ -566,7 +566,7 @@ test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
 GO_DIR   := interop/grpc/go
 GOPB_DIR := $(GO_DIR)/paymentpb
 
-test-grpc-go: $(RT_SO) $(MODULE_PAY) $(ASHC)
+test-grpc-go: $(RT_SO) $(MODULE_PAY) $(GEAS)
 	@py=""; \
 	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
 	    py="$(GRPCVENV)/bin/python"; \
@@ -584,11 +584,11 @@ test-grpc-go: $(RT_SO) $(MODULE_PAY) $(ASHC)
 	    echo "[test-grpc-go] go or the protoc toolchain not found, skipping"; \
 	    exit 0; \
 	fi; \
-	$(ASHC) emit-proto skeleton/payment.ash || exit 1; \
+	$(GEAS) emit-proto skeleton/payment.geas || exit 1; \
 	mkdir -p $(GOPB_DIR) $(GRPC_GEN); \
 	PATH="$$PATH:$$HOME/go/bin" protoc -I $(OUT) \
-	    --go_out=$(GO_DIR) --go_opt=module=ashbridge \
-	    --go-grpc_out=$(GO_DIR) --go-grpc_opt=module=ashbridge \
+	    --go_out=$(GO_DIR) --go_opt=module=geasbridge \
+	    --go-grpc_out=$(GO_DIR) --go-grpc_opt=module=geasbridge \
 	    $(OUT)/payment.proto || exit 1; \
 	cp $(OUT)/payment_session.go $(GOPB_DIR)/ || exit 1; \
 	(cd $(GO_DIR) && go build -o ../../../$(OUT)/bridge_client_go ./client) || exit 1; \
@@ -707,7 +707,7 @@ test-grpc-failover: $(RT_SO) $(MODULE_PAY)
 # skipping clean where node, npm, or grpcio is absent.
 NODE_DIR := interop/grpc/node
 
-test-grpc-node: $(RT_SO) $(MODULE_PAY) $(ASHC)
+test-grpc-node: $(RT_SO) $(MODULE_PAY) $(GEAS)
 	@py=""; \
 	if $(GRPCVENV)/bin/python -c "import grpc, grpc_tools" 2>/dev/null; then \
 	    py="$(GRPCVENV)/bin/python"; \
@@ -723,7 +723,7 @@ test-grpc-node: $(RT_SO) $(MODULE_PAY) $(ASHC)
 	    echo "[test-grpc-node] node or npm not found, skipping"; \
 	    exit 0; \
 	fi; \
-	$(ASHC) emit-proto skeleton/payment.ash || exit 1; \
+	$(GEAS) emit-proto skeleton/payment.geas || exit 1; \
 	mkdir -p $(NODE_DIR)/gen $(GRPC_GEN); \
 	cp $(OUT)/payment.proto $(OUT)/payment_session.ts $(NODE_DIR)/gen/ || exit 1; \
 	if [ ! -d $(NODE_DIR)/node_modules ]; then \

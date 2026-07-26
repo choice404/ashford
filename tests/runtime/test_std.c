@@ -1,14 +1,14 @@
 /* test_std.c: the standard library gate. It loads the compiled std_user
- * module, whose imports merged four ashstd modules into one build, and
+ * module, whose imports merged four std modules into one build, and
  * drives the merged surface from C: MathOps and ListOps signed by name even
  * though only the root file names StdUser, the integer and float pledges on
  * each, the error sums riding the Err box as tagged values, Option answers
  * from the reductions, and StdUser's sort3, whose ordering runs through the
- * compare clause the contract incorporated from ashstd.traits. Runs under
+ * compare clause the contract incorporated from std.traits. Runs under
  * ASan and LSan, so every instance allocation the lowered bodies make is
  * watched. */
 
-#include <ash/ash.h>
+#include <geas/geas.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -24,122 +24,122 @@ static int g_fail = 0;
         }                                                    \
     } while (0)
 
-static AshValue int_val(int64_t i) {
-    AshValue v;
+static GeasValue int_val(int64_t i) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_INT;
+    v.ty = GEAS_TY_INT;
     v.as.i = i;
     return v;
 }
 
-static AshValue float_val(double f) {
-    AshValue v;
+static GeasValue float_val(double f) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_FLOAT;
+    v.ty = GEAS_TY_FLOAT;
     v.as.f = f;
     return v;
 }
 
-static AshValue int_list(AshValue* elems, uint64_t n) {
-    AshValue v;
+static GeasValue int_list(GeasValue* elems, uint64_t n) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_LIST;
+    v.ty = GEAS_TY_LIST;
     v.as.list.data = elems;
     v.as.list.len = n;
     v.as.list.cap = n;
-    v.as.list.elem_ty = ASH_TY_INT;
+    v.as.list.elem_ty = GEAS_TY_INT;
     return v;
 }
 
 /* The boxed Int behind an Ok result. */
-static int ok_int(const AshValue* v, int64_t want) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_INT && p->as.i == want;
+static int ok_int(const GeasValue* v, int64_t want) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_INT && p->as.i == want;
 }
 
-static int ok_float(const AshValue* v, double want) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_FLOAT && p->as.f == want;
+static int ok_float(const GeasValue* v, double want) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_FLOAT && p->as.f == want;
 }
 
-static int ok_bool(const AshValue* v, int want) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_BOOL && p->as.b == (want ? 1 : 0);
+static int ok_bool(const GeasValue* v, int want) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_BOOL && p->as.b == (want ? 1 : 0);
 }
 
-static int ok_str(const AshValue* v, const char* want) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    if (p->ty != ASH_TY_STRING) return 0;
+static int ok_str(const GeasValue* v, const char* want) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    if (p->ty != GEAS_TY_STRING) return 0;
     if (p->as.s.len != strlen(want)) return 0;
     return memcmp(p->as.s.ptr, want, p->as.s.len) == 0;
 }
 
 /* The sum behind an Err result: the box holds the error value and its tag is
  * the variant's declaration index. */
-static int err_sum(const AshValue* v, uint32_t variant) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 1 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_SUM && p->tag == variant;
+static int err_sum(const GeasValue* v, uint32_t variant) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 1 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_SUM && p->tag == variant;
 }
 
 /* The boxed Int behind an Err result, for a pledge whose error type is Int. */
-static int err_int(const AshValue* v, int64_t want) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 1 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_INT && p->as.i == want;
+static int err_int(const GeasValue* v, int64_t want) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 1 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_INT && p->as.i == want;
 }
 
-static int some_int(const AshValue* v, int64_t want) {
-    if (v->ty != ASH_TY_OPTION || v->tag != 1 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    return p->ty == ASH_TY_INT && p->as.i == want;
+static int some_int(const GeasValue* v, int64_t want) {
+    if (v->ty != GEAS_TY_OPTION || v->tag != 1 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    return p->ty == GEAS_TY_INT && p->as.i == want;
 }
 
-static int is_none(const AshValue* v) {
-    return v->ty == ASH_TY_OPTION && v->tag == 0;
+static int is_none(const GeasValue* v) {
+    return v->ty == GEAS_TY_OPTION && v->tag == 0;
 }
 
 /* The boxed List<Int> behind an Ok result, element for element. */
-static int ok_int_list(const AshValue* v, const int64_t* want, uint64_t n) {
-    if (v->ty != ASH_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
-    const AshValue* p = (const AshValue*)v->as.box;
-    if (p->ty != ASH_TY_LIST || p->as.list.len != n) return 0;
-    const AshValue* el = (const AshValue*)p->as.list.data;
+static int ok_int_list(const GeasValue* v, const int64_t* want, uint64_t n) {
+    if (v->ty != GEAS_TY_RESULT || v->tag != 0 || !v->as.box) return 0;
+    const GeasValue* p = (const GeasValue*)v->as.box;
+    if (p->ty != GEAS_TY_LIST || p->as.list.len != n) return 0;
+    const GeasValue* el = (const GeasValue*)p->as.list.data;
     for (uint64_t i = 0; i < n; i++) {
-        if (el[i].ty != ASH_TY_INT || el[i].as.i != want[i]) return 0;
+        if (el[i].ty != GEAS_TY_INT || el[i].as.i != want[i]) return 0;
     }
     return 1;
 }
 
-static AshValue run(AshContract* c, const char* name, AshValue* args,
+static GeasValue run(GeasContract* c, const char* name, GeasValue* args,
                     size_t nargs, const char* what) {
-    AshValue out;
+    GeasValue out;
     memset(&out, 0, sizeof(out));
-    CHECK(ash_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out) ==
-              ASH_OK,
+    CHECK(geas_pledge_fulfill_sync(c, name, args, nargs, NULL, 0, &out) ==
+              GEAS_OK,
           what);
     return out;
 }
 
-/* AshMathError: DomainError 0, Overflowed 1. CommonError: NotFound 0,
+/* GeasMathError: DomainError 0, Overflowed 1. CommonError: NotFound 0,
  * Invalid 1, Exhausted 2. The declaration order is the tag order. */
 enum { MATH_DOMAIN = 0, MATH_OVERFLOWED = 1 };
 enum { COMMON_INVALID = 1 };
 
-static void drive_mathops(AshRuntime* rt) {
-    AshContract* c = NULL;
-    CHECK(ash_contract_sign(rt, "MathOps", NULL, 0, 0, &c) == ASH_OK,
+static void drive_mathops(GeasRuntime* rt) {
+    GeasContract* c = NULL;
+    CHECK(geas_contract_sign(rt, "MathOps", NULL, 0, 0, &c) == GEAS_OK,
           "sign MathOps");
     if (!c) return;
 
-    AshValue out;
-    AshValue a1[1];
-    AshValue a2[2];
-    AshValue a3[3];
+    GeasValue out;
+    GeasValue a1[1];
+    GeasValue a2[2];
+    GeasValue a3[3];
 
     a1[0] = int_val(-5);
     out = run(c, "abs", a1, 1, "abs -5 runs");
@@ -211,19 +211,19 @@ static void drive_mathops(AshRuntime* rt) {
     out = run(c, "approx_eq", a2, 2, "approx_eq far runs");
     CHECK(ok_bool(&out, 0), "approx_eq outside epsilon is Ok(false)");
 
-    CHECK(ash_contract_break(c) == ASH_OK, "break MathOps");
+    CHECK(geas_contract_break(c) == GEAS_OK, "break MathOps");
 }
 
-static void drive_listops(AshRuntime* rt) {
-    AshContract* c = NULL;
-    CHECK(ash_contract_sign(rt, "ListOps", NULL, 0, 0, &c) == ASH_OK,
+static void drive_listops(GeasRuntime* rt) {
+    GeasContract* c = NULL;
+    CHECK(geas_contract_sign(rt, "ListOps", NULL, 0, 0, &c) == GEAS_OK,
           "sign ListOps");
     if (!c) return;
 
-    AshValue out;
-    AshValue e[4] = { int_val(4), int_val(7), int_val(4), int_val(2) };
-    AshValue a1[1];
-    AshValue a2[2];
+    GeasValue out;
+    GeasValue e[4] = { int_val(4), int_val(7), int_val(4), int_val(2) };
+    GeasValue a1[1];
+    GeasValue a2[2];
 
     a1[0] = int_list(e, 4);
     out = run(c, "sum", a1, 1, "sum runs");
@@ -264,41 +264,41 @@ static void drive_listops(AshRuntime* rt) {
     a2[1] = int_val(4);
     out = run(c, "all_eq", a2, 2, "all_eq mixed runs");
     CHECK(ok_bool(&out, 0), "all_eq over mixed is Ok(false)");
-    AshValue same[3] = { int_val(4), int_val(4), int_val(4) };
+    GeasValue same[3] = { int_val(4), int_val(4), int_val(4) };
     a2[0] = int_list(same, 3);
     out = run(c, "all_eq", a2, 2, "all_eq uniform runs");
     CHECK(ok_bool(&out, 1), "all_eq over uniform is Ok(true)");
 
     /* product overflow trips the checked multiply, Err(Invalid). */
-    AshValue big[2] = { int_val(INT64_MAX / 2), int_val(3) };
+    GeasValue big[2] = { int_val(INT64_MAX / 2), int_val(3) };
     a1[0] = int_list(big, 2);
     out = run(c, "product", a1, 1, "product overflow runs");
     CHECK(err_sum(&out, COMMON_INVALID), "product overflow is Err(Invalid)");
 
-    CHECK(ash_contract_break(c) == ASH_OK, "break ListOps");
+    CHECK(geas_contract_break(c) == GEAS_OK, "break ListOps");
 }
 
-static void drive_stduser(AshRuntime* rt) {
-    AshContract* c = NULL;
-    CHECK(ash_contract_sign(rt, "StdUser", NULL, 0, 0, &c) == ASH_OK,
+static void drive_stduser(GeasRuntime* rt) {
+    GeasContract* c = NULL;
+    CHECK(geas_contract_sign(rt, "StdUser", NULL, 0, 0, &c) == GEAS_OK,
           "sign StdUser");
     if (!c) return;
 
-    AshValue out;
-    AshValue a3[3] = { int_val(3), int_val(1), int_val(2) };
+    GeasValue out;
+    GeasValue a3[3] = { int_val(3), int_val(1), int_val(2) };
     out = run(c, "sort3", a3, 3, "sort3 runs");
     {
         const int64_t want[3] = { 1, 2, 3 };
         CHECK(ok_int_list(&out, want, 3), "sort3(3,1,2) is Ok([1,2,3])");
     }
-    AshValue r3[3] = { int_val(9), int_val(9), int_val(-4) };
+    GeasValue r3[3] = { int_val(9), int_val(9), int_val(-4) };
     out = run(c, "sort3", r3, 3, "sort3 with a tie runs");
     {
         const int64_t want[3] = { -4, 9, 9 };
         CHECK(ok_int_list(&out, want, 3), "sort3(9,9,-4) is Ok([-4,9,9])");
     }
 
-    AshValue a1[1];
+    GeasValue a1[1];
     a1[0] = int_val(12);
     out = run(c, "check_positive", a1, 1, "check_positive 12 runs");
     CHECK(ok_int(&out, 12), "check_positive(12) is Ok(12)");
@@ -320,7 +320,7 @@ static void drive_stduser(AshRuntime* rt) {
     CHECK(ok_int(&out, 8), "compute(-4) is Ok(8)");
 
     /* abs faults on the one unrepresentable magnitude; compute translates
-     * the AshMathError sum into its own Int error by hand. */
+     * the GeasMathError sum into its own Int error by hand. */
     a1[0] = int_val(INT64_MIN);
     out = run(c, "compute", a1, 1, "compute INT64_MIN runs");
     CHECK(err_int(&out, -1), "compute(INT64_MIN) is Err(-1)");
@@ -332,23 +332,23 @@ static void drive_stduser(AshRuntime* rt) {
     out = run(c, "compute", a1, 1, "compute 2000 runs");
     CHECK(err_int(&out, 2000), "compute(2000) propagates Err(2000) via '?'");
 
-    CHECK(ash_contract_break(c) == ASH_OK, "break StdUser");
+    CHECK(geas_contract_break(c) == GEAS_OK, "break StdUser");
 }
 
 int main(void) {
-    AshRuntime* rt = NULL;
-    if (ash_runtime_init(NULL, &rt) != ASH_OK) {
+    GeasRuntime* rt = NULL;
+    if (geas_runtime_init(NULL, &rt) != GEAS_OK) {
         fprintf(stderr, "[test_std] FAIL: runtime init\n");
         return 1;
     }
-    CHECK(ash_module_load(rt, "target/ashc-out/libstd_user.ash.so") == ASH_OK,
+    CHECK(geas_module_load(rt, "target/geas-out/libstd_user.geas.so") == GEAS_OK,
           "module load");
 
     drive_mathops(rt);
     drive_listops(rt);
     drive_stduser(rt);
 
-    ash_runtime_shutdown(rt);
+    geas_runtime_shutdown(rt);
     if (g_fail) return 1;
     fprintf(stderr, "[test_std] ok\n");
     return 0;

@@ -1,4 +1,4 @@
-// tcexpr: expression inference for the ashford type checker. Inference walks
+// tcexpr: expression inference for the geas type checker. Inference walks
 // the tree once with an expected type riding down, -1 when the position
 // expects nothing in particular. The expected type is what lets an integer
 // literal become UInt or Byte where the value fits, lets Some, Ok, Err, and

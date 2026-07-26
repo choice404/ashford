@@ -1,4 +1,4 @@
-module ashbridge
+module geasbridge
 
 go 1.25.0
 

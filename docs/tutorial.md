@@ -1,6 +1,6 @@
-# An Ashford Tutorial
+# An Geas Tutorial
 
-Ashford is a language for the space between languages. You write a contract
+Geas is a language for the space between languages. You write a contract
 once, and any language that can call a C library can sign it, fulfill its
 pledges, and read the results, with the runtime holding every allocation that
 crosses the line. This tutorial walks the whole language surface and then the
@@ -8,7 +8,7 @@ part that is the point of it: driving one contract from C and from Python with
 no generated bindings on either side.
 
 The bridge, contracts served over gRPC to other processes, is a real part of
-Ashford and is out of scope here on purpose. Everything below is the in
+Geas and is out of scope here on purpose. Everything below is the in
 process story: the language, and two languages meeting through it in one
 address space. The bridge is [docs/bridge.md](bridge.md) when you want it.
 
@@ -25,7 +25,7 @@ skeleton:
 make smoke
 ```
 
-That compiles the runtime into `libashrt.so`, builds `ashc` through dusk,
+That compiles the runtime into `libgeasrt.so`, builds `geas` through dusk,
 compiles a contract module, and runs a C host that signs it and fulfills a
 pledge end to end. If the installed dusk lags, point `DUSK` at a newer build:
 
@@ -33,13 +33,13 @@ pledge end to end. If the installed dusk lags, point `DUSK` at a newer build:
 make smoke DUSK=~/projects/cool-lang/target/release/dusk
 ```
 
-The compiler is `ashc`, source files end in `.ash`, and a compiled module ends
-in `.ash.so`. Everything lands under `target/`.
+The compiler is `geas`, source files end in `.geas`, and a compiled module ends
+in `.geas.so`. Everything lands under `target/`.
 
 ## 1. Your first contract
 
-A contract is the unit of Ashford the way a function is the unit of most
-languages. Here is the whole of `skeleton/hello.ash`:
+A contract is the unit of Geas the way a function is the unit of most
+languages. Here is the whole of `skeleton/hello.geas`:
 
 ```text
 GreetError is either Empty
@@ -64,12 +64,12 @@ assign to it.
 
 A **pledge** is a callable commitment with a declared return type. `greet` has a
 body and returns a `Result`. Every fallible pledge returns a `Result` or an
-`Option`, never a bare value and never an exception, because errors in Ashford
+`Option`, never a bare value and never an exception, because errors in Geas
 are values that cross the boundary like any other.
 
 `shout` is an **abstract pledge**: a commitment with no body. The contract
 cannot be signed until a host binds an implementation for it, which is how a
-foreign language plugs its own behavior into an Ashford contract. We come back
+foreign language plugs its own behavior into a Geas contract. We come back
 to it in the interop section.
 
 `String + String` concatenates, and `Ok(...)` wraps a success. `GreetError is
@@ -95,13 +95,13 @@ down and reclaims every allocation the runtime made for it. A contract that got
 partway reports exactly which pledges landed, which are pending, and which
 broke, with the errors attached.
 
-You never call these transitions from inside `.ash` code for your own contract;
+You never call these transitions from inside `.geas` code for your own contract;
 a host drives them across the boundary. That is the next half of the tutorial.
 First, the rest of the language.
 
 ## 3. Data: records and sums
 
-Ashford has two ways to shape your own data.
+Geas has two ways to shape your own data.
 
 A **record** is a product, a fixed set of named fields:
 
@@ -122,7 +122,7 @@ both arms.
 ## 4. Inside a pledge body
 
 A pledge body is ordinary imperative code. Here is `Main.run` from
-`skeleton/main_demo.ash`, which counts its arguments:
+`skeleton/main_demo.geas`, which counts its arguments:
 
 ```text
 pledge run(args: List<String>) -> Result<Int, DemoError> {
@@ -148,7 +148,7 @@ The pieces:
   `break` and `continue` do what you expect.
 - `return` leaves the pledge with a value of its declared type.
 
-The two operators that make Ashford feel like Ashford are `match` and `?`.
+The two operators that make Geas feel like Geas are `match` and `?`.
 
 **`match`** is an exhaustive expression. It must cover every variant, and the
 checker rejects it if it does not:
@@ -185,7 +185,7 @@ out of range index returns a type error rather than faulting.
 
 A **clause** is an internal method. It never leaves its contract, has no place
 in the lifecycle, and exists so pledges can share logic. From
-`skeleton/std_user.ash`:
+`skeleton/std_user.geas`:
 
 ```text
 clause compare(a: Int, b: Int) -> Int {
@@ -195,7 +195,7 @@ clause compare(a: Int, b: Int) -> Int {
 }
 ```
 
-A **provisional clause** is Ashford's trait: a named set of clause signatures a
+A **provisional clause** is Geas's trait: a named set of clause signatures a
 contract can promise to satisfy. A contract `incorporate`s one and implements
 its clauses:
 
@@ -234,7 +234,7 @@ another. The one place a write lands in place is an assignment target like
 
 A **subcontract** groups pledges, and the **requirements** block writes the
 contract's success and failure as boolean logic over those groups. This is the
-heart of the language, and `skeleton/payment.ash` shows it whole:
+heart of the language, and `skeleton/payment.geas` shows it whole:
 
 ```text
 contract PaymentService {
@@ -286,7 +286,7 @@ read the latched errors by name. We watch that happen from Python below.
 ## 7. Calling a contract from a contract
 
 A pledge body can sign another contract, fulfill it, and break it, which is how
-Ashford composes. From `StdUser.compute`:
+Geas composes. From `StdUser.compute`:
 
 ```text
 pledge compute(x: Int) -> Result<Int, Int> {
@@ -315,7 +315,7 @@ also the one value that can never cross the C boundary, only its results can.
 
 ## 8. A standalone program
 
-Everything so far is a library other languages drive. Ashford is also a language
+Everything so far is a library other languages drive. Geas is also a language
 you can compile straight to an executable. Declare one `Main` contract with a
 `run` pledge over `List<String>` returning `Result<Int, E>`:
 
@@ -339,38 +339,38 @@ an `Err` renders itself to stderr and exits 1:
 
 ```sh
 make test-bin
-./target/ashc-out/main_demo a b c ; echo $?   # counts its args, exits 3
-./target/ashc-out/main_demo fail              # takes the Err path, exits 1
+./target/geas-out/main_demo a b c ; echo $?   # counts its args, exits 3
+./target/geas-out/main_demo fail              # takes the Err path, exits 1
 ```
 
 ## 9. The standard library
 
-A first standard library lives under `lib/ashstd`: `math` with overflow checked
+A first standard library lives under `lib/std`: `math` with overflow checked
 pledges, `strings` and `collections` shaped to what the language can express,
 common `errors`, and the `traits` that hold the provisional clauses like
 `Comparable` and `Loggable`. You pull a module in with `import`:
 
 ```text
-import ashstd.math
-import ashstd.collections
-import ashstd.traits
-import ashstd.errors
+import std.math
+import std.collections
+import std.traits
+import std.errors
 ```
 
-Imports resolve beside your root file and then under `ASH_HOME`, every file
+Imports resolve beside your root file and then under `GEAS_HOME`, every file
 parses into one shared tree, and cycles and duplicate imports are named errors.
 A module lends another its record and sum shapes, its error sums for the `E`
 slot, its provisional clauses, and its contracts themselves. `make test-std`
-builds a module that imports four ashstd modules and drives them from C.
+builds a module that imports four std modules and drives them from C.
 
 That is the language. Now the reason it exists.
 
 ## 10. The boundary
 
-Here is what makes Ashford an interop language and not just another small
+Here is what makes Geas an interop language and not just another small
 language.
 
-A compiled `.ash.so` module carries **descriptors**, tables that spell every
+A compiled `.geas.so` module carries **descriptors**, tables that spell every
 contract, every pledge and its signature, and every vow and its default. When
 the runtime loads the module, it registers all of that in the **iname table**, a
 sorted registry keyed by a **mangled name** that bakes in the contract, the
@@ -379,15 +379,15 @@ contract up by that name, and because the name carries the shape hash, a version
 mismatch is a clean error at discovery time instead of silent corruption at call
 time.
 
-Every value that crosses the boundary is an `AshValue`, a small tagged union
+Every value that crosses the boundary is an `GeasValue`, a small tagged union
 whose layout is fixed and documented in [docs/abi.md](abi.md). Integers, floats,
 strings, lists, tuples, records, sums, options, and results all have a pinned
 representation. The one iron rule is ownership: the runtime owns every heap
 allocation that crosses the line. Arguments are copied onto the instance on the
 way in, results are owned by the instance and die when it breaks, and a value
 passed by reference is copied in on entry and written back on return, never held
-by Ashford past the call. A host never has to free what Ashford gave it, and
-Ashford never holds a pointer into host memory after a call returns.
+by Geas past the call. A host never has to free what Geas gave it, and
+Geas never holds a pointer into host memory after a call returns.
 
 A host drives a contract through a handful of runtime calls: initialize the
 runtime, load a module, sign a contract, fulfill its pledges, read the partial
@@ -396,44 +396,44 @@ just C. Let us make two languages speak them.
 
 ## 11. Interop with C
 
-`skeleton/host.c` is a foreign program. It knows nothing about `ashc`; it links
-`libashrt` and speaks the ABI header `ash/ash.h`. The shape of a host is always
+`skeleton/host.c` is a foreign program. It knows nothing about `geas`; it links
+`libgeasrt` and speaks the ABI header `geas/geas.h`. The shape of a host is always
 the same five moves.
 
 **Initialize and load.**
 
 ```c
-AshRuntime* rt = NULL;
-ash_runtime_init(NULL, &rt);
-ash_module_load(rt, "target/ashc-out/libhello.ash.so");
+GeasRuntime* rt = NULL;
+geas_runtime_init(NULL, &rt);
+geas_module_load(rt, "target/geas-out/libhello.geas.so");
 ```
 
-**Sign.** A host builds an argument as an `AshValue` and hands the runtime a
+**Sign.** A host builds an argument as an `GeasValue` and hands the runtime a
 value it owns; the runtime never keeps it:
 
 ```c
-AshContract* c = NULL;
-ash_contract_sign(rt, "Greeter", NULL, 0, 0, &c);
+GeasContract* c = NULL;
+geas_contract_sign(rt, "Greeter", NULL, 0, 0, &c);
 ```
 
 Pass a vow override to change a locked field at sign, exactly what
 `MathOps.sign(epsilon: 0.5)` did from inside the language:
 
 ```c
-AshVowBinding prefix;
+GeasVowBinding prefix;
 prefix.name = "prefix";
 prefix.value = str_arg("hey, ");
-ash_contract_sign(rt, "Greeter", &prefix, 1, 0, &c3);
+geas_contract_sign(rt, "Greeter", &prefix, 1, 0, &c3);
 ```
 
-**Fulfill.** A pledge runs through a future: `ash_pledge_fulfill` returns a
-handle and `ash_future_wait` collects the outcome exactly once. The synchronous
+**Fulfill.** A pledge runs through a future: `geas_pledge_fulfill` returns a
+handle and `geas_future_wait` collects the outcome exactly once. The synchronous
 form fuses the two:
 
 ```c
-AshValue out;
-AshValue name = str_arg("world");
-ash_pledge_fulfill_sync(c, "greet", &name, 1, NULL, 0, &out);
+GeasValue out;
+GeasValue name = str_arg("world");
+geas_pledge_fulfill_sync(c, "greet", &name, 1, NULL, 0, &out);
 // out is Ok("hello, world")
 ```
 
@@ -447,14 +447,14 @@ written in the same uniform thunk frame every compiled pledge uses, and only
 then can the contract sign:
 
 ```c
-static AshStatus host_shout(void* ctx, const AshValue* args, size_t nargs,
-                            AshValue* out) {
-    AshContract* c = (AshContract*)ctx;
+static GeasStatus host_shout(void* ctx, const GeasValue* args, size_t nargs,
+                            GeasValue* out) {
+    GeasContract* c = (GeasContract*)ctx;
     // uppercase args[0], write the result into *out as Ok(...)
-    return ASH_OK;
+    return GEAS_OK;
 }
 
-ash_pledge_bind(rt, "Greeter.shout", host_shout);
+geas_pledge_bind(rt, "Greeter.shout", host_shout);
 ```
 
 **By reference and write back.** A pledge can take an argument by reference and
@@ -464,14 +464,14 @@ and the write back lands in host memory only at delivery, while the host is
 still blocked in the call:
 
 ```c
-AshString by_ref;
+GeasString by_ref;
 by_ref.ptr = (uint8_t*)"whisper";
 by_ref.len = 7;
-AshRef ref;
+GeasRef ref;
 memset(&ref, 0, sizeof(ref));
 ref.host_ptr = &by_ref;
-ref.ty = ASH_TY_STRING;
-ash_pledge_fulfill_sync(c, "shout", NULL, 0, &ref, 1, &out);
+ref.ty = GEAS_TY_STRING;
+geas_pledge_fulfill_sync(c, "shout", NULL, 0, &ref, 1, &out);
 // by_ref now holds "WHISPER", written back into host storage
 ```
 
@@ -479,7 +479,7 @@ ash_pledge_fulfill_sync(c, "shout", NULL, 0, &ref, 1, &out);
 fulfillment on it is a clean state error:
 
 ```c
-ash_contract_break(c);
+geas_contract_break(c);
 ```
 
 Run the whole C walk, sign, bind, fulfill, by reference write back, futures,
@@ -490,10 +490,10 @@ make smoke-asan
 ```
 
 **Resolving names without hardcoding them.** A host can spell mangled names by
-hand, but `ashc` will generate the header for you:
+hand, but `geas` will generate the header for you:
 
 ```sh
-target/dusk-out/ashc emit-header skeleton/hello.ash
+target/dusk-out/geas emit-header skeleton/hello.geas
 ```
 
 That writes the shape hash and every mangled pledge name as C defines, read from
@@ -502,19 +502,19 @@ generated names instead of string literals.
 
 ## 12. Interop with Python
 
-The claim Ashford makes is that any language which can load a C library can
+The claim Geas makes is that any language which can load a C library can
 speak a contract, with no code generated for the binding. The repository proves
-it with Python and nothing but `ctypes`. `interop/python/ashford.py` is written
+it with Python and nothing but `ctypes`. `interop/python/geas.py` is written
 against [docs/abi.md](abi.md) alone, no header parsed and no stubs generated, and
 `interop/python/demo_payment.py` drives the payment contract with it.
 
 The same five moves, now in Python:
 
 ```python
-from ashford import Runtime, Ok, Err
+from geas import Runtime, Ok, Err
 
-with Runtime(OUT / "libashrt.so") as rt:
-    rt.load(OUT / "libpayment.ash.so")
+with Runtime(OUT / "libgeasrt.so") as rt:
+    rt.load(OUT / "libpayment.geas.so")
     rt.bind("PaymentService.charge", charge)   # a Python function is the pledge
     rt.freeze()
 

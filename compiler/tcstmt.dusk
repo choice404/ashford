@@ -87,7 +87,7 @@ func check_let(tc: *Tc, s: StmtNode) -> void {
 // The type an lvalue chain resolves to, walked in assignment position. The
 // one place this differs from the value read is a map index: reading m[k]
 // yields Option<V>, but writing through m[k] targets the value V itself, a
-// mid-chain miss becoming the runtime fault ASH_ERR_TYPE since an lvalue
+// mid-chain miss becoming the runtime fault GEAS_ERR_TYPE since an lvalue
 // has no Option to hang a None on. Record fields and list elements type
 // exactly as their reads do.
 func lvalue_type(tc: *Tc, eid: int64) -> int64 {

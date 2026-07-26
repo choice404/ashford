@@ -2,7 +2,7 @@
 
 Appendix III names instance state over stateless gRPC the load bearing unknown
 and asks for one contract in one language before anything else moves. This is
-that prototype. `skeleton/payment.ash` is served over gRPC by `bridge_server.py`
+that prototype. `skeleton/payment.geas` is served over gRPC by `bridge_server.py`
 and driven by `bridge_client.py`, which holds no runtime handle and knows its
 instance only by a uint64 the server issued. The client asserts the same answers
 `interop/python/demo_payment.py` gets in process.
@@ -45,8 +45,8 @@ instance idle past the TTL is presumed abandoned, broken, and dropped.
 
 Four things follow, in the order they hurt:
 
-1. **A timer breaks contracts.** This is the sharp one. In Ashford, break is a
-   meaningful act. `payment.ash` writes a break policy in its own source. The
+1. **A timer breaks contracts.** This is the sharp one. In Geas, break is a
+   meaningful act. `payment.geas` writes a break policy in its own source. The
    reaper's break is none of that. It is resource management wearing the
    lifecycle's clothes, and from inside the contract it is indistinguishable
    from a party deciding to break. The bridge invents a way for an obligation to
@@ -66,7 +66,7 @@ Four things follow, in the order they hurt:
    guess about a client side intent nobody transmitted.
 
 4. **The break is not the end of the row.** `Break` here leaves the table entry
-   standing, because in process a broken handle still answers `ASH_ERR_STATE` to
+   standing, because in process a broken handle still answers `GEAS_ERR_STATE` to
    a fulfillment and still reads its partial surface, so the owner learns it
    broke. Dropping the row would make a broken instance answer `NOT_FOUND`,
    indistinguishable from an id that never existed, and the bridge would lose a
@@ -113,7 +113,7 @@ job over the store rather than a thread racing a table.
 
 ## The typed .proto mapping
 
-`payment_bridge.proto` is hand written to the shape ashc should emit. Every
+`payment_bridge.proto` is hand written to the shape geas should emit. Every
 pledge is its own rpc. This is the choice that makes step 2 work: a Go or Java
 consumer gets the argument and result types from protoc alone, with no generic
 Value envelope and no dispatch on a pledge name string.
@@ -125,17 +125,17 @@ Value envelope and no dispatch on a pledge name string.
   bare `bool` plus `int64` would have walked into. Appendix III's type mapping
   read is confirmed on this contract.
 - **Vow to optional.** Exact. proto3 `optional` gives presence, and "unset takes
-  the declared default" is what `ash_contract_sign` already does with an omitted
+  the declared default" is what `geas_contract_sign` already does with an omitted
   override. The wire form and the ABI form agree without a rule.
 - **The partial surface to repeated.** Appendix III's map ordering problem does
   not arise here, because nothing about the partial surface wants to be a `map`.
-  `repeated string` preserves the insertion order Ashford pins as normative, for
+  `repeated string` preserves the insertion order Geas pins as normative, for
   free. The problem is real but it is not this contract's problem.
-- **The lifecycle to an enum.** `ASH_UNSIGNED` through `ASH_BROKEN` in the
+- **The lifecycle to an enum.** `GEAS_UNSIGNED` through `GEAS_BROKEN` in the
   runtime's own numbering, and `UNSIGNED = 0` is already the zero value protobuf
   wants. Nothing to decide.
-- **Business versus transport.** The split Ashford already drew holds perfectly.
-  A pledge's `Err` is a value on an OK rpc; an Ashford status is a gRPC code.
+- **Business versus transport.** The split Geas already drew holds perfectly.
+  A pledge's `Err` is a value on an OK rpc; a Geas status is a gRPC code.
   `Charge(-2.0)` answering `err=41` with `StatusCode.OK` is the single most
   reassuring line in the client, because it means the bridge did not smuggle
   business outcomes into the transport's error channel, which is the mistake
@@ -143,22 +143,22 @@ Value envelope and no dispatch on a pledge name string.
 
 **Friction:**
 
-- **NOT_FOUND is overloaded.** `ASH_ERR_NAME` maps to `NOT_FOUND`, and so does
+- **NOT_FOUND is overloaded.** `GEAS_ERR_NAME` maps to `NOT_FOUND`, and so does
   an unknown instance id. An unknown pledge and an unknown session arrive at the
   client as the same code and are separable only by reading the message string.
-  Typed rpcs make `ASH_ERR_NAME` nearly unreachable, since protoc will not let a
+  Typed rpcs make `GEAS_ERR_NAME` nearly unreachable, since protoc will not let a
   client name a pledge that does not exist, which mitigates it here and will not
   in a contract with dynamic surface.
-- **ASH_ERR_VERSION to ABORTED is a stretch.** Nothing in gRPC means "your shape
+- **GEAS_ERR_VERSION to ABORTED is a stretch.** Nothing in gRPC means "your shape
   hash disagrees with mine". `ABORTED` is the closest and it is not close.
   Underneath it is Appendix III's schema evolution question showing up as a
-  concrete field: `expected_hash` in `SignRequest` imports Ashford's refusal into
+  concrete field: `expected_hash` in `SignRequest` imports Geas's refusal into
   a protocol whose whole tolerance story is why it won. The field works. Whether
-  Ashford wants it on a wire that believes the opposite is unanswered, and this
+  Geas wants it on a wire that believes the opposite is unanswered, and this
   prototype does not settle it.
 - **One result message per shape.** All four payment pledges return
   `Result<Bool, Int>`, so `BoolIntResult` serves all four. A real contract needs
-  one message per distinct result type. Mechanical for ashc to emit and dedupe by
+  one message per distinct result type. Mechanical for geas to emit and dedupe by
   shape, but it means the emitted `.proto` has messages the contract's author
   never wrote and will read in error messages.
 - **The Future flattens.** In process, `fulfill` returns a Future and `wait`
@@ -169,13 +169,13 @@ Value envelope and no dispatch on a pledge name string.
 - **By reference has no analog.** Already refused across the wire, so the Greeter
   shout path is not in this proto and nothing here changes that reading.
 
-**Is the shape clear enough for ashc to emit in step 2?** Yes. Every message in
+**Is the shape clear enough for geas to emit in step 2?** Yes. Every message in
 this file is a mechanical function of the contract's declarations: vows to
 optional fields on `SignRequest`, each pledge to an rpc with a request message of
 its parameters plus the instance id, each result type to a oneof message, the
 partial surface and the lifecycle fixed for every contract. Writing it by hand
 turned up no decision that needed taste, only the four frictions above, and none
-of them is about generation. `Debug` is the one message ashc must never emit: it
+of them is about generation. `Debug` is the one message geas must never emit: it
 exposes the instance table and it exists here only so the client can watch the
 reaper work.
 
@@ -188,7 +188,7 @@ mapping is mechanical, the business versus transport split holds without
 argument, and the walk matched the in process demo check for check. Five
 consecutive green runs, no flake. A single server serving one contract to typed
 generated clients is a solved problem and step 2, emitting this `.proto` from
-ashc and driving it from Go, is small and should be done next. The language
+geas and driving it from Go, is small and should be done next. The language
 coverage objection dies cheaply.
 
 **The session is a quarter.** Every cost in this document is a lifetime cost or a
@@ -309,7 +309,7 @@ It is still the right trade, on three counts and against one.
 - **It is the transport's problem, tuned in the transport's language.**
   Keepalives, deadlines, and retry policy are gRPC's, they are configured per
   deployment, and they are not the application inventing a lifecycle rule. The
-  TTL was Ashford making a networking decision in a contract runtime, which is
+  TTL was Geas making a networking decision in a contract runtime, which is
   the wrong place for it.
 - **Against:** none of that gives back the thirty second partition. A stream is
   strictly less tolerant than a long timer.
@@ -333,7 +333,7 @@ silently and discovers it at exactly the wrong time.
 
 **The break at stream end is still a break the contract did not write.** It has
 a defensible reading now, the holder is gone, which the timer never had. It is
-still not something `payment.ash` can see coming or write a policy about. The
+still not something `payment.geas` can see coming or write a policy about. The
 honest statement is that the bridge no longer invents an ending, it reports one,
 and reporting is a different act from inventing. That closes cost 1 as written.
 It does not mean a contract language has nothing left to say about what a
@@ -343,7 +343,7 @@ That question is now askable, which it was not while a timer was answering it.
 ## An explicit break zeroes the payload, and the bridge inherits that
 
 Writing the tombstone check turned this up and it is worth recording. An
-explicit `ash_contract_break` zeroes the stored Err payloads, deliberately,
+explicit `geas_contract_break` zeroes the stored Err payloads, deliberately,
 because they point into the heap the break frees, and it keeps the latches so
 the partial surface still names which pledges landed and which broke. So step
 1's line about the partial surface still reading the payload belongs to the
@@ -377,9 +377,9 @@ first bug.
 So step 1's claim needs one word changed. It said protoc alone kills the
 language coverage objection. It is protoc plus a small emitted wrapper, and the
 objection is just as dead, because a wrapper that holds a stream and cancels it
-is twenty lines in every gRPC language and ashc emits it once per contract from
+is twenty lines in every gRPC language and geas emits it once per contract from
 the same declarations it already reads. The consequence for step 2 is concrete:
-**ashc emits a session wrapper, not only a `.proto`**. Worth knowing before the
+**geas emits a session wrapper, not only a `.proto`**. Worth knowing before the
 Go client is written rather than after.
 
 The trade is also worth stating plainly, because it reads as a loss and is not.
@@ -411,20 +411,20 @@ need a quarter of its own.
 Appendix III's sequence holds, and step 1's correction to it survives intact
 with its answer filled in. The load bearing unknown was who ends an instance.
 The answer is the party that holds it, and gRPC will tell you the moment they
-stop. Emit the `.proto` and the session wrapper from ashc and drive it from Go
+stop. Emit the `.proto` and the session wrapper from geas and drive it from Go
 next, let the store answer everything left in this file, and retire the custom
 wire after that.
 
 # The gRPC bridge, step 2: the surface out of the compiler
 
 Steps 1 and 1b proved the shape by hand: a hand written `.proto` for one
-contract, a hand written session object in one language. Step 2 makes ashc
+contract, a hand written session object in one language. Step 2 makes geas
 write both, and proves the emitted surface with the consumer the whole
-exercise was aimed at, a Go client that has never heard of Ashford.
+exercise was aimed at, a Go client that has never heard of Geas.
 
-## What ashc emits
+## What geas emits
 
-`ashc emit-proto skeleton/payment.ash` runs the same front end as `build` and
+`geas emit-proto skeleton/payment.geas` runs the same front end as `build` and
 writes two files. `payment.proto` is the step 1b surface exactly: one typed
 rpc per pledge, the streaming `Session` whose lifetime is the instance's, the
 Result oneof, the partial surface with its repeated name lists, and no Debug
@@ -460,11 +460,11 @@ the old timer resumes on latches set before the silence.
 Two things surfaced that the Python walk could not have said:
 
 - **The wire compatibility claim is now a fact, not a comment.** The hand
-  written proto said "the shape ashc emits in step 2" at the top. The Go
+  written proto said "the shape geas emits in step 2" at the top. The Go
   client is generated from the emitted proto and the server from the hand
   one, and every call routes: same package, same service, same field
   numbers. The comment is now enforced by a passing gate.
-- **A lying hash is ABORTED.** Shape skew at sign is ASH_ERR_VERSION in the
+- **A lying hash is ABORTED.** Shape skew at sign is GEAS_ERR_VERSION in the
   runtime, and the bridge's status table maps it to ABORTED, not
   INVALID_ARGUMENT. Fair: it is not a malformed request, it is two builds
   disagreeing about the world. The wrapper's pinned constant is what makes
@@ -472,7 +472,7 @@ Two things surfaced that the Python walk could not have said:
 
 ## What the language coverage objection is now
 
-Step 1b closed with "emit the .proto and the session wrapper from ashc and
+Step 1b closed with "emit the .proto and the session wrapper from geas and
 drive it from Go". Both are done. The objection Appendix III kept open, that
 the bridge only spoke languages someone hand wrote a binding for, is dead:
 any language protoc speaks gets the typed surface from the emitted proto,
@@ -512,7 +512,7 @@ with the prefix rule, the wrappers, and the reserved spelling.
 ## The second wrapper
 
 The step 2 close said another language's session wrapper is a morning, not a
-milestone. The TypeScript wrapper is that morning, spent. ashc emits it
+milestone. The TypeScript wrapper is that morning, spent. geas emits it
 beside the Go one, and it makes the opposite tooling choice on purpose: the
 Go consumer runs protoc and gets compiled stubs, the Node consumer loads
 the emitted .proto through @grpc/proto-loader at runtime and gets its

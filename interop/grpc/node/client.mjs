@@ -1,5 +1,5 @@
 // bridge_client_node: the payment walk, driven from Node against the bridge
-// server, built from nothing but ashc's emitted artifacts. The .proto rides
+// server, built from nothing but geas's emitted artifacts. The .proto rides
 // in through @grpc/proto-loader, so there is no protoc step and no generated
 // stub; the session rides in through the emitted TypeScript wrapper, which
 // node runs directly under type stripping. This is the editor extension's
@@ -44,7 +44,7 @@ function makeClient() {
     { keepCase: true, longs: String, enums: String, oneofs: true, defaults: false },
   );
   const pkg = grpc.loadPackageDefinition(def);
-  return new pkg.ashford.payment.PaymentService(
+  return new pkg.geas.payment.PaymentService(
     addr,
     grpc.credentials.createInsecure(),
   );

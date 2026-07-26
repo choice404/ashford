@@ -1,4 +1,4 @@
-// lex: the ashford lexer. It walks a source buffer by byte offset, pushing
+// lex: the geas lexer. It walks a source buffer by byte offset, pushing
 // tokens and recording faults, so its position and its two output vectors live
 // in one heap value passed by pointer. The token grammar it implements is the
 // lexical section of docs/grammar.md: hard keywords, the operator set, decimal,

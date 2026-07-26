@@ -1,14 +1,14 @@
 /* test_header.c: the emit-header gate's C half. This host includes the
- * header ashc emitted for skeleton/hello.ash and drives discovery with the
+ * header geas emitted for skeleton/hello.geas and drives discovery with the
  * two names it publishes and nothing else hardcoded: resolve the pledge's
  * mangled symbol through the iname table, check the entry hands back exactly
  * the shape hash the header spells, sign under that hash, and prove a wrong
- * hash is refused with ASH_ERR_VERSION. That is the product claim of the
+ * hash is refused with GEAS_ERR_VERSION. That is the product claim of the
  * generated header: a C host compiles against it and signs safely without
  * ever computing a hash itself. Runs under ASan and LSan. */
 
-#include <ash/ash.h>
-#include "hello.ash.h"
+#include <geas/geas.h>
+#include "hello.geas.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,49 +25,49 @@ static int g_failures = 0;
     } while (0)
 
 /* Greeter.shout is abstract; signing needs a body bound over it. */
-static AshStatus stub_shout(void* ctx, const AshValue* args, size_t nargs,
-                            AshValue* out) {
+static GeasStatus stub_shout(void* ctx, const GeasValue* args, size_t nargs,
+                            GeasValue* out) {
     (void)ctx;
     (void)args;
-    if (nargs != 1) return ASH_ERR_TYPE;
+    if (nargs != 1) return GEAS_ERR_TYPE;
     memset(out, 0, sizeof(*out));
-    out->ty = ASH_TY_UNIT;
-    return ASH_OK;
+    out->ty = GEAS_TY_UNIT;
+    return GEAS_OK;
 }
 
 int main(void) {
-    AshRuntime* rt = NULL;
-    CHECK(ash_runtime_init(NULL, &rt) == ASH_OK, "runtime init");
-    CHECK(ash_module_load(rt, "target/ashc-out/libhello.ash.so") == ASH_OK,
+    GeasRuntime* rt = NULL;
+    CHECK(geas_runtime_init(NULL, &rt) == GEAS_OK, "runtime init");
+    CHECK(geas_module_load(rt, "target/geas-out/libhello.geas.so") == GEAS_OK,
           "load the hello module");
 
-    AshInameEntry e;
+    GeasInameEntry e;
     memset(&e, 0, sizeof(e));
-    CHECK(ash_iname_lookup(rt, ASH_MANGLED_Greeter_greet, &e) == ASH_OK,
+    CHECK(geas_iname_lookup(rt, GEAS_MANGLED_Greeter_greet, &e) == GEAS_OK,
           "resolve the header's mangled greet");
-    CHECK(e.kind == ASH_INAME_PLEDGE, "greet resolves as a pledge");
+    CHECK(e.kind == GEAS_INAME_PLEDGE, "greet resolves as a pledge");
     CHECK(strcmp(e.contract, "Greeter") == 0, "greet belongs to Greeter");
-    CHECK(e.shape_hash == ASH_HASH_Greeter,
-          "the iname hash matches the header's ASH_HASH_Greeter");
+    CHECK(e.shape_hash == GEAS_HASH_Greeter,
+          "the iname hash matches the header's GEAS_HASH_Greeter");
 
-    CHECK(ash_iname_lookup(rt, ASH_MANGLED_Greeter_shout, &e) == ASH_OK,
+    CHECK(geas_iname_lookup(rt, GEAS_MANGLED_Greeter_shout, &e) == GEAS_OK,
           "resolve the header's mangled shout");
-    CHECK(e.shape_hash == ASH_HASH_Greeter, "shout carries the same hash");
+    CHECK(e.shape_hash == GEAS_HASH_Greeter, "shout carries the same hash");
 
-    CHECK(ash_pledge_bind(rt, "Greeter.shout", stub_shout) == ASH_OK,
+    CHECK(geas_pledge_bind(rt, "Greeter.shout", stub_shout) == GEAS_OK,
           "bind a body over the abstract shout");
-    ash_runtime_freeze(rt);
+    geas_runtime_freeze(rt);
 
-    AshContract* c = NULL;
-    CHECK(ash_contract_sign(rt, e.contract, NULL, 0, ASH_HASH_Greeter, &c) ==
-              ASH_OK,
+    GeasContract* c = NULL;
+    CHECK(geas_contract_sign(rt, e.contract, NULL, 0, GEAS_HASH_Greeter, &c) ==
+              GEAS_OK,
           "sign Greeter under the header's hash");
-    CHECK(ash_contract_sign(rt, e.contract, NULL, 0, ASH_HASH_Greeter ^ 1,
-                            &c) == ASH_ERR_VERSION,
+    CHECK(geas_contract_sign(rt, e.contract, NULL, 0, GEAS_HASH_Greeter ^ 1,
+                            &c) == GEAS_ERR_VERSION,
           "a wrong expected hash is refused");
 
-    CHECK(ash_contract_break(c) == ASH_OK, "break the signed instance");
-    ash_runtime_shutdown(rt);
+    CHECK(geas_contract_break(c) == GEAS_OK, "break the signed instance");
+    geas_runtime_shutdown(rt);
 
     if (g_failures) {
         fprintf(stderr, "[test_header] %d check(s) failed\n", g_failures);

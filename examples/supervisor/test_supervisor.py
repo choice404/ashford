@@ -121,7 +121,7 @@ def cleanup(gates, piddir):
 
 def main():
     gates = []
-    with tempfile.TemporaryDirectory(prefix="ashford-supervisor-") as temp:
+    with tempfile.TemporaryDirectory(prefix="geas-supervisor-") as temp:
         root = Path(temp)
         dsn = root / "supervisor.sqlite"
         piddir = root / "pids"

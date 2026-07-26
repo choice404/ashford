@@ -24,7 +24,7 @@
  * inherited across the fork, because the parent's pool threads do not cross a
  * fork and only a fresh runtime has workers to fulfill against. */
 
-#include <ash/ash.h>
+#include <geas/geas.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -43,62 +43,62 @@ static int g_fail = 0;
         }                                                           \
     } while (0)
 
-static AshValue int_val(int64_t i) {
-    AshValue v;
+static GeasValue int_val(int64_t i) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_INT;
+    v.ty = GEAS_TY_INT;
     v.as.i = i;
     return v;
 }
 
-static AshValue float_val(double f) {
-    AshValue v;
+static GeasValue float_val(double f) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_FLOAT;
+    v.ty = GEAS_TY_FLOAT;
     v.as.f = f;
     return v;
 }
 
-static AshValue str_val(const char* s) {
-    AshValue v;
+static GeasValue str_val(const char* s) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_STRING;
+    v.ty = GEAS_TY_STRING;
     v.as.s.ptr = (uint8_t*)s;
     v.as.s.len = strlen(s);
     return v;
 }
 
-static const char* g_module = "target/ashc-out/libledger.ash.so";
+static const char* g_module = "target/geas-out/libledger.geas.so";
 
 /* Signs a fresh Ledger against the dsn on the given runtime. */
-static AshContract* sign_on(AshRuntime* rt, const char* dsn) {
-    AshVowBinding ovr = { "dsn", str_val(dsn) };
-    AshContract* c = NULL;
-    ash_contract_sign(rt, "Ledger", &ovr, 1, 0, &c);
+static GeasContract* sign_on(GeasRuntime* rt, const char* dsn) {
+    GeasVowBinding ovr = { "dsn", str_val(dsn) };
+    GeasContract* c = NULL;
+    geas_contract_sign(rt, "Ledger", &ovr, 1, 0, &c);
     return c;
 }
 
 /* Reads one account's balance on the parent's runtime, a fresh instance so the
  * committed file is the witness. Reconciles the schema on the way in, so a read
  * that succeeds is also proof the shape still validates after a crash. */
-static double read_balance(AshRuntime* rt, const char* dsn, int64_t id,
+static double read_balance(GeasRuntime* rt, const char* dsn, int64_t id,
                            int* ok) {
     *ok = 0;
-    AshContract* c = sign_on(rt, dsn);
-    if (!c || ash_contract_state(c) != ASH_SIGNED) return -1.0;
-    AshValue key[1] = { int_val(id) };
-    AshValue out;
+    GeasContract* c = sign_on(rt, dsn);
+    if (!c || geas_contract_state(c) != GEAS_SIGNED) return -1.0;
+    GeasValue key[1] = { int_val(id) };
+    GeasValue out;
     memset(&out, 0, sizeof(out));
-    AshStatus st = ash_pledge_fulfill_sync(c, "balance", key, 1, NULL, 0, &out);
+    GeasStatus st = geas_pledge_fulfill_sync(c, "balance", key, 1, NULL, 0, &out);
     double bal = -1.0;
-    if (st == ASH_OK && out.ty == ASH_TY_RESULT && out.tag == 0 && out.as.box) {
-        const AshValue* p = (const AshValue*)out.as.box;
-        if (p->ty == ASH_TY_FLOAT) {
+    if (st == GEAS_OK && out.ty == GEAS_TY_RESULT && out.tag == 0 && out.as.box) {
+        const GeasValue* p = (const GeasValue*)out.as.box;
+        if (p->ty == GEAS_TY_FLOAT) {
             bal = p->as.f;
             *ok = 1;
         }
     }
-    ash_contract_break(c);
+    geas_contract_break(c);
     return bal;
 }
 
@@ -121,19 +121,19 @@ static int crash_mid_txn(const char* dsn, int64_t id, double amount) {
         /* the child: a fresh runtime, a fresh sign, a debit that opens the
          * transaction, then a signal and a block until the kill. */
         close(pfd[0]);
-        AshRuntime* crt = NULL;
-        if (ash_runtime_init(NULL, &crt) != ASH_OK || !crt) _exit(2);
-        if (ash_module_load(crt, g_module) != ASH_OK) _exit(2);
-        AshContract* c = sign_on(crt, dsn);
-        if (!c || ash_contract_state(c) != ASH_SIGNED) _exit(2);
-        AshValue d[2] = { int_val(id), float_val(amount) };
-        AshValue out;
+        GeasRuntime* crt = NULL;
+        if (geas_runtime_init(NULL, &crt) != GEAS_OK || !crt) _exit(2);
+        if (geas_module_load(crt, g_module) != GEAS_OK) _exit(2);
+        GeasContract* c = sign_on(crt, dsn);
+        if (!c || geas_contract_state(c) != GEAS_SIGNED) _exit(2);
+        GeasValue d[2] = { int_val(id), float_val(amount) };
+        GeasValue out;
         memset(&out, 0, sizeof(out));
-        AshStatus st = ash_pledge_fulfill_sync(c, "debit", d, 2, NULL, 0, &out);
+        GeasStatus st = geas_pledge_fulfill_sync(c, "debit", d, 2, NULL, 0, &out);
         /* a debit that would not open the transaction is a bug in the setup,
          * not the crash under test; leave without signaling so the parent's
          * read on the pipe fails and the pass is caught. */
-        if (st != ASH_OK) _exit(2);
+        if (st != GEAS_OK) _exit(2);
         char one = 1;
         ssize_t w = write(pfd[1], &one, 1);
         (void)w;
@@ -158,12 +158,12 @@ static int crash_mid_txn(const char* dsn, int64_t id, double amount) {
 }
 
 int main(void) {
-    AshRuntime* rt = NULL;
-    if (ash_runtime_init(NULL, &rt) != ASH_OK || !rt) {
+    GeasRuntime* rt = NULL;
+    if (geas_runtime_init(NULL, &rt) != GEAS_OK || !rt) {
         fprintf(stderr, "[test_store_crash] FAIL: runtime init\n");
         return 1;
     }
-    CHECK(ash_module_load(rt, g_module) == ASH_OK, "load ledger module");
+    CHECK(geas_module_load(rt, g_module) == GEAS_OK, "load ledger module");
 
     char db_path[] = "target/ashcrash_XXXXXX";
     int fd = mkstemp(db_path);
@@ -177,15 +177,15 @@ int main(void) {
 
     /* ---- seed one account the parent owns the truth of ---- */
 
-    AshContract* seed = sign_on(rt, dsn);
+    GeasContract* seed = sign_on(rt, dsn);
     if (seed) {
-        AshValue a[3] = { int_val(1), str_val("alice"), float_val(100.0) };
-        AshValue out;
+        GeasValue a[3] = { int_val(1), str_val("alice"), float_val(100.0) };
+        GeasValue out;
         memset(&out, 0, sizeof(out));
-        CHECK(ash_pledge_fulfill_sync(seed, "open", a, 3, NULL, 0, &out) ==
-                  ASH_OK,
+        CHECK(geas_pledge_fulfill_sync(seed, "open", a, 3, NULL, 0, &out) ==
+                  GEAS_OK,
               "seed account 1");
-        ash_contract_break(seed);
+        geas_contract_break(seed);
     }
 
     /* ---- crash mid transaction: a child killed with the debit open, and the
@@ -214,15 +214,15 @@ int main(void) {
 
     /* the file is still a working store after the run of crashes: a plain write
      * lands and reads back, so the reconcile and the surface both survived. */
-    AshContract* fin = sign_on(rt, dsn);
-    if (fin && ash_contract_state(fin) == ASH_SIGNED) {
-        AshValue set[3] = { int_val(1), str_val("alice"), float_val(250.0) };
-        AshValue out;
+    GeasContract* fin = sign_on(rt, dsn);
+    if (fin && geas_contract_state(fin) == GEAS_SIGNED) {
+        GeasValue set[3] = { int_val(1), str_val("alice"), float_val(250.0) };
+        GeasValue out;
         memset(&out, 0, sizeof(out));
-        CHECK(ash_pledge_fulfill_sync(fin, "set_balance", set, 3, NULL, 0,
-                                      &out) == ASH_OK,
+        CHECK(geas_pledge_fulfill_sync(fin, "set_balance", set, 3, NULL, 0,
+                                      &out) == GEAS_OK,
               "the store still writes after the crash loop");
-        ash_contract_break(fin);
+        geas_contract_break(fin);
     } else {
         CHECK(0, "the store still signs after the crash loop");
     }
@@ -230,7 +230,7 @@ int main(void) {
     bal = read_balance(rt, dsn, 1, &ok);
     CHECK(ok && bal == 250.0, "the post loop write read back, the store intact");
 
-    ash_runtime_shutdown(rt);
+    geas_runtime_shutdown(rt);
     unlink(db_path);
 
     if (g_fail) {

@@ -1,6 +1,6 @@
-# The Ashford Grammar
+# The Geas Grammar
 
-This is the normative grammar for Ashford. It covers the lexical structure, the type grammar, every declaration form, and the statement and expression core that clause and pledge bodies are written in. Where the grammar alone cannot pin a rule down, a semantic note next to the production carries the rest. The parser and the checker are held to this document, and a change to the surface lands here first.
+This is the normative grammar for Geas. It covers the lexical structure, the type grammar, every declaration form, and the statement and expression core that clause and pledge bodies are written in. Where the grammar alone cannot pin a rule down, a semantic note next to the production carries the rest. The parser and the checker are held to this document, and a change to the surface lands here first.
 
 ## Notation
 
@@ -20,7 +20,7 @@ Nonterminals are CamelCase. Token classes are UPPERCASE.
 
 ## Source files
 
-A source file is UTF-8 and ends in `.ash`. A string literal that is not valid UTF-8 is a compile error, not a silent replacement.
+A source file is UTF-8 and ends in `.geas`. A string literal that is not valid UTF-8 is a compile error, not a silent replacement.
 
 Statements and declarations are terminated by a newline. There are no semicolons. A newline inside parentheses, brackets, or an argument list does not terminate anything, so a long signature can wrap freely. A `{` at the end of a line opens a block and the matching `}` closes it. `NL` in the productions below means one or more newlines.
 
@@ -110,7 +110,7 @@ Import      ::= "import" IDENT { "." IDENT }
 TopDecl     ::= RecordDecl | SumDecl | ProvClause | ContractDecl
 ```
 
-A file is a module. A directory is a package. `import ashstd.math` brings a module into scope by its dotted path. `internal` on a contract or provisional clause keeps it inside its package and out of the descriptor table.
+A file is a module. A directory is a package. `import std.math` brings a module into scope by its dotted path. `internal` on a contract or provisional clause keeps it inside its package and out of the descriptor table.
 
 ## Attributes
 
@@ -185,7 +185,7 @@ SubcontractDecl ::= "subcontract" [ IDENT ] [ "transactional" ] "{" NL { PledgeD
 Semantic notes.
 
 - A pledge return type must be `Result<T, E>`, `Option<T>`, or `Unit`. Nothing else.
-- A pledge with a `Block` is implemented in Ashford. A pledge without one is abstract: it must be bound to a foreign symbol through `[abi: ..., symbol: ...]` or bound by the host through the runtime before the contract signs. Signing with an unbound pledge is an error.
+- A pledge with a `Block` is implemented in Geas. A pledge without one is abstract: it must be bound to a foreign symbol through `[abi: ..., symbol: ...]` or bound by the host through the runtime before the contract signs. Signing with an unbound pledge is an error.
 - A vow initializer must be a constant expression of the vow type. A vow without an initializer must be supplied at sign time.
 - Clauses are not first class. A clause is callable by bare name only inside its own contract.
 - Subcontracts do not nest. An anonymous subcontract cannot be named in a `requirements` block.
@@ -314,7 +314,7 @@ let result = payment.validate_card(my_card)
 - `instance.break()` tears the contract down and returns `Unit`. Every later fulfillment on it returns the broken contract error.
 - `instance.status()` returns the state's canonical spelling as a `String`: `"Unsigned"`, `"Signed"`, `"Fulfilled"`, `"Partial"`, or `"Broken"`.
 - `instance.park(dsn, key)` writes the instance's durable state into the store behind `dsn` under `key` and returns `Unit`; parking is a write, not an ending, and the instance stays live. A park mid walk, an open transactional episode or an unwaited future, faults the body, the same refusals the C surface answers.
-- `instance.partial()` returns the `PartialResult`, a builtin record every program carries without declaring it: `state: String`, `fulfilled: List<String>`, `pending: List<String>`, `broken: List<String>`, the name lists in the runtime's insertion order. It is an ordinary record value, its fields read like any record's, and the copy is independent the way every read is. The `Err` payloads stay on the C surface, where `ash_partial_error` hands them over, because their types vary per pledge and a record field carries one. Declaring your own `PartialResult` collides with the builtin and is an error.
+- `instance.partial()` returns the `PartialResult`, a builtin record every program carries without declaring it: `state: String`, `fulfilled: List<String>`, `pending: List<String>`, `broken: List<String>`, the name lists in the runtime's insertion order. It is an ordinary record value, its fields read like any record's, and the copy is independent the way every read is. The `Err` payloads stay on the C surface, where `geas_partial_error` hands them over, because their types vary per pledge and a record field carries one. Declaring your own `PartialResult` collides with the builtin and is an error.
 - A clause is called by bare name, `format_message(msg)`, and only from inside its own contract.
 
 The member spellings `sign`, `resume`, `break`, `status`, `park`, and `partial` belong to the lifecycle; a pledge under one of those names is unreachable through an instance and its own spelling should step aside.

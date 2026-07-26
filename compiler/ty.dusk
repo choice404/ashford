@@ -1,4 +1,4 @@
-// ty: the checked type arena for the ashford type checker. Every checked type
+// ty: the checked type arena for the geas type checker. Every checked type
 // is one hash consed node, so two mentions of the same type share one id and
 // a type comparison downstream is an integer compare. The node shapes follow
 // docs/grammar.md: the seven scalars and Unit, the builtin composites List,

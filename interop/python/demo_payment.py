@@ -1,5 +1,5 @@
 """demo_payment.py: the payment walk from Python, no C written, no binding
-generated. ashford.py speaks the documented ABI through ctypes and this demo
+generated. geas.py speaks the documented ABI through ctypes and this demo
 drives the same ground tests/runtime/test_partial.c covers in C: load the
 runtime and two compiled modules, bind Python callables over the abstract
 pledges, sign with a vow override, and walk the partial, fulfilled, and
@@ -16,12 +16,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import ashford
-from ashford import (ASH_ERR_STATE, ASH_FULFILLED, ASH_PARTIAL, ASH_SIGNED,
-                     ASH_BROKEN, AshError, Err, Ok, Runtime, StringRef)
+import geas
+from geas import (GEAS_ERR_STATE, GEAS_FULFILLED, GEAS_PARTIAL, GEAS_SIGNED,
+                     GEAS_BROKEN, GeasError, Err, Ok, Runtime, StringRef)
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "target" / "ashc-out"
+OUT = ROOT / "target" / "geas-out"
 
 _failures = 0
 
@@ -52,19 +52,19 @@ def shout(inst, args, nargs, out):
     instance owned memory, written into the slot, and returned as Ok. The
     delivery writes the final slot value back to host storage."""
     import ctypes as C
-    if nargs != 1 or args[0].ty != ashford.ASH_TY_STRING:
-        return ashford.ASH_ERR_TYPE
-    shouted = ashford.decode(args[0]).upper().encode("utf-8")
-    sv = inst._rt._lib.ash_string_copy(inst._ptr, shouted, len(shouted))
-    C.memmove(C.byref(args[0]), C.byref(sv), C.sizeof(ashford.AshValue))
+    if nargs != 1 or args[0].ty != geas.GEAS_TY_STRING:
+        return geas.GEAS_ERR_TYPE
+    shouted = geas.decode(args[0]).upper().encode("utf-8")
+    sv = inst._rt._lib.geas_string_copy(inst._ptr, shouted, len(shouted))
+    C.memmove(C.byref(args[0]), C.byref(sv), C.sizeof(geas.GeasValue))
     inst._rt._encode_owned(inst._ptr, out[0], Ok(shouted.decode("utf-8")))
-    return ashford.ASH_OK
+    return geas.GEAS_OK
 
 
 def main():
-    with Runtime(OUT / "libashrt.so") as rt:
-        rt.load(OUT / "libpayment.ash.so")
-        rt.load(OUT / "libhello.ash.so")
+    with Runtime(OUT / "libgeasrt.so") as rt:
+        rt.load(OUT / "libpayment.geas.so")
+        rt.load(OUT / "libhello.geas.so")
         rt.bind("PaymentService.charge", charge)
         rt.bind("Greeter.shout", shout, raw=True)
         rt.freeze()
@@ -74,8 +74,8 @@ def main():
         try:
             rt.bind("PaymentService.charge", charge)
             check(False, "bind after freeze did not fail")
-        except AshError as e:
-            check(e.status == ASH_ERR_STATE, "bind after freeze is ERR_STATE")
+        except GeasError as e:
+            check(e.status == GEAS_ERR_STATE, "bind after freeze is ERR_STATE")
 
         # ---- discovery: the iname table as Python sees it ----
 
@@ -96,7 +96,7 @@ def main():
         # ---- the partial path, signed with a vow override ----
 
         c1 = rt.sign("PaymentService", vows={"currency": "EUR"})
-        check(c1.state() == ASH_SIGNED, "c1 signed")
+        check(c1.state() == GEAS_SIGNED, "c1 signed")
         check(c1.vow("currency") == "EUR", "vow override landed")
         check(c1.hash() != 0 and c1.signed_at() > 0, "c1 carries a signature")
 
@@ -107,16 +107,16 @@ def main():
         # Validation, one pledge synchronously and one through a future.
         check(c1.fulfill_sync("validate_card", "4111 1111") == Ok(True),
               "validate_card Ok")
-        check(c1.state() == ASH_SIGNED, "half a subcontract moves nothing")
+        check(c1.state() == GEAS_SIGNED, "half a subcontract moves nothing")
         fut = c1.fulfill("validate_amount", 25.0)
         check(fut.wait() == Ok(True), "validate_amount Ok through a future")
         try:
             fut.wait()
             check(False, "second wait did not fail")
-        except AshError as e:
-            check(e.status == ASH_ERR_STATE, "second wait is ERR_STATE")
+        except GeasError as e:
+            check(e.status == GEAS_ERR_STATE, "second wait is ERR_STATE")
 
-        check(c1.state() == ASH_PARTIAL, "Validation lands, c1 partial")
+        check(c1.state() == GEAS_PARTIAL, "Validation lands, c1 partial")
         p = c1.partial()
         check(p.fulfilled == ["Validation"] and
               p.pending == ["Processing", "notify_user"] and
@@ -133,7 +133,7 @@ def main():
 
         check(c1.fulfill_sync("notify_user", True) == Ok(True),
               "notify_user Ok")
-        check(c1.state() == ASH_FULFILLED, "c1 fulfilled")
+        check(c1.state() == GEAS_FULFILLED, "c1 fulfilled")
         p = c1.partial()
         check(len(p.fulfilled) == 3 and p.pending == [] and p.errors == [],
               "every item fulfilled")
@@ -145,7 +145,7 @@ def main():
         check(c2.vow("currency") == "USD", "c2 signs on the declared default")
         out = c2.fulfill_sync("charge", "4111 1111", -2.0)
         check(out == Err(41), "charge Err returns to the caller")
-        check(c2.state() == ASH_BROKEN, "the break line fired by itself")
+        check(c2.state() == GEAS_BROKEN, "the break line fired by itself")
 
         p = c2.partial()
         check(p.broken == ["Processing"] and
@@ -159,8 +159,8 @@ def main():
         try:
             c2.fulfill_sync("validate_card", "4111 1111")
             check(False, "fulfillment after break did not fail")
-        except AshError as e:
-            check(e.status == ASH_ERR_STATE,
+        except GeasError as e:
+            check(e.status == GEAS_ERR_STATE,
                   "fulfillment after automatic break is ERR_STATE")
 
         # An explicit break reclaims the heap the automatic one kept; the

@@ -1,10 +1,10 @@
 // bridge_client_go: the demo_payment.py walk, driven from Go against the
-// bridge server, built from nothing but ashc's emitted artifacts. The
+// bridge server, built from nothing but geas's emitted artifacts. The
 // paymentpb package this imports is protoc's output over the emitted
 // payment.proto plus the emitted session wrapper, so every symbol the walk
 // touches, the typed pledge calls, the signature, the pinned shape hash,
-// and the session handle, came out of the compiler. No Ashford binding,
-// no libashrt, no hand written stub.
+// and the session handle, came out of the compiler. No Geas binding,
+// no libgeasrt, no hand written stub.
 //
 // The walk asserts what bridge_client.py asserts, minus the Debug rpc,
 // which the emitted surface does not carry because the instance table is
@@ -30,7 +30,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	"ashbridge/paymentpb"
+	"geasbridge/paymentpb"
 )
 
 var failures int
@@ -206,8 +206,8 @@ func walk(ctx context.Context, c paymentpb.PaymentServiceClient, legacyTTL time.
 		p.GetErrors()[0].GetPledge() == "charge" && p.GetErrors()[0].GetErr() == 41,
 		"the automatic break kept the Err payload readable")
 
-	// Fulfillment against a broken instance is ASH_ERR_STATE, the one
-	// Ashford status this walk turns into a gRPC error.
+	// Fulfillment against a broken instance is GEAS_ERR_STATE, the one
+	// Geas status this walk turns into a gRPC error.
 	_, err = c.ValidateCard(ctx, &paymentpb.ValidateCardRequest{InstanceId: c2, Card: "4111 1111"})
 	expectCode(err, codes.FailedPrecondition, "fulfillment after automatic break")
 
@@ -242,7 +242,7 @@ func walk(ctx context.Context, c paymentpb.PaymentServiceClient, legacyTTL time.
 	// The wrapper's pinned hash is what an honest consumer sends; a wrong
 	// one is refused at sign, before an instance exists, and the refusal is
 	// a transport error because no contract ever ran. Shape skew is
-	// ASH_ERR_VERSION in the runtime and the bridge maps it to ABORTED.
+	// GEAS_ERR_VERSION in the runtime and the bridge maps it to ABORTED.
 
 	_, err = paymentpb.OpenPaymentServiceSession(ctx, c, &paymentpb.SignRequest{
 		ExpectedHash: paymentpb.PaymentServiceShapeHash + 1,

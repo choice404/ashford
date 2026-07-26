@@ -1,5 +1,5 @@
 // cgenexpr: lowering one expression to C. Every expression becomes a fresh
-// AshValue temporary built by a few statements, and the lowering returns the
+// GeasValue temporary built by a few statements, and the lowering returns the
 // temporary's name beside its checked type, so the parent reads fields off a
 // value whose shape it knows. The lowered set now spans the grammar's
 // expression core: the literals, parameter, vow, and let bound reads, the
@@ -8,14 +8,14 @@
 // list indexing, sum variant construction, the propagation operator, match,
 // which lives in cgenmatch, the bare clause call, which lands on the
 // contract's static clause function, and the cross-contract operations:
-// Contract.sign with named vow overrides through ash_contract_sign on the
+// Contract.sign with named vow overrides through geas_contract_sign on the
 // runtime the enclosing instance rides, instance.pledge(args) through
-// ash_pledge_fulfill_sync with the callee's result deep copied home, and
-// instance.break() through ash_contract_break. An instance value is the
-// internal ASH_TY_INSTANCE handle in as.box, value semantics' one exception:
+// geas_pledge_fulfill_sync with the callee's result deep copied home, and
+// instance.break() through geas_contract_break. An instance value is the
+// internal GEAS_TY_INSTANCE handle in as.box, value semantics' one exception:
 // a let or a bind copies the handle, not the contract. Map operations lower
-// onto the runtime's map helpers: the constructor through ash_map_new and
-// the index read through ash_map_get, wrapped into the Option the checker
+// onto the runtime's map helpers: the constructor through geas_map_new and
+// the index read through geas_map_get, wrapped into the Option the checker
 // promised. What stays out, the first class pledge value read off an
 // instance, is a named build error through cg_unsupported, so no thunk ever
 // ships C the emitter was guessing at. The type questions were all settled by the
@@ -40,10 +40,10 @@ export func bad_val(g: *Cg) -> CVal {
     return CVal { cvar: "bad", ty: ty_unknown((*g).ty) }
 }
 
-// Opens a fresh zeroed AshValue temporary and returns its name.
+// Opens a fresh zeroed GeasValue temporary and returns its name.
 export func new_value(g: *Cg) -> string {
     v: string = cg_tmp(g)
-    cg_line(g, tmsg3("AshValue ", v, " = {0};"))
+    cg_line(g, tmsg3("GeasValue ", v, " = {0};"))
     return v
 }
 
@@ -87,7 +87,7 @@ func gen_int(g: *Cg, e: ExprNode, want: int64) -> CVal {
 func gen_str(g: *Cg, e: ExprNode) -> CVal {
     cs: CStr = cg_c_string(g, e.a)
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_STRING")
+    set_ty(g, v, "GEAS_TY_STRING")
     cg_line(g, tmsg5(v, ".as.s.ptr = (uint8_t*)", cs.lit, ";", ""))
     cg_line(g, tmsg5(v, ".as.s.len = ", int_to_string(cs.len), ";", ""))
     return CVal { cvar: v, ty: ty_str((*g).ty) }
@@ -109,8 +109,8 @@ export func gen_variant(g: *Cg, name: int64, args_off: int64, args_len: int64, l
     if cv.len > 0 {
         arr = cg_tmp(g)
         n: string = int_to_string(cv.len)
-        cg_line(g, tmsg7("AshValue* ", arr, " = (AshValue*)ash_bytes(cc, ", n, " * sizeof(AshValue));", "", ""))
-        cg_line(g, tmsg3("if (!", arr, ") return ASH_ERR_OOM;"))
+        cg_line(g, tmsg7("GeasValue* ", arr, " = (GeasValue*)geas_bytes(cc, ", n, " * sizeof(GeasValue));", "", ""))
+        cg_line(g, tmsg3("if (!", arr, ") return GEAS_ERR_OOM;"))
         mut i: int64 = 0
         while i < args_len {
             arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, args_off + i))
@@ -124,7 +124,7 @@ export func gen_variant(g: *Cg, name: int64, args_off: int64, args_len: int64, l
         }
     }
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_SUM")
+    set_ty(g, v, "GEAS_TY_SUM")
     cg_line(g, tmsg5(v, ".tag = ", int_to_string(cv.idx), ";", ""))
     if cv.len > 0 {
         n2: string = int_to_string(cv.len)
@@ -149,10 +149,10 @@ func gen_ident(g: *Cg, e: ExprNode) -> CVal {
         if m.kind == mk_vow() {
             vs: VowSigT = sig_vow((*g).sigs, (*g).cur_cid, e.a)
             p: string = cg_tmp(g)
-            cg_line(g, tmsg5("const AshValue* ", p, " = ash_vow_ref(cc, \"", text, "\");"))
-            cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_NAME;"))
+            cg_line(g, tmsg5("const GeasValue* ", p, " = geas_vow_ref(cc, \"", text, "\");"))
+            cg_line(g, tmsg3("if (!", p, ") return GEAS_ERR_NAME;"))
             v: string = cg_tmp(g)
-            cg_line(g, tmsg5("AshValue ", v, " = *", p, ";"))
+            cg_line(g, tmsg5("GeasValue ", v, " = *", p, ";"))
             return CVal { cvar: v, ty: vs.ty }
         }
     }
@@ -169,7 +169,7 @@ func gen_unary(g: *Cg, e: ExprNode) -> CVal {
     x: CVal = gen_expr(g, e.b, -1)
     if e.a == uop_not() {
         v: string = new_value(g)
-        set_ty(g, v, "ASH_TY_BOOL")
+        set_ty(g, v, "GEAS_TY_BOOL")
         cg_line(g, tmsg5(v, ".as.b = !", x.cvar, ".as.b;", ""))
         return CVal { cvar: v, ty: ty_bool(t) }
     }
@@ -188,8 +188,8 @@ func gen_unary(g: *Cg, e: ExprNode) -> CVal {
 // result on the instance the thunk runs against.
 func gen_concat(g: *Cg, l: CVal, r: CVal) -> CVal {
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_STRING")
-    cg_line(g, tmsg7("if (ash_string_concat(cc, &", l.cvar, ", &", r.cvar, ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    set_ty(g, v, "GEAS_TY_STRING")
+    cg_line(g, tmsg7("if (geas_string_concat(cc, &", l.cvar, ", &", r.cvar, ", &", v, ") != GEAS_OK) return GEAS_ERR_OOM;"))
     return CVal { cvar: v, ty: ty_str((*g).ty) }
 }
 
@@ -205,7 +205,7 @@ export func cg_is_composite(t: *TyArena, tyid: int64) -> bool {
 }
 
 // Whether equality on this checked type goes through the structural
-// ash_value_eq helper: the composite shapes, everything whose value is more
+// geas_value_eq helper: the composite shapes, everything whose value is more
 // than one union field, and the instance handle, whose equality arm is
 // handle identity.
 func deep_eq_kind(t: *TyArena, tyid: int64) -> bool {
@@ -224,8 +224,8 @@ export func cg_copy_out(g: *Cg, v: CVal) -> CVal {
     if !cg_is_composite((*g).ty, v.ty) { return v }
     dst: string = new_value(g)
     st: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, &", v.cvar, ", &", dst, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st, " = geas_value_deep_copy(cc, &", v.cvar, ", &", dst, ");"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     return CVal { cvar: dst, ty: v.ty }
 }
 
@@ -239,7 +239,7 @@ func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
         // the right when the left is true, '||' when the left is false.
         l: CVal = gen_expr(g, e.b, ty_bool(t))
         v: string = new_value(g)
-        set_ty(g, v, "ASH_TY_BOOL")
+        set_ty(g, v, "GEAS_TY_BOOL")
         cg_line(g, tmsg5(v, ".as.b = ", l.cvar, ".as.b;", ""))
         if op == bop_and() {
             cg_line(g, tmsg3("if (", v, ".as.b) {"))
@@ -272,17 +272,17 @@ func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
     }
     if op == bop_eq() || op == bop_ne() {
         v2: string = new_value(g)
-        set_ty(g, v2, "ASH_TY_BOOL")
+        set_ty(g, v2, "GEAS_TY_BOOL")
         mut bang: string = ""
         if op == bop_ne() { bang = "!" }
         if k == tyk_str() {
-            cg_line(g, tmsg7(v2, ".as.b = ", bang, "ash_string_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
+            cg_line(g, tmsg7(v2, ".as.b = ", bang, "geas_string_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
             return CVal { cvar: v2, ty: ty_bool(t) }
         }
         fld: string = cg_field_of(g, opty)
         if str_len(fld) == 0 {
             if deep_eq_kind(t, opty) {
-                cg_line(g, tmsg7(v2, ".as.b = ", bang, "ash_value_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
+                cg_line(g, tmsg7(v2, ".as.b = ", bang, "geas_value_eq(&", l2.cvar, tmsg3(", &", r2.cvar, ");"), ""))
                 return CVal { cvar: v2, ty: ty_bool(t) }
             }
             cg_unsupported(g, e.lo, e.hi, "'==' on this type")
@@ -298,7 +298,7 @@ func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
     }
     if op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() {
         v3: string = new_value(g)
-        set_ty(g, v3, "ASH_TY_BOOL")
+        set_ty(g, v3, "GEAS_TY_BOOL")
         cg_line(g, tmsg7(v3, ".as.b = (", tmsg5(l2.cvar, ".as.", fld2, " ", c_op(op)), tmsg3(" ", r2.cvar, ".as."), tmsg2(fld2, ");"), "", ""))
         return CVal { cvar: v3, ty: ty_bool(t) }
     }
@@ -318,8 +318,8 @@ func gen_binary(g: *Cg, e: ExprNode, want: int64) -> CVal {
 // wrapper carries the ABI tag, Option 0 None 1 Some, Result 0 Ok 1 Err.
 func gen_boxed(g: *Cg, payload: CVal, tag_name: string, variant: int64, tyid: int64) -> CVal {
     b: string = cg_tmp(g)
-    cg_line(g, tmsg3("AshValue* ", b, " = ash_box(cc);"))
-    cg_line(g, tmsg3("if (!", b, ") return ASH_ERR_OOM;"))
+    cg_line(g, tmsg3("GeasValue* ", b, " = geas_box(cc);"))
+    cg_line(g, tmsg3("if (!", b, ") return GEAS_ERR_OOM;"))
     cg_line(g, tmsg5("*", b, " = ", payload.cvar, ";"))
     v: string = new_value(g)
     set_ty(g, v, tag_name)
@@ -336,7 +336,7 @@ func gen_some(g: *Cg, e: ExprNode, want: int64) -> CVal {
         if wn.kind == tyk_option() { pw = wn.a }
     }
     p: CVal = gen_expr(g, e.a, pw)
-    return gen_boxed(g, p, "ASH_TY_OPTION", 1, ty_option(t, p.ty))
+    return gen_boxed(g, p, "GEAS_TY_OPTION", 1, ty_option(t, p.ty))
 }
 
 func gen_ok_err(g: *Cg, e: ExprNode, want: int64, is_ok: bool) -> CVal {
@@ -361,7 +361,7 @@ func gen_ok_err(g: *Cg, e: ExprNode, want: int64, is_ok: bool) -> CVal {
     }
     mut variant: int64 = 0
     if !is_ok { variant = 1 }
-    return gen_boxed(g, p, "ASH_TY_RESULT", variant, tyid)
+    return gen_boxed(g, p, "GEAS_TY_RESULT", variant, tyid)
 }
 
 func gen_none(g: *Cg, e: ExprNode, want: int64) -> CVal {
@@ -371,7 +371,7 @@ func gen_none(g: *Cg, e: ExprNode, want: int64) -> CVal {
         if ty_get(t, want).kind == tyk_option() { tyid = want }
     }
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_OPTION")
+    set_ty(g, v, "GEAS_TY_OPTION")
     return CVal { cvar: v, ty: tyid }
 }
 
@@ -397,13 +397,13 @@ func gen_list(g: *Cg, e: ExprNode, want: int64) -> CVal {
     mut tag: string = cg_tag_of(g, elem)
     // An empty literal with no expectation has no element tag to declare;
     // Unit stands in, and nothing is ever pushed against it.
-    if str_len(tag) == 0 { tag = "ASH_TY_UNIT" }
+    if str_len(tag) == 0 { tag = "GEAS_TY_UNIT" }
     v: string = new_value(g)
-    cg_line(g, tmsg7("if (ash_list_new(cc, ", tag, ", ", int_to_string(e.b), ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    cg_line(g, tmsg7("if (geas_list_new(cc, ", tag, ", ", int_to_string(e.b), ", &", v, ") != GEAS_OK) return GEAS_ERR_OOM;"))
     mut j: int64 = 0
     while j < vec_len(vals) {
         el: CVal = vec_get(vals, j)
-        cg_line(g, tmsg7("if (ash_list_push(cc, &", v, ", &", el.cvar, ") != ASH_OK) return ASH_ERR_OOM;", "", ""))
+        cg_line(g, tmsg7("if (geas_list_push(cc, &", v, ", &", el.cvar, ") != GEAS_OK) return GEAS_ERR_OOM;", "", ""))
         j = j + 1
     }
     return CVal { cvar: v, ty: ty_list(t, elem) }
@@ -430,11 +430,11 @@ func gen_tuple(g: *Cg, e: ExprNode, want: int64) -> CVal {
         i = i + 1
     }
     v: string = new_value(g)
-    cg_line(g, tmsg5("if (ash_tuple_new(cc, ", int_to_string(e.b), ", &", v, ") != ASH_OK) return ASH_ERR_OOM;"))
+    cg_line(g, tmsg5("if (geas_tuple_new(cc, ", int_to_string(e.b), ", &", v, ") != GEAS_OK) return GEAS_ERR_OOM;"))
     mut j: int64 = 0
     while j < vec_len(vals) {
         el: CVal = vec_get(vals, j)
-        cg_line(g, tmsg7("((AshValue*)", v, ".as.list.data)[", int_to_string(j), "] = ", el.cvar, ";"))
+        cg_line(g, tmsg7("((GeasValue*)", v, ".as.list.data)[", int_to_string(j), "] = ", el.cvar, ";"))
         j = j + 1
     }
     return CVal { cvar: v, ty: ty_tuple(t, tys) }
@@ -455,8 +455,8 @@ func gen_record_lit(g: *Cg, e: ExprNode) -> CVal {
     if rs.len > 0 {
         arr = cg_tmp(g)
         n: string = int_to_string(rs.len)
-        cg_line(g, tmsg7("AshValue* ", arr, " = (AshValue*)ash_bytes(cc, ", n, " * sizeof(AshValue));", "", ""))
-        cg_line(g, tmsg3("if (!", arr, ") return ASH_ERR_OOM;"))
+        cg_line(g, tmsg7("GeasValue* ", arr, " = (GeasValue*)geas_bytes(cc, ", n, " * sizeof(GeasValue));", "", ""))
+        cg_line(g, tmsg3("if (!", arr, ") return GEAS_ERR_OOM;"))
         mut j: int64 = 0
         while j < rs.len {
             fld: FieldSig = sig_field((*g).sigs, rs.off, j)
@@ -479,7 +479,7 @@ func gen_record_lit(g: *Cg, e: ExprNode) -> CVal {
         }
     }
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_RECORD")
+    set_ty(g, v, "GEAS_TY_RECORD")
     if rs.len > 0 {
         n2: string = int_to_string(rs.len)
         cg_line(g, tmsg5(v, ".as.list.data = ", arr, ";", ""))
@@ -501,14 +501,14 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
         cf: CField = cg_rec_field(g, cn.name, e.b)
         if cf.found {
             v: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshValue ", v, " = ((const AshValue*)", base.cvar, ".as.list.data)[", tmsg2(int_to_string(cf.idx), "];"), ""))
+            cg_line(g, tmsg7("GeasValue ", v, " = ((const GeasValue*)", base.cvar, ".as.list.data)[", tmsg2(int_to_string(cf.idx), "];"), ""))
             // The read yields a value, so a composite field lifts out as its
             // own copy: mutating it never writes back through the record.
             return cg_copy_out(g, CVal { cvar: v, ty: cf.ty })
         }
     }
     if ty_get((*g).ty, base.ty).kind == tyk_contract() {
-        // A vow read through the instance: ash_vow_ref borrows the locked
+        // A vow read through the instance: geas_vow_ref borrows the locked
         // value, and the read deep copies it home so the value survives the
         // callee's break the way value semantics promise.
         cid: int64 = cg_contract_of(g, base.ty)
@@ -516,13 +516,13 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
             vs: VowSigT = sig_vow((*g).sigs, cid, e.b)
             if vs.found {
                 p: string = cg_tmp(g)
-                head: string = tmsg7("const AshValue* ", p, " = ash_vow_ref((AshContract*)", base.cvar, ".as.box, \"", ast_name(a, e.b), "\");")
+                head: string = tmsg7("const GeasValue* ", p, " = geas_vow_ref((GeasContract*)", base.cvar, ".as.box, \"", ast_name(a, e.b), "\");")
                 cg_line(g, head)
-                cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_NAME;"))
+                cg_line(g, tmsg3("if (!", p, ") return GEAS_ERR_NAME;"))
                 home: string = new_value(g)
                 st: string = cg_tmp(g)
-                cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, ", p, ", &", home, ");"))
-                cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+                cg_line(g, tmsg7("GeasStatus ", st, " = geas_value_deep_copy(cc, ", p, ", &", home, ");"))
+                cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
                 return CVal { cvar: home, ty: vs.ty }
             }
         }
@@ -533,7 +533,7 @@ func gen_member(g: *Cg, e: ExprNode) -> CVal {
     return bad_val(g)
 }
 
-// A map index read: ash_map_get borrows the value slot on a hit, and the
+// A map index read: geas_map_get borrows the value slot on a hit, and the
 // result is Option<V>, Some around a deep copy of the slot so the Option owns
 // what it carries, None on a miss, never a fault.
 func gen_map_index(g: *Cg, base: CVal, e: ExprNode) -> CVal {
@@ -541,19 +541,19 @@ func gen_map_index(g: *Cg, base: CVal, e: ExprNode) -> CVal {
     n: TyNode = ty_get(t, base.ty)
     key: CVal = gen_expr(g, e.b, n.a)
     p: string = cg_tmp(g)
-    cg_line(g, tmsg3("const AshValue* ", p, " = NULL;"))
+    cg_line(g, tmsg3("const GeasValue* ", p, " = NULL;"))
     f: string = cg_tmp(g)
-    cg_line(g, tmsg7("int ", f, " = ash_map_get(&", base.cvar, ", &", key.cvar, tmsg3(", &", p, ");")))
+    cg_line(g, tmsg7("int ", f, " = geas_map_get(&", base.cvar, ", &", key.cvar, tmsg3(", &", p, ");")))
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_OPTION")
+    set_ty(g, v, "GEAS_TY_OPTION")
     cg_line(g, tmsg3("if (", f, ") {"))
     (*g).indent = (*g).indent + 1
     b: string = cg_tmp(g)
-    cg_line(g, tmsg3("AshValue* ", b, " = ash_box(cc);"))
-    cg_line(g, tmsg3("if (!", b, ") return ASH_ERR_OOM;"))
+    cg_line(g, tmsg3("GeasValue* ", b, " = geas_box(cc);"))
+    cg_line(g, tmsg3("if (!", b, ") return GEAS_ERR_OOM;"))
     st: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st, " = ash_value_deep_copy(cc, ", p, ", ", b, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st, " = geas_value_deep_copy(cc, ", p, ", ", b, ");"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     cg_line(g, tmsg3(v, ".tag = 1;", ""))
     cg_line(g, tmsg5(v, ".as.box = ", b, ";", ""))
     (*g).indent = (*g).indent - 1
@@ -561,9 +561,9 @@ func gen_map_index(g: *Cg, base: CVal, e: ExprNode) -> CVal {
     return CVal { cvar: v, ty: ty_option(t, n.b) }
 }
 
-// A list index read, bounds checked through ash_list_get: an index outside
+// A list index read, bounds checked through geas_list_get: an index outside
 // the list, negative included through the unsigned cast, is a clean
-// ASH_ERR_TYPE from the pledge. A map index read routes to gen_map_index,
+// GEAS_ERR_TYPE from the pledge. A map index read routes to gen_map_index,
 // the type driving the split the way the checker settled it.
 func gen_index(g: *Cg, e: ExprNode) -> CVal {
     t: *TyArena = (*g).ty
@@ -578,10 +578,10 @@ func gen_index(g: *Cg, e: ExprNode) -> CVal {
         return bad_val(g)
     }
     p: string = cg_tmp(g)
-    cg_line(g, tmsg7("const AshValue* ", p, " = ash_list_get(&", base.cvar, ", (uint64_t)", idx.cvar, ".as.i);"))
-    cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_TYPE;"))
+    cg_line(g, tmsg7("const GeasValue* ", p, " = geas_list_get(&", base.cvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+    cg_line(g, tmsg3("if (!", p, ") return GEAS_ERR_TYPE;"))
     v: string = cg_tmp(g)
-    cg_line(g, tmsg5("AshValue ", v, " = *", p, ";"))
+    cg_line(g, tmsg5("GeasValue ", v, " = *", p, ";"))
     // A read is a value read, so a composite element comes out as its own
     // copy and a later mutation never reaches back into the list.
     return cg_copy_out(g, CVal { cvar: v, ty: n.a })
@@ -602,9 +602,9 @@ func gen_question(g: *Cg, e: ExprNode) -> CVal {
         cg_unsupported(g, e.lo, e.hi, "'?' on this type")
         return bad_val(g)
     }
-    cg_line(g, tmsg7("if (", x.cvar, ".tag == ", fail, ") { *out = ", x.cvar, "; return ASH_OK; }"))
+    cg_line(g, tmsg7("if (", x.cvar, ".tag == ", fail, ") { *out = ", x.cvar, "; return GEAS_OK; }"))
     v: string = cg_tmp(g)
-    cg_line(g, tmsg5("AshValue ", v, " = *(const AshValue*)", x.cvar, ".as.box;"))
+    cg_line(g, tmsg5("GeasValue ", v, " = *(const GeasValue*)", x.cvar, ".as.box;"))
     return CVal { cvar: v, ty: inner }
 }
 
@@ -624,14 +624,14 @@ func gen_args(g: *Cg, params: TyList, off: int64, len: int64) -> *Vector<CVal> {
     return vals
 }
 
-// Gathers lowered argument values into one stack AshValue array and returns
+// Gathers lowered argument values into one stack GeasValue array and returns
 // its name, or "NULL" for an empty list, the spelling both the static clause
 // call and the fulfill call pass on.
 func gen_val_array(g: *Cg, vals: *Vector<CVal>) -> string {
     if vec_len(vals) == 0 { return "NULL" }
     arr: string = cg_tmp(g)
     line: *StringBuilder = alloc(sb_new())
-    sb_push(line, "AshValue ")
+    sb_push(line, "GeasValue ")
     sb_push(line, arr)
     sb_push_char(line, 91)
     sb_push_int(line, vec_len(vals))
@@ -653,10 +653,10 @@ func gen_val_array(g: *Cg, vals: *Vector<CVal>) -> string {
 
 // A bare clause call. The arguments lower against the clause's checked
 // parameter types, land in one stack array, and the static clause function
-// runs in the thunk's exit convention: a status that is not ASH_OK exits the
+// runs in the thunk's exit convention: a status that is not GEAS_OK exits the
 // enclosing body with it, exactly as the runtime helpers do, and the value
 // arrives through the out slot. Propagation inside the clause is invisible
-// here: a clause that early-returns its None or Err reports ASH_OK with that
+// here: a clause that early-returns its None or Err reports GEAS_OK with that
 // value in out, which is simply the clause's result.
 func gen_clause_call(g: *Cg, name: int64, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
@@ -670,8 +670,8 @@ func gen_clause_call(g: *Cg, name: int64, e: ExprNode) -> CVal {
     fname: string = cg_clause_fn(cname, ast_name(a, name))
     rv: string = new_value(g)
     st: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st, " = ", fname, "(cc, ", argref, tmsg3(", &", rv, ");")))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st, " = ", fname, "(cc, ", argref, tmsg3(", &", rv, ");")))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     mut ret: int64 = cs.ret
     if ret < 0 { ret = ty_unknown(t) }
     return CVal { cvar: rv, ty: ret }
@@ -687,10 +687,10 @@ func cg_contract_of(g: *Cg, tyid: int64) -> int64 {
     return -1
 }
 
-// Contract.sign(named vow overrides). The overrides land in an AshVowBinding
+// Contract.sign(named vow overrides). The overrides land in a GeasVowBinding
 // array, each value lowered against its vow's checked type, and the sign
 // runs against the runtime the enclosing instance rides, reached through
-// ash_instance_runtime(cc). The expected hash is 0 on purpose: the callee's
+// geas_instance_runtime(cc). The expected hash is 0 on purpose: the callee's
 // descriptor was emitted from this same checked tree, so the name alone
 // identifies it. A sign that fails is a pledge fault, its status returned
 // straight through the thunk. The value is the internal instance handle. An
@@ -709,7 +709,7 @@ func gen_sign(g: *Cg, scid: int64, e: ExprNode) -> CVal {
     mut vbref: string = "NULL"
     if e.c > 0 {
         arr: string = cg_tmp(g)
-        cg_line(g, tmsg5("AshVowBinding ", arr, "[", int_to_string(e.c), "];"))
+        cg_line(g, tmsg5("GeasVowBinding ", arr, "[", int_to_string(e.c), "];"))
         mut i: int64 = 0
         while i < e.c {
             arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + i))
@@ -723,13 +723,13 @@ func gen_sign(g: *Cg, scid: int64, e: ExprNode) -> CVal {
         vbref = arr
     }
     ins: string = cg_tmp(g)
-    cg_line(g, tmsg3("AshContract* ", ins, " = NULL;"))
+    cg_line(g, tmsg3("GeasContract* ", ins, " = NULL;"))
     st: string = cg_tmp(g)
-    head: string = tmsg7("AshStatus ", st, " = ash_contract_sign(ash_instance_runtime(cc), \"", cname, "\", ", vbref, ", ")
+    head: string = tmsg7("GeasStatus ", st, " = geas_contract_sign(geas_instance_runtime(cc), \"", cname, "\", ", vbref, ", ")
     cg_line(g, tmsg7(head, int_to_string(e.c), ", 0, &", ins, ");", "", ""))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_INSTANCE")
+    set_ty(g, v, "GEAS_TY_INSTANCE")
     cg_line(g, tmsg5(v, ".as.box = ", ins, ";", ""))
     return CVal { cvar: v, ty: ty_contract(t, cname) }
 }
@@ -737,7 +737,7 @@ func gen_sign(g: *Cg, scid: int64, e: ExprNode) -> CVal {
 // instance.pledge(args), the cross-contract fulfillment. The arguments lower
 // against the pledge's checked parameter types and ride one synchronous
 // fulfill against the callee instance; on a pool worker the runtime runs it
-// inline on this thread. A status that is not ASH_OK is a fault of the
+// inline on this thread. A status that is not GEAS_OK is a fault of the
 // enclosing pledge and returns straight through the thunk; the value, which
 // the callee instance owns, is deep copied onto the enclosing instance at
 // once, so it outlives the callee's break the way value semantics promise.
@@ -755,13 +755,13 @@ func gen_pledge_call(g: *Cg, base: CVal, mname: int64, e: ExprNode) -> CVal {
     argref: string = gen_val_array(g, vals)
     rv: string = new_value(g)
     st: string = cg_tmp(g)
-    head: string = tmsg7("AshStatus ", st, " = ash_pledge_fulfill_sync((AshContract*)", base.cvar, ".as.box, \"", mtext, "\", ")
+    head: string = tmsg7("GeasStatus ", st, " = geas_pledge_fulfill_sync((GeasContract*)", base.cvar, ".as.box, \"", mtext, "\", ")
     cg_line(g, tmsg7(head, argref, ", ", int_to_string(vec_len(vals)), ", NULL, 0, &", rv, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     home: string = new_value(g)
     st2: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st2, " = ash_value_deep_copy(cc, &", rv, ", &", home, ");"))
-    cg_line(g, tmsg5("if (", st2, " != ASH_OK) return ", st2, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st2, " = geas_value_deep_copy(cc, &", rv, ", &", home, ");"))
+    cg_line(g, tmsg5("if (", st2, " != GEAS_OK) return ", st2, ";"))
     mut ret: int64 = ps.ret
     if ret < 0 { ret = ty_unknown(t) }
     return CVal { cvar: home, ty: ret }
@@ -771,8 +771,8 @@ func gen_pledge_call(g: *Cg, base: CVal, mname: int64, e: ExprNode) -> CVal {
 // runtime helper; the value is Unit, the zeroed fresh temporary.
 func gen_break_call(g: *Cg, base: CVal) -> CVal {
     st: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st, " = ash_contract_break((AshContract*)", base.cvar, ".as.box);", "", ""))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st, " = geas_contract_break((GeasContract*)", base.cvar, ".as.box);", "", ""))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     v: string = new_value(g)
     return CVal { cvar: v, ty: ty_unit((*g).ty) }
 }
@@ -781,7 +781,7 @@ func gen_break_call(g: *Cg, base: CVal) -> CVal {
 // String borrowing static bytes, so nothing allocates and nothing frees.
 func gen_status_call(g: *Cg, base: CVal) -> CVal {
     v: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshValue ", v, " = ash_state_value((const AshContract*)", base.cvar, ".as.box);", "", ""))
+    cg_line(g, tmsg7("GeasValue ", v, " = geas_state_value((const GeasContract*)", base.cvar, ".as.box);", "", ""))
     return CVal { cvar: v, ty: ty_str((*g).ty) }
 }
 
@@ -796,9 +796,9 @@ func gen_park_call(g: *Cg, base: CVal, e: ExprNode) -> CVal {
     d: CVal = gen_expr(g, arg0.expr, ty_str(t))
     k: CVal = gen_expr(g, arg1.expr, ty_str(t))
     st: string = cg_tmp(g)
-    head: string = tmsg7("AshStatus ", st, " = ash_instance_park_v((AshContract*)", base.cvar, ".as.box, &", d.cvar, ", &")
+    head: string = tmsg7("GeasStatus ", st, " = geas_instance_park_v((GeasContract*)", base.cvar, ".as.box, &", d.cvar, ", &")
     cg_line(g, tmsg3(head, k.cvar, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     v: string = new_value(g)
     return CVal { cvar: v, ty: ty_unit(t) }
 }
@@ -810,8 +810,8 @@ func gen_park_call(g: *Cg, base: CVal, e: ExprNode) -> CVal {
 func gen_partial_call(g: *Cg, base: CVal) -> CVal {
     v: string = new_value(g)
     st: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshStatus ", st, " = ash_partial_value((AshContract*)", base.cvar, ".as.box, cc, &", v, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg7("GeasStatus ", st, " = geas_partial_value((GeasContract*)", base.cvar, ".as.box, cc, &", v, ");"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     return CVal { cvar: v, ty: ty_named((*g).ty, "PartialResult") }
 }
 
@@ -831,19 +831,19 @@ func gen_resume(g: *Cg, scid: int64, e: ExprNode) -> CVal {
     d: CVal = gen_expr(g, arg0.expr, ty_str(t))
     k: CVal = gen_expr(g, arg1.expr, ty_str(t))
     ins: string = cg_tmp(g)
-    cg_line(g, tmsg3("AshContract* ", ins, " = NULL;"))
+    cg_line(g, tmsg3("GeasContract* ", ins, " = NULL;"))
     st: string = cg_tmp(g)
-    head: string = tmsg7("AshStatus ", st, " = ash_instance_resume_v(ash_instance_runtime(cc), &", d.cvar, ", &", k.cvar, ", 0, &")
+    head: string = tmsg7("GeasStatus ", st, " = geas_instance_resume_v(geas_instance_runtime(cc), &", d.cvar, ", &", k.cvar, ", 0, &")
     cg_line(g, tmsg3(head, ins, ");"))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
     v: string = new_value(g)
-    set_ty(g, v, "ASH_TY_INSTANCE")
+    set_ty(g, v, "GEAS_TY_INSTANCE")
     cg_line(g, tmsg5(v, ".as.box = ", ins, ";", ""))
     return CVal { cvar: v, ty: ty_contract(t, cname) }
 }
 
 // The schema of the given name in the contract: its declaration index, the one
-// the emitted AshSchemaDesc array shares, and its arena id. (-1, -1) when the
+// the emitted GeasSchemaDesc array shares, and its arena id. (-1, -1) when the
 // contract declares no such schema, which the checker already reported.
 func cg_schema_index(g: *Cg, cid: int64, name: int64) -> (int64, int64) {
     a: *Ast = (*g).ast
@@ -872,16 +872,16 @@ func cg_arg_expr(g: *Cg, e: ExprNode, i: int64) -> int64 {
 
 // The comparison operator of a Store.query term as its runtime enum spelling.
 func cg_cmp_name(op: int64) -> string {
-    if op == bop_eq() { return "ASH_CMP_EQ" }
-    if op == bop_ne() { return "ASH_CMP_NE" }
-    if op == bop_lt() { return "ASH_CMP_LT" }
-    if op == bop_le() { return "ASH_CMP_LE" }
-    if op == bop_gt() { return "ASH_CMP_GT" }
-    return "ASH_CMP_GE"
+    if op == bop_eq() { return "GEAS_CMP_EQ" }
+    if op == bop_ne() { return "GEAS_CMP_NE" }
+    if op == bop_lt() { return "GEAS_CMP_LT" }
+    if op == bop_le() { return "GEAS_CMP_LE" }
+    if op == bop_gt() { return "GEAS_CMP_GT" }
+    return "GEAS_CMP_GE"
 }
 
 // Walks a Store.query predicate the checker already validated, lowering each
-// comparison's value into its own temporary and pushing one AshStoreTerm
+// comparison's value into its own temporary and pushing one GeasStoreTerm
 // initializer, { column index, comparison, &value }, in left to right order. A
 // && recurses both sides; a comparison is one term whose column resolves to the
 // same schema field index the checker read.
@@ -911,7 +911,7 @@ func cg_query_terms(g: *Cg, rs: RecSig, xid: int64, terms: *Vector<string>) -> v
     vec_push(terms, entry)
 }
 
-// Lowers a Store.query predicate into one AshStoreTerm array declaration and
+// Lowers a Store.query predicate into one GeasStoreTerm array declaration and
 // returns the array's name beside its term count. Each comparison's value lands
 // in its own temporary through cg_query_terms, so the array's initializers hold
 // borrows into live values; the count rides back so the caller passes it to the
@@ -921,7 +921,7 @@ func cg_build_term_array(g: *Cg, rs: RecSig, xid: int64) -> (string, int64) {
     cg_query_terms(g, rs, xid, terms)
     arr: string = cg_tmp(g)
     line: *StringBuilder = alloc(sb_new())
-    sb_push(line, "AshStoreTerm ")
+    sb_push(line, "GeasStoreTerm ")
     sb_push(line, arr)
     sb_push(line, "[] = { ")
     mut ti: int64 = 0
@@ -1076,7 +1076,7 @@ func cg_dnf(g: *Cg, xid: int64) -> *Vector<*Vector<int64>> {
     return single
 }
 
-// One comparison of a DNF group lowered into its own AshStoreTerm initializer,
+// One comparison of a DNF group lowered into its own GeasStoreTerm initializer,
 // { column index, comparison, &value }. The left side is the bare column the
 // checker resolved to a schema field, so it lowers to that field's declaration
 // index, and the value lowers against the column's type into a fresh temporary
@@ -1124,17 +1124,17 @@ func cg_emit_init_array(g: *Cg, decl: string, arr: string, items: *Vector<string
     free(text)
 }
 
-// A Store.query predicate that carries a || lowered onto ash_store_select. The
+// A Store.query predicate that carries a || lowered onto geas_store_select. The
 // predicate normalizes to disjunctive normal form and its groups flatten, group
-// by group, into one AshStoreTerm array; a parallel uint32_t array holds each
+// by group, into one GeasStoreTerm array; a parallel uint32_t array holds each
 // group's length, so the primitive reads group i as the group_lens[i] terms
 // after the groups before it. ordcol_s is a column index with its 'u' suffix
-// when the query is ordered or ASH_STORE_NO_ORDER when it is not, dir_s is the
+// when the query is ordered or GEAS_STORE_NO_ORDER when it is not, dir_s is the
 // direction the same way, and limref is the address of an Int temporary when the
 // query is bounded or NULL when it is not. Each comparison's value lowers into
 // its own temporary, a term repeated across groups re-lowering its value, so the
 // array initializers borrow live values.
-// Flattens a Store predicate's disjunctive normal form into one AshStoreTerm
+// Flattens a Store predicate's disjunctive normal form into one GeasStoreTerm
 // array and a parallel uint32_t group-length array, the shape the group aware
 // store primitives read: the primitive reads group i as the group_lens[i] terms
 // after the groups before it. Each group's comparisons flatten in order and each
@@ -1158,7 +1158,7 @@ func cg_dnf_arrays(g: *Cg, rs: RecSig, xid: int64) -> (string, string, string) {
         gi = gi + 1
     }
     tarr: string = cg_tmp(g)
-    cg_emit_init_array(g, "AshStoreTerm ", tarr, terms)
+    cg_emit_init_array(g, "GeasStoreTerm ", tarr, terms)
     garr: string = cg_tmp(g)
     cg_emit_init_array(g, "uint32_t ", garr, lens)
     return (tarr, garr, int_to_string(vec_len(dnf)))
@@ -1166,17 +1166,17 @@ func cg_dnf_arrays(g: *Cg, rs: RecSig, xid: int64) -> (string, string, string) {
 
 func cg_store_select(g: *Cg, rs: RecSig, xid: int64, schref: string, out: string, st: string, ordcol_s: string, dir_s: string, limref: string) -> void {
     tarr, garr, ng := cg_dnf_arrays(g, rs, xid)
-    head: string = tmsg7("AshStatus ", st, " = ash_store_select(cc, ", schref, ", ", tarr, ", ")
+    head: string = tmsg7("GeasStatus ", st, " = geas_store_select(cc, ", schref, ", ", tarr, ", ")
     mid: string = tmsg7(garr, ", ", ng, "u, ", ordcol_s, ", ", dir_s)
     tail: string = tmsg7(", ", limref, ", &", out, ");", "", "")
     cg_line(g, tmsg3(head, mid, tail))
-    cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+    cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
 }
 
 // A Store.* operation lowered onto its runtime primitive. The schema name is a
 // bare identifier, resolved to the emitted descriptor entry and never lowered
 // as a value; the key and row lower against the types the schema fixes. The
-// primitive runs in the thunk's exit convention, a status other than ASH_OK
+// primitive runs in the thunk's exit convention, a status other than GEAS_OK
 // returning straight through the body, and lands its Ok(...) result in the
 // fresh temporary, which is the value the surface promised.
 func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
@@ -1206,9 +1206,9 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
     st: string = cg_tmp(g)
     if str_eq(op, "find") {
         key: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
-        call: string = tmsg5(" = ash_store_find(cc, ", schref, ", &", key.cvar, tmsg3(", &", out, ");"))
-        cg_line(g, tmsg3("AshStatus ", st, call))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        call: string = tmsg5(" = geas_store_find(cc, ", schref, ", &", key.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("GeasStatus ", st, call))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_option(t, row_ty), err_ty) }
     }
     if str_eq(op, "query") {
@@ -1218,17 +1218,17 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             // lowering byte for byte.
             pred2: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
             if cg_pred_has_or(g, pred2) {
-                cg_store_select(g, rs, pred2, schref, out, st, "ASH_STORE_NO_ORDER", "0u", "NULL")
+                cg_store_select(g, rs, pred2, schref, out, st, "GEAS_STORE_NO_ORDER", "0u", "NULL")
                 return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
             }
             // The predicate form: each comparison's value lowers into its own
-            // temporary and one AshStoreTerm rides an array beside it, and the
+            // temporary and one GeasStoreTerm rides an array beside it, and the
             // where primitive answers every row the whole predicate accepts.
             terms: *Vector<string> = alloc(vec_new())
             cg_query_terms(g, rs, pred2, terms)
             arr: string = cg_tmp(g)
             line: *StringBuilder = alloc(sb_new())
-            sb_push(line, "AshStoreTerm ")
+            sb_push(line, "GeasStoreTerm ")
             sb_push(line, arr)
             sb_push(line, "[] = { ")
             mut ti: int64 = 0
@@ -1243,9 +1243,9 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             free(line)
             cg_line(g, text)
             free(text)
-            callw: string = tmsg7(" = ash_store_query_where(cc, ", schref, ", ", arr, ", ", int_to_string(vec_len(terms)), tmsg5("u, &", out, ");", "", ""))
-            cg_line(g, tmsg3("AshStatus ", st, callw))
-            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            callw: string = tmsg7(" = geas_store_query_where(cc, ", schref, ", ", arr, ", ", int_to_string(vec_len(terms)), tmsg5("u, &", out, ");", "", ""))
+            cg_line(g, tmsg3("GeasStatus ", st, callw))
+            cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
         }
         // The ordered form: a predicate then asc(column) or desc(column). The
@@ -1288,9 +1288,9 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                         nterms_s: string = tmsg2(int_to_string(nterms2), "u, ")
                         ordcol_s: string = tmsg2(int_to_string(ordcol), "u, ")
                         tail: string = tmsg5(descflag, ", &", out, ");", "")
-                        callo: string = tmsg7(" = ash_store_query_ordered(cc, ", schref, ", ", arr2, ", ", nterms_s, tmsg2(ordcol_s, tail))
-                        cg_line(g, tmsg3("AshStatus ", st, callo))
-                        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+                        callo: string = tmsg7(" = geas_store_query_ordered(cc, ", schref, ", ", arr2, ", ", nterms_s, tmsg2(ordcol_s, tail))
+                        cg_line(g, tmsg3("GeasStatus ", st, callo))
+                        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
                         return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
                     }
                 }
@@ -1340,9 +1340,9 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             nterms4_s: string = tmsg2(int_to_string(nterms4), "u, ")
             ordcol4_s: string = tmsg2(int_to_string(ordcol), "u, ")
             tail4: string = tmsg7(descflag, ", &", lval.cvar, ", &", out, ");", "")
-            callp: string = tmsg7(" = ash_store_query_page(cc, ", schref, ", ", arr4, ", ", nterms4_s, tmsg2(ordcol4_s, tail4))
-            cg_line(g, tmsg3("AshStatus ", st, callp))
-            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            callp: string = tmsg7(" = geas_store_query_page(cc, ", schref, ", ", arr4, ", ", nterms4_s, tmsg2(ordcol4_s, tail4))
+            cg_line(g, tmsg3("GeasStatus ", st, callp))
+            cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
         }
         // The second argument is a bare column name the checker already
@@ -1365,9 +1365,9 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             return bad_val(g)
         }
         qval: CVal = gen_expr(g, cg_arg_expr(g, e, 2), col_ty)
-        callq: string = tmsg7(" = ash_store_query_eq(cc, ", schref, ", ", int_to_string(colidx), "u, &", qval.cvar, tmsg5(", &", out, ");", "", ""))
-        cg_line(g, tmsg3("AshStatus ", st, callq))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        callq: string = tmsg7(" = geas_store_query_eq(cc, ", schref, ", ", int_to_string(colidx), "u, &", qval.cvar, tmsg5(", &", out, ");", "", ""))
+        cg_line(g, tmsg3("GeasStatus ", st, callq))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
     }
     if str_eq(op, "count") {
@@ -1379,18 +1379,18 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         predc: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
         if cg_pred_has_or(g, predc) {
             ctarr, cgarr, cng := cg_dnf_arrays(g, rs, predc)
-            callca: string = tmsg7(" = ash_store_count_any(cc, ", schref, ", ", ctarr, ", ", cgarr, tmsg5(", ", cng, "u, &", out, ");"))
-            cg_line(g, tmsg3("AshStatus ", st, callca))
-            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            callca: string = tmsg7(" = geas_store_count_any(cc, ", schref, ", ", ctarr, ", ", cgarr, tmsg5(", ", cng, "u, &", out, ");"))
+            cg_line(g, tmsg3("GeasStatus ", st, callca))
+            cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, ty_int(t), err_ty) }
         }
         // The pure && predicate lowers to the same term array the where form
         // builds and the count primitive reads it, landing the Int the surface
         // promised in the fresh temporary.
         arrc, ntermsc := cg_build_term_array(g, rs, predc)
-        callc: string = tmsg7(" = ash_store_count_where(cc, ", schref, ", ", arrc, ", ", int_to_string(ntermsc), tmsg5("u, &", out, ");", "", ""))
-        cg_line(g, tmsg3("AshStatus ", st, callc))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        callc: string = tmsg7(" = geas_store_count_where(cc, ", schref, ", ", arrc, ", ", int_to_string(ntermsc), tmsg5("u, &", out, ");", "", ""))
+        cg_line(g, tmsg3("GeasStatus ", st, callc))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_int(t), err_ty) }
     }
     if str_eq(op, "sum") {
@@ -1424,17 +1424,17 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         preds: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 2))
         if cg_pred_has_or(g, preds) {
             starr, sgarr, sng := cg_dnf_arrays(g, rs, preds)
-            callsa_head: string = tmsg7(" = ash_store_sum_any(cc, ", schref, ", ", int_to_string(sumcol), "u, ", starr, ", ")
+            callsa_head: string = tmsg7(" = geas_store_sum_any(cc, ", schref, ", ", int_to_string(sumcol), "u, ", starr, ", ")
             callsa_tail: string = tmsg7(sgarr, ", ", sng, "u, &", out, ");", "")
             callsa: string = tmsg2(callsa_head, callsa_tail)
-            cg_line(g, tmsg3("AshStatus ", st, callsa))
-            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            cg_line(g, tmsg3("GeasStatus ", st, callsa))
+            cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, sum_col_ty, err_ty) }
         }
         arrs, ntermss := cg_build_term_array(g, rs, preds)
-        calls: string = tmsg7(" = ash_store_sum_where(cc, ", schref, ", ", int_to_string(sumcol), "u, ", arrs, tmsg5(", ", int_to_string(ntermss), "u, &", out, ");"))
-        cg_line(g, tmsg3("AshStatus ", st, calls))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        calls: string = tmsg7(" = geas_store_sum_where(cc, ", schref, ", ", int_to_string(sumcol), "u, ", arrs, tmsg5(", ", int_to_string(ntermss), "u, &", out, ");"))
+        cg_line(g, tmsg3("GeasStatus ", st, calls))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, sum_col_ty, err_ty) }
     }
     if str_eq(op, "min") || str_eq(op, "max") || str_eq(op, "avg") {
@@ -1446,7 +1446,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         // three are new, so no golden pins their bytes: the predicate always
         // normalizes to disjunctive normal form and rides the one group aware
         // primitive, a pure && predicate a single group of one and no special
-        // path. ash_store_agg_any lands the answer, an Option the runtime fills
+        // path. geas_store_agg_any lands the answer, an Option the runtime fills
         // Some on a match and None on the empty set, so the value is
         // Result<Option<Col>, StoreError>, and avg's own answer is a Float even
         // over an Int column.
@@ -1471,35 +1471,35 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         if str_eq(op, "avg") { aggkind = "2u" }
         predg: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 2))
         gtarr, ggarr, gng := cg_dnf_arrays(g, rs, predg)
-        callg_head: string = tmsg7(" = ash_store_agg_any(cc, ", schref, ", ", aggkind, ", ", int_to_string(aggcol), "u, ")
+        callg_head: string = tmsg7(" = geas_store_agg_any(cc, ", schref, ", ", aggkind, ", ", int_to_string(aggcol), "u, ")
         callg_tail: string = tmsg7(gtarr, ", ", ggarr, ", ", gng, "u, &", tmsg2(out, ");"))
         callg: string = tmsg2(callg_head, callg_tail)
-        cg_line(g, tmsg3("AshStatus ", st, callg))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        cg_line(g, tmsg3("GeasStatus ", st, callg))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         mut agg_ret: int64 = agg_col_ty
         if str_eq(op, "avg") { agg_ret = ty_float(t) }
         return CVal { cvar: out, ty: ty_result(t, ty_option(t, agg_ret), err_ty) }
     }
     if str_eq(op, "insert") {
         row: CVal = gen_expr(g, cg_arg_expr(g, e, 1), row_ty)
-        call2: string = tmsg5(" = ash_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))
-        cg_line(g, tmsg3("AshStatus ", st, call2))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        call2: string = tmsg5(" = geas_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("GeasStatus ", st, call2))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
     }
     if str_eq(op, "update") {
         key2: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
         row2: CVal = gen_expr(g, cg_arg_expr(g, e, 2), row_ty)
-        call3: string = tmsg7(" = ash_store_update(cc, ", schref, ", &", key2.cvar, tmsg5(", &", row2.cvar, ", &", out, ");"), "", "")
-        cg_line(g, tmsg3("AshStatus ", st, call3))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        call3: string = tmsg7(" = geas_store_update(cc, ", schref, ", &", key2.cvar, tmsg5(", &", row2.cvar, ", &", out, ");"), "", "")
+        cg_line(g, tmsg3("GeasStatus ", st, call3))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
     }
     if str_eq(op, "delete") {
         key3: CVal = gen_expr(g, cg_arg_expr(g, e, 1), pk_ty)
-        call4: string = tmsg5(" = ash_store_delete(cc, ", schref, ", &", key3.cvar, tmsg3(", &", out, ");"))
-        cg_line(g, tmsg3("AshStatus ", st, call4))
-        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        call4: string = tmsg5(" = geas_store_delete(cc, ", schref, ", &", key3.cvar, tmsg3(", &", out, ");"))
+        cg_line(g, tmsg3("GeasStatus ", st, call4))
+        cg_line(g, tmsg5("if (", st, " != GEAS_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, ty_unit(t), err_ty) }
     }
     cg_unsupported(g, e.lo, e.hi, tmsg3("the Store operation '", op, "' in a pledge body"))
@@ -1585,20 +1585,20 @@ export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
     if e.kind == xk_int() { return gen_int(g, e, want) }
     if e.kind == xk_float() {
         v: string = new_value(g)
-        set_ty(g, v, "ASH_TY_FLOAT")
+        set_ty(g, v, "GEAS_TY_FLOAT")
         cg_line(g, tmsg5(v, ".as.f = ", ast_name(a, e.a), ";", ""))
         return CVal { cvar: v, ty: ty_float(t) }
     }
     if e.kind == xk_str() { return gen_str(g, e) }
     if e.kind == xk_char() {
         v2: string = new_value(g)
-        set_ty(g, v2, "ASH_TY_CHAR")
+        set_ty(g, v2, "GEAS_TY_CHAR")
         cg_line(g, tmsg5(v2, ".as.ch = ", int_to_string(e.a), ";", ""))
         return CVal { cvar: v2, ty: ty_char(t) }
     }
     if e.kind == xk_bool() {
         v3: string = new_value(g)
-        set_ty(g, v3, "ASH_TY_BOOL")
+        set_ty(g, v3, "GEAS_TY_BOOL")
         cg_line(g, tmsg5(v3, ".as.b = ", int_to_string(e.a), ";", ""))
         return CVal { cvar: v3, ty: ty_bool(t) }
     }
@@ -1616,7 +1616,7 @@ export func gen_expr(g: *Cg, id: int64, want: int64) -> CVal {
         mt: int64 = lower_type((*g).sigs, e.a, e.lo, e.hi)
         mn: TyNode = ty_get(t, mt)
         mv: string = cg_tmp(g)
-        cg_line(g, tmsg7("AshValue ", mv, " = ash_map_new(cc, ", cg_tag_of(g, mn.a), ");", "", ""))
+        cg_line(g, tmsg7("GeasValue ", mv, " = geas_map_new(cc, ", cg_tag_of(g, mn.a), ");", "", ""))
         return CVal { cvar: mv, ty: mt }
     }
     if e.kind == xk_call() { return gen_call(g, e) }

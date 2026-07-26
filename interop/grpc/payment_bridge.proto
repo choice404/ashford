@@ -1,5 +1,5 @@
-// The step 1b bridge surface for skeleton/payment.ash, hand written to the
-// shape ashc emits in step 2. Every pledge is its own typed rpc, so a Go or
+// The step 1b bridge surface for skeleton/payment.geas, hand written to the
+// shape geas emits in step 2. Every pledge is its own typed rpc, so a Go or
 // Java consumer gets the contract's argument and result types from protoc
 // alone, with no generic Value envelope and no language side dispatch on a
 // pledge name string. The vow is an optional field on the sign call and the
@@ -11,13 +11,13 @@
 // instance's life, so the connection is the session again, exactly the
 // property the C ABI got free from the process. The unary pledge rpcs are
 // unchanged and still carry the instance id, because that is what protoc
-// turns into a typed call in a language with no Ashford binding.
+// turns into a typed call in a language with no Geas binding.
 
 syntax = "proto3";
-package ashford.payment;
+package geas.payment;
 
 // The sign call carries the vow overrides and the shape check, the two
-// things ash_contract_sign takes beside the contract name. currency unset
+// things geas_contract_sign takes beside the contract name. currency unset
 // takes the declared default, matching the vows dict a Python host omits.
 message SignRequest {
   optional string currency = 1;   // the vow; unset takes the declared default
@@ -68,7 +68,7 @@ message ValidateAmountRequest { uint64 instance_id = 1; double amount = 2; }
 message ChargeRequest         { uint64 instance_id = 1; string card = 2; double amount = 3; }
 message NotifyUserRequest     { uint64 instance_id = 1; bool ok = 2; }
 
-// The lifecycle states, ASH_UNSIGNED through ASH_BROKEN, in the runtime's
+// The lifecycle states, GEAS_UNSIGNED through GEAS_BROKEN, in the runtime's
 // own numbering.
 enum ContractState {
   UNSIGNED = 0;
@@ -83,7 +83,7 @@ message PledgeError { string pledge = 1; int64 err = 2; }
 message PartialRequest { uint64 instance_id = 1; }
 
 // The partial surface, name lists in the runtime's insertion order.
-// repeated, not map, so the order Ashford pins as normative survives the
+// repeated, not map, so the order Geas pins as normative survives the
 // wire.
 message PartialReply {
   ContractState state = 1;

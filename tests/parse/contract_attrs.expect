@@ -1,6 +1,6 @@
 File {
     imports: [
-        Import("ashstd.math"),
+        Import("std.math"),
     ],
     decls: [
         Contract {

@@ -1,10 +1,10 @@
-# The Ashford Bridge
+# The Geas Bridge
 
-Ashford connects languages in two shapes, and this document is the normative reference for the second. Inside one process, contracts glue languages over the C ABI: every language loads `libashrt`, signs, fulfills, and breaks in shared memory, and nothing is serialized. Across processes, contracts speak gRPC: the compiler emits the wire surface, stock tooling builds the clients, and the contract's lifecycle rides a protocol every language already carries. One contract, two boundaries, one lifecycle.
+Geas connects languages in two shapes, and this document is the normative reference for the second. Inside one process, contracts glue languages over the C ABI: every language loads `libgeasrt`, signs, fulfills, and breaks in shared memory, and nothing is serialized. Across processes, contracts speak gRPC: the compiler emits the wire surface, stock tooling builds the clients, and the contract's lifecycle rides a protocol every language already carries. One contract, two boundaries, one lifecycle.
 
 ## The emitted surface
 
-`ashc emit-proto file.ash` runs the whole front end and writes three artifacts into `target/ashc-out`, each byte stable for a given source and pinned as a golden:
+`geas emit-proto file.geas` runs the whole front end and writes three artifacts into `target/geas-out`, each byte stable for a given source and pinned as a golden:
 
 - `<stem>.proto`, the wire surface. Every public contract is its own service, every pledge its own typed rpc, so a consumer in any gRPC language gets the contract's argument and result types from protoc alone, with no generic value envelope and no dispatch on a name string.
 - `<stem>_session.go`, the Go session wrapper, living in the same package as protoc's output.
@@ -24,21 +24,21 @@ The wrappers pin the contract's shape hash as a constant, the same value the com
 
 ## Business and transport
 
-A contract's own `Err` is a value. It crosses as one arm of the result oneof on an OK rpc, exactly as it returns in process, and never becomes a transport error. An Ashford status is the transport and lifecycle layer, a fulfillment that did not run, and crosses as a gRPC code:
+A contract's own `Err` is a value. It crosses as one arm of the result oneof on an OK rpc, exactly as it returns in process, and never becomes a transport error. An Geas status is the transport and lifecycle layer, a fulfillment that did not run, and crosses as a gRPC code:
 
-| Ashford status    | gRPC code           |
+| Geas status    | gRPC code           |
 | ----------------- | ------------------- |
-| `ASH_ERR_STATE`   | FAILED_PRECONDITION |
-| `ASH_ERR_NAME`    | NOT_FOUND           |
-| `ASH_ERR_TYPE`    | INVALID_ARGUMENT    |
-| `ASH_ERR_VERSION` | ABORTED             |
-| `ASH_ERR_UNBOUND` | FAILED_PRECONDITION |
+| `GEAS_ERR_STATE`   | FAILED_PRECONDITION |
+| `GEAS_ERR_NAME`    | NOT_FOUND           |
+| `GEAS_ERR_TYPE`    | INVALID_ARGUMENT    |
+| `GEAS_ERR_VERSION` | ABORTED             |
+| `GEAS_ERR_UNBOUND` | FAILED_PRECONDITION |
 
 The split is the language's own line, drawn once and held across the wire.
 
 ## The type set
 
-Scalars cross as proto scalars, Int and UInt as their 64 bit forms, Float as double, Bool and String as themselves. A declared record is a message with its fields in declaration order. A declared sum whose arms are all bare is an enum numbered in declared arm order, the ABI's own tag space; a sum with a payload arm is a message whose oneof carries one message per arm in the same order. Unit is the empty message. Option and List ride oneof arms as wrapper messages and sit in fields as optional and repeated. A pledge may answer a bare Option and it crosses as the wrapper directly. Map and tuple are named build errors that write nothing, because proto's map carries no deterministic order and Ashford pins map iteration as insertion ordered; a service with a silent hole is worse than a refusal with a name.
+Scalars cross as proto scalars, Int and UInt as their 64 bit forms, Float as double, Bool and String as themselves. A declared record is a message with its fields in declaration order. A declared sum whose arms are all bare is an enum numbered in declared arm order, the ABI's own tag space; a sum with a payload arm is a message whose oneof carries one message per arm in the same order. Unit is the empty message. Option and List ride oneof arms as wrapper messages and sit in fields as optional and repeated. A pledge may answer a bare Option and it crosses as the wrapper directly. Map and tuple are named build errors that write nothing, because proto's map carries no deterministic order and Geas pins map iteration as insertion ordered; a service with a silent hole is worse than a refusal with a name.
 
 Message names carry no contract prefix while a file declares one public contract; a file with several prefixes every contract scoped message with its contract's name. The rpc spellings `Session`, `Resume`, `GetPartial`, and `Break` belong to the surface, and a pledge under one of those names is refused by name; a pledge spelled `sign` keeps its rpc and moves its request message alone to `SignPledgeRequest`.
 
@@ -52,7 +52,7 @@ Two replicas may hold one park store, and then the delete is the claim. A `Resum
 
 ## The server
 
-The reference bridge server is a Python host over `libashrt`: it loads the compiled module through the C ABI, binds host implementations over abstract pledges, and serves the emitted surface with grpc. Nothing about it is privileged. Any language that reaches the ABI can hold the runtime, and any language with a gRPC server can serve the surface, because the bridge is ordinary host code on one side and ordinary protobuf on the other. The gates stand the server up against clients in Python, Go, and Node, kill it between a park and a resume, and demand the contract finish on latches set before the death. A failover gate stands two replicas over one park store, kills the one that holds an instance, resumes it on the other, and then sets two replicas racing one token and demands exactly one win and one NOT_FOUND.
+The reference bridge server is a Python host over `libgeasrt`: it loads the compiled module through the C ABI, binds host implementations over abstract pledges, and serves the emitted surface with grpc. Nothing about it is privileged. Any language that reaches the ABI can hold the runtime, and any language with a gRPC server can serve the surface, because the bridge is ordinary host code on one side and ordinary protobuf on the other. The gates stand the server up against clients in Python, Go, and Node, kill it between a park and a resume, and demand the contract finish on latches set before the death. A failover gate stands two replicas over one park store, kills the one that holds an instance, resumes it on the other, and then sets two replicas racing one token and demands exactly one win and one NOT_FOUND.
 
 ## What the bridge does not do
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# The golden test runner for the ashford front end. Each suite directory pairs
-# with an ashc command: tests/lex with `ashc lex`, tests/parse with
-# `ashc parse`, and tests/check and tests/typeck with `ashc check`. Every NAME.ash with a
+# The golden test runner for the geas front end. Each suite directory pairs
+# with a geas command: tests/lex with `geas lex`, tests/parse with
+# `geas parse`, and tests/check and tests/typeck with `geas check`. Every NAME.geas with a
 # NAME.expect beside it must be accepted and its dump must match the golden
 # byte for byte; check writes nothing to stdout, so its goldens are a single
-# blank line guarding that silence. Every NAME.ash with a
+# blank line guarding that silence. Every NAME.geas with a
 # NAME.err beside it must be rejected: a nonzero exit and every line of the
 # .err file appearing somewhere in stderr as a substring, so a diagnostic can
 # gain context without breaking the suite. tests/check/mfa holds the
 # multi-file programs: only files with a golden beside them are roots, the
-# rest are modules the roots import. The ashc binary is rebuilt when
-# missing; set ASHC to test another build, or DUSK to build with another
+# rest are modules the roots import. The geas binary is rebuilt when
+# missing; set GEAS to test another build, or DUSK to build with another
 # toolchain.
 
 set -u
@@ -19,11 +19,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 DUSK="${DUSK:-dusk}"
-ASHC="${ASHC:-$ROOT/target/dusk-out/ashc}"
+GEAS="${GEAS:-$ROOT/target/dusk-out/geas}"
 
-if [ ! -x "$ASHC" ]; then
-    echo "[tests] building ashc with $DUSK" >&2
-    "$DUSK" build compiler/ashc.dusk || exit 1
+if [ ! -x "$GEAS" ]; then
+    echo "[tests] building geas with $DUSK" >&2
+    "$DUSK" build compiler/geas.dusk || exit 1
 fi
 
 pass=0
@@ -38,12 +38,12 @@ run_suite() {
     local dir="$1"
     local cmd="$2"
     local src name base out code err missing want
-    for src in tests/"$dir"/*.ash; do
-        name="${src%.ash}"
+    for src in tests/"$dir"/*.geas; do
+        name="${src%.geas}"
         base="$dir/$(basename "$name")"
 
         if [ -f "$name.expect" ]; then
-            out="$("$ASHC" "$cmd" "$src" 2>/dev/null)"
+            out="$("$GEAS" "$cmd" "$src" 2>/dev/null)"
             code=$?
             if [ "$code" -ne 0 ]; then
                 fail_case "$base" "expected exit 0, got $code"
@@ -56,7 +56,7 @@ run_suite() {
             fi
             pass=$((pass + 1))
         elif [ -f "$name.err" ]; then
-            err="$("$ASHC" "$cmd" "$src" 2>&1 >/dev/null)"
+            err="$("$GEAS" "$cmd" "$src" 2>&1 >/dev/null)"
             code=$?
             if [ "$code" -eq 0 ]; then
                 fail_case "$base" "expected rejection, got exit 0"
@@ -82,19 +82,19 @@ run_suite() {
     done
 }
 
-# The multi-file suite. Every NAME.ash in the directory with a NAME.expect
+# The multi-file suite. Every NAME.geas in the directory with a NAME.expect
 # or NAME.err beside it is a program root and runs exactly like a check
 # case; a file with neither is a helper another root imports and is skipped
 # rather than failed, since it is not a test by itself.
 run_multi_suite() {
     local dir="$1"
     local src name base out code err missing want
-    for src in tests/"$dir"/*.ash; do
-        name="${src%.ash}"
+    for src in tests/"$dir"/*.geas; do
+        name="${src%.geas}"
         base="$dir/$(basename "$name")"
 
         if [ -f "$name.expect" ]; then
-            out="$("$ASHC" check "$src" 2>/dev/null)"
+            out="$("$GEAS" check "$src" 2>/dev/null)"
             code=$?
             if [ "$code" -ne 0 ]; then
                 fail_case "$base" "expected exit 0, got $code"
@@ -107,7 +107,7 @@ run_multi_suite() {
             fi
             pass=$((pass + 1))
         elif [ -f "$name.err" ]; then
-            err="$("$ASHC" check "$src" 2>&1 >/dev/null)"
+            err="$("$GEAS" check "$src" 2>&1 >/dev/null)"
             code=$?
             if [ "$code" -eq 0 ]; then
                 fail_case "$base" "expected rejection, got exit 0"
@@ -131,20 +131,20 @@ run_multi_suite() {
     done
 }
 
-# The standalone reject suite. Every NAME.ash here breaks the entry point
-# rule some way, so `ashc build --bin` must refuse it with every line of the
+# The standalone reject suite. Every NAME.geas here breaks the entry point
+# rule some way, so `geas build --bin` must refuse it with every line of the
 # .err beside it on stderr; nothing in this directory is expected to build.
 run_bin_suite() {
     local src name base code err missing want
-    for src in tests/bin/*.ash; do
-        name="${src%.ash}"
+    for src in tests/bin/*.geas; do
+        name="${src%.geas}"
         base="bin/$(basename "$name")"
 
         if [ ! -f "$name.err" ]; then
             fail_case "$base" "no .err beside it"
             continue
         fi
-        err="$("$ASHC" build --bin "$src" 2>&1 >/dev/null)"
+        err="$("$GEAS" build --bin "$src" 2>&1 >/dev/null)"
         code=$?
         if [ "$code" -eq 0 ]; then
             fail_case "$base" "expected rejection, got exit 0"

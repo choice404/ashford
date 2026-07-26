@@ -1,5 +1,5 @@
 /* test_value.c: the runtime's deep value gate. No compiled module here, the
- * descriptors are handwritten so the test drives libashrt the way any host
+ * descriptors are handwritten so the test drives libgeasrt the way any host
  * embedding it directly would: register a contract, sign an instance as an
  * arena, build nested values with the deep helpers, deep copy them, and
  * prove the copy shares nothing with its source. The copy-in half runs a
@@ -7,7 +7,7 @@
  * only ever saw instance owned memory. Runs under ASan and LSan; a single
  * leaked block fails the build. */
 
-#include <ash/ash.h>
+#include <geas/geas.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,54 +24,54 @@ static int g_failures = 0;
         }                                                                  \
     } while (0)
 
-static AshValue str_val(const char* s) {
-    AshValue v;
+static GeasValue str_val(const char* s) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_STRING;
+    v.ty = GEAS_TY_STRING;
     v.as.s.ptr = (uint8_t*)s;
     v.as.s.len = strlen(s);
     return v;
 }
 
-static AshValue int_val(int64_t i) {
-    AshValue v;
+static GeasValue int_val(int64_t i) {
+    GeasValue v;
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_INT;
+    v.ty = GEAS_TY_INT;
     v.as.i = i;
     return v;
 }
 
 /* Structural equality, deep, for everything deep copy supports. */
-static int value_eq(const AshValue* a, const AshValue* b) {
+static int value_eq(const GeasValue* a, const GeasValue* b) {
     if (a->ty != b->ty || a->tag != b->tag) return 0;
-    switch ((AshTypeTag)a->ty) {
-    case ASH_TY_UNIT:   return 1;
-    case ASH_TY_INT:    return a->as.i == b->as.i;
-    case ASH_TY_UINT:   return a->as.u == b->as.u;
-    case ASH_TY_FLOAT:  return a->as.f == b->as.f;
-    case ASH_TY_BOOL:
-    case ASH_TY_BYTE:   return a->as.b == b->as.b;
-    case ASH_TY_CHAR:   return a->as.ch == b->as.ch;
-    case ASH_TY_STRING: return ash_string_eq(a, b);
-    case ASH_TY_LIST:
-    case ASH_TY_MAP:
-    case ASH_TY_TUPLE:
-    case ASH_TY_RECORD:
-    case ASH_TY_SUM: {
+    switch ((GeasTypeTag)a->ty) {
+    case GEAS_TY_UNIT:   return 1;
+    case GEAS_TY_INT:    return a->as.i == b->as.i;
+    case GEAS_TY_UINT:   return a->as.u == b->as.u;
+    case GEAS_TY_FLOAT:  return a->as.f == b->as.f;
+    case GEAS_TY_BOOL:
+    case GEAS_TY_BYTE:   return a->as.b == b->as.b;
+    case GEAS_TY_CHAR:   return a->as.ch == b->as.ch;
+    case GEAS_TY_STRING: return geas_string_eq(a, b);
+    case GEAS_TY_LIST:
+    case GEAS_TY_MAP:
+    case GEAS_TY_TUPLE:
+    case GEAS_TY_RECORD:
+    case GEAS_TY_SUM: {
         if (a->as.list.len != b->as.list.len) return 0;
-        const AshValue* xa = (const AshValue*)a->as.list.data;
-        const AshValue* xb = (const AshValue*)b->as.list.data;
+        const GeasValue* xa = (const GeasValue*)a->as.list.data;
+        const GeasValue* xb = (const GeasValue*)b->as.list.data;
         for (uint64_t i = 0; i < a->as.list.len; i++) {
             if (!value_eq(&xa[i], &xb[i])) return 0;
         }
         return 1;
     }
-    case ASH_TY_OPTION:
-    case ASH_TY_RESULT: {
+    case GEAS_TY_OPTION:
+    case GEAS_TY_RESULT: {
         if (!a->as.box && !b->as.box) return 1;
         if (!a->as.box || !b->as.box) return 0;
-        return value_eq((const AshValue*)a->as.box,
-                        (const AshValue*)b->as.box);
+        return value_eq((const GeasValue*)a->as.box,
+                        (const GeasValue*)b->as.box);
     }
     default:
         return 0;
@@ -83,274 +83,274 @@ static int value_eq(const AshValue* a, const AshValue* b) {
 /* The thunk stashes what it saw so the test can look at it after mutating
  * the host bytes the argument came from. The pointer aims into the frame on
  * the instance, valid until break. */
-static const AshValue* g_seen = NULL;
+static const GeasValue* g_seen = NULL;
 
-static AshStatus capture_fn(void* ctx, const AshValue* args, size_t nargs,
-                            AshValue* out) {
+static GeasStatus capture_fn(void* ctx, const GeasValue* args, size_t nargs,
+                            GeasValue* out) {
     (void)ctx;
-    if (nargs != 1 || args[0].ty != ASH_TY_STRING) return ASH_ERR_TYPE;
+    if (nargs != 1 || args[0].ty != GEAS_TY_STRING) return GEAS_ERR_TYPE;
     g_seen = &args[0];
     memset(out, 0, sizeof(*out));
-    out->ty = ASH_TY_UNIT;
-    return ASH_OK;
+    out->ty = GEAS_TY_UNIT;
+    return GEAS_OK;
 }
 
-static const AshPledgeDesc k_capture_pledges[] = {
-    { "capture", "__ash_test_capture", 1, capture_fn, -1 },
+static const GeasPledgeDesc k_capture_pledges[] = {
+    { "capture", "__geas_test_capture", 1, capture_fn, -1 },
 };
 
-static const AshContractDesc k_arena = {
+static const GeasContractDesc k_arena = {
     .name = "Arena", .shape_hash = 0x1ULL, .version = 1,
 };
 
-static const AshContractDesc k_capture = {
+static const GeasContractDesc k_capture = {
     .name = "Capture", .shape_hash = 0x2ULL, .version = 1,
     .npledges = 1, .pledges = k_capture_pledges,
 };
 
 /* ---- the tests ---- */
 
-static void test_list_of_tuples(AshContract* src_arena, AshContract* dst_arena) {
-    AshValue list;
-    CHECK(ash_list_new(src_arena, ASH_TY_TUPLE, 2, &list) == ASH_OK,
+static void test_list_of_tuples(GeasContract* src_arena, GeasContract* dst_arena) {
+    GeasValue list;
+    CHECK(geas_list_new(src_arena, GEAS_TY_TUPLE, 2, &list) == GEAS_OK,
           "list_new");
 
     const char* names[] = { "alpha", "beta", "gamma" };
     for (int i = 0; i < 3; i++) {
-        AshValue tup;
-        CHECK(ash_tuple_new(src_arena, 2, &tup) == ASH_OK, "tuple_new");
-        AshValue* slots = (AshValue*)tup.as.list.data;
-        AshValue s = str_val(names[i]);
-        CHECK(ash_value_deep_copy(src_arena, &s, &slots[0]) == ASH_OK,
+        GeasValue tup;
+        CHECK(geas_tuple_new(src_arena, 2, &tup) == GEAS_OK, "tuple_new");
+        GeasValue* slots = (GeasValue*)tup.as.list.data;
+        GeasValue s = str_val(names[i]);
+        CHECK(geas_value_deep_copy(src_arena, &s, &slots[0]) == GEAS_OK,
               "deep copy string into tuple");
         slots[1] = int_val(i * 10);
-        CHECK(ash_list_push(src_arena, &list, &tup) == ASH_OK, "list_push");
+        CHECK(geas_list_push(src_arena, &list, &tup) == GEAS_OK, "list_push");
     }
     CHECK(list.as.list.len == 3, "list length after pushes");
     CHECK(list.as.list.cap >= 3, "list grew past its initial capacity");
 
     /* Push of a mismatched element is refused. */
-    AshValue wrong = int_val(7);
-    CHECK(ash_list_push(src_arena, &list, &wrong) == ASH_ERR_TYPE,
+    GeasValue wrong = int_val(7);
+    CHECK(geas_list_push(src_arena, &list, &wrong) == GEAS_ERR_TYPE,
           "push of the wrong element type");
 
     /* Out of range and non-list gets are NULL. */
-    CHECK(ash_list_get(&list, 3) == NULL, "get past the end");
-    CHECK(ash_list_get(&wrong, 0) == NULL, "get on a non-list");
+    CHECK(geas_list_get(&list, 3) == NULL, "get past the end");
+    CHECK(geas_list_get(&wrong, 0) == NULL, "get on a non-list");
 
-    AshValue copy;
-    CHECK(ash_value_deep_copy(dst_arena, &list, &copy) == ASH_OK,
+    GeasValue copy;
+    CHECK(geas_value_deep_copy(dst_arena, &list, &copy) == GEAS_OK,
           "deep copy of the nested list");
     CHECK(value_eq(&list, &copy), "copy is structurally equal");
     CHECK(copy.as.list.data != list.as.list.data,
           "copy owns its own element array");
 
-    const AshValue* t0 = ash_list_get(&list, 0);
-    const AshValue* c0 = ash_list_get(&copy, 0);
+    const GeasValue* t0 = geas_list_get(&list, 0);
+    const GeasValue* c0 = geas_list_get(&copy, 0);
     CHECK(t0 && c0 && t0->as.list.data != c0->as.list.data,
           "copied tuple owns its own slots");
-    const AshValue* s0 = ash_list_get(t0, 0);
-    const AshValue* cs0 = ash_list_get(c0, 0);
+    const GeasValue* s0 = geas_list_get(t0, 0);
+    const GeasValue* cs0 = geas_list_get(c0, 0);
     CHECK(s0 && cs0 && s0->as.s.ptr != cs0->as.s.ptr,
           "copied string owns its own bytes");
 }
 
-static void test_option_result_nesting(AshContract* arena,
-                                       AshContract* dst_arena) {
+static void test_option_result_nesting(GeasContract* arena,
+                                       GeasContract* dst_arena) {
     /* Err(Some("deep")) : a Result wrapping an Option wrapping a String. */
-    AshValue inner_str = ash_string_copy(arena, (const uint8_t*)"deep", 4);
+    GeasValue inner_str = geas_string_copy(arena, (const uint8_t*)"deep", 4);
 
-    AshValue some;
+    GeasValue some;
     memset(&some, 0, sizeof(some));
-    some.ty = ASH_TY_OPTION;
+    some.ty = GEAS_TY_OPTION;
     some.tag = 1;
-    some.as.box = ash_box(arena);
-    *(AshValue*)some.as.box = inner_str;
+    some.as.box = geas_box(arena);
+    *(GeasValue*)some.as.box = inner_str;
 
-    AshValue err;
+    GeasValue err;
     memset(&err, 0, sizeof(err));
-    err.ty = ASH_TY_RESULT;
+    err.ty = GEAS_TY_RESULT;
     err.tag = 1;
-    err.as.box = ash_box(arena);
-    *(AshValue*)err.as.box = some;
+    err.as.box = geas_box(arena);
+    *(GeasValue*)err.as.box = some;
 
-    AshValue copy;
-    CHECK(ash_value_deep_copy(dst_arena, &err, &copy) == ASH_OK,
+    GeasValue copy;
+    CHECK(geas_value_deep_copy(dst_arena, &err, &copy) == GEAS_OK,
           "deep copy of Err(Some(String))");
     CHECK(value_eq(&err, &copy), "nested copy is structurally equal");
     CHECK(copy.as.box != err.as.box, "copied Result owns its own box");
-    const AshValue* copt = (const AshValue*)copy.as.box;
-    const AshValue* oopt = (const AshValue*)err.as.box;
+    const GeasValue* copt = (const GeasValue*)copy.as.box;
+    const GeasValue* oopt = (const GeasValue*)err.as.box;
     CHECK(copt->as.box != oopt->as.box, "copied Option owns its own box");
 
     /* None carries a null box and copies to one. */
-    AshValue none;
+    GeasValue none;
     memset(&none, 0, sizeof(none));
-    none.ty = ASH_TY_OPTION;
-    CHECK(ash_value_deep_copy(dst_arena, &none, &copy) == ASH_OK,
+    none.ty = GEAS_TY_OPTION;
+    CHECK(geas_value_deep_copy(dst_arena, &none, &copy) == GEAS_OK,
           "deep copy of None");
-    CHECK(copy.ty == ASH_TY_OPTION && copy.tag == 0 && copy.as.box == NULL,
+    CHECK(copy.ty == GEAS_TY_OPTION && copy.tag == 0 && copy.as.box == NULL,
           "None copies to None");
 
 }
 
-static void check_render(const AshValue* v, const char* want,
+static void check_render(const GeasValue* v, const char* want,
                          const char* what);
 
-static void test_map(AshContract* arena, AshContract* dst_arena) {
-    AshValue m = ash_map_new(arena, ASH_TY_STRING);
-    CHECK(m.ty == ASH_TY_MAP && m.as.list.elem_ty == ASH_TY_STRING &&
+static void test_map(GeasContract* arena, GeasContract* dst_arena) {
+    GeasValue m = geas_map_new(arena, GEAS_TY_STRING);
+    CHECK(m.ty == GEAS_TY_MAP && m.as.list.elem_ty == GEAS_TY_STRING &&
               m.as.list.len == 0,
           "a fresh map is empty and carries its key tag");
 
     /* Insert, then update in place: the pair count stays put and the key
      * keeps its insertion slot. */
-    AshValue ka = str_val("ada");
-    AshValue kb = str_val("bob");
-    AshValue v36 = int_val(36);
-    CHECK(ash_map_set(arena, &m, &ka, &v36) == ASH_OK, "map set ada");
-    AshValue v40 = int_val(40);
-    CHECK(ash_map_set(arena, &m, &kb, &v40) == ASH_OK, "map set bob");
-    AshValue v37 = int_val(37);
-    CHECK(ash_map_set(arena, &m, &ka, &v37) == ASH_OK, "map update ada");
+    GeasValue ka = str_val("ada");
+    GeasValue kb = str_val("bob");
+    GeasValue v36 = int_val(36);
+    CHECK(geas_map_set(arena, &m, &ka, &v36) == GEAS_OK, "map set ada");
+    GeasValue v40 = int_val(40);
+    CHECK(geas_map_set(arena, &m, &kb, &v40) == GEAS_OK, "map set bob");
+    GeasValue v37 = int_val(37);
+    CHECK(geas_map_set(arena, &m, &ka, &v37) == GEAS_OK, "map update ada");
     CHECK(m.as.list.len == 4, "two pairs after the update, len 4");
 
-    const AshValue* got = NULL;
-    CHECK(ash_map_get(&m, &ka, &got) == 1 && got && got->as.i == 37,
+    const GeasValue* got = NULL;
+    CHECK(geas_map_get(&m, &ka, &got) == 1 && got && got->as.i == 37,
           "get ada reads the updated value");
-    CHECK(ash_map_get(&m, &kb, &got) == 1 && got && got->as.i == 40,
+    CHECK(geas_map_get(&m, &kb, &got) == 1 && got && got->as.i == 40,
           "get bob hits");
-    AshValue kz = str_val("zed");
-    CHECK(ash_map_get(&m, &kz, &got) == 0, "get zed misses, never a fault");
-    AshValue ki = int_val(7);
-    CHECK(ash_map_get(&m, &ki, &got) == 0,
+    GeasValue kz = str_val("zed");
+    CHECK(geas_map_get(&m, &kz, &got) == 0, "get zed misses, never a fault");
+    GeasValue ki = int_val(7);
+    CHECK(geas_map_get(&m, &ki, &got) == 0,
           "a key of the wrong tag reads as a miss");
-    CHECK(ash_map_set(arena, &m, &ki, &v37) == ASH_ERR_TYPE,
+    CHECK(geas_map_set(arena, &m, &ki, &v37) == GEAS_ERR_TYPE,
           "set with a key of the wrong tag is refused");
 
     /* The set deep copied the host's key bytes. */
-    const AshValue* k0 = &((const AshValue*)m.as.list.data)[0];
+    const GeasValue* k0 = &((const GeasValue*)m.as.list.data)[0];
     CHECK(k0->as.s.ptr != ka.as.s.ptr, "the stored key owns its own bytes");
 
     /* Deep copy shares nothing with its source and compares equal. */
-    AshValue copy;
-    CHECK(ash_value_deep_copy(dst_arena, &m, &copy) == ASH_OK,
+    GeasValue copy;
+    CHECK(geas_value_deep_copy(dst_arena, &m, &copy) == GEAS_OK,
           "deep copy of a map");
     CHECK(value_eq(&m, &copy), "map copy is structurally equal");
-    CHECK(ash_value_eq(&m, &copy), "the runtime eq agrees");
+    CHECK(geas_value_eq(&m, &copy), "the runtime eq agrees");
     CHECK(copy.as.list.data != m.as.list.data,
           "map copy owns its own pair array");
-    const AshValue* ck0 = &((const AshValue*)copy.as.list.data)[0];
+    const GeasValue* ck0 = &((const GeasValue*)copy.as.list.data)[0];
     CHECK(ck0->as.s.ptr != k0->as.s.ptr,
           "map copy owns its own key bytes");
 
     /* Insertion order is part of equality: the same pairs written in the
      * other order read unequal. */
-    AshValue swapped = ash_map_new(arena, ASH_TY_STRING);
-    CHECK(ash_map_set(arena, &swapped, &kb, &v40) == ASH_OK, "swapped bob");
-    CHECK(ash_map_set(arena, &swapped, &ka, &v37) == ASH_OK, "swapped ada");
-    CHECK(!ash_value_eq(&m, &swapped),
+    GeasValue swapped = geas_map_new(arena, GEAS_TY_STRING);
+    CHECK(geas_map_set(arena, &swapped, &kb, &v40) == GEAS_OK, "swapped bob");
+    CHECK(geas_map_set(arena, &swapped, &ka, &v37) == GEAS_OK, "swapped ada");
+    CHECK(!geas_value_eq(&m, &swapped),
           "the same pairs in another insertion order read unequal");
 
     /* The canonical render: pairs in insertion order, and {} when empty. */
     check_render(&m, "{\"ada\": 37, \"bob\": 40}", "render a map");
-    AshValue empty = ash_map_new(arena, ASH_TY_STRING);
+    GeasValue empty = geas_map_new(arena, GEAS_TY_STRING);
     check_render(&empty, "{}", "render an empty map");
 
     /* An Option nests as a map value: the box deep copies with the map. */
-    AshValue optmap = ash_map_new(arena, ASH_TY_STRING);
-    AshValue some;
+    GeasValue optmap = geas_map_new(arena, GEAS_TY_STRING);
+    GeasValue some;
     memset(&some, 0, sizeof(some));
-    some.ty = ASH_TY_OPTION;
+    some.ty = GEAS_TY_OPTION;
     some.tag = 1;
-    some.as.box = ash_box(arena);
-    *(AshValue*)some.as.box = int_val(7);
-    AshValue kq = str_val("maybe");
-    CHECK(ash_map_set(arena, &optmap, &kq, &some) == ASH_OK,
+    some.as.box = geas_box(arena);
+    *(GeasValue*)some.as.box = int_val(7);
+    GeasValue kq = str_val("maybe");
+    CHECK(geas_map_set(arena, &optmap, &kq, &some) == GEAS_OK,
           "set a Some valued pair");
-    CHECK(ash_map_get(&optmap, &kq, &got) == 1 && got &&
-              got->ty == ASH_TY_OPTION && got->tag == 1 &&
+    CHECK(geas_map_get(&optmap, &kq, &got) == 1 && got &&
+              got->ty == GEAS_TY_OPTION && got->tag == 1 &&
               got->as.box != some.as.box,
           "the stored Some owns its own box");
-    AshValue optcopy;
-    CHECK(ash_value_deep_copy(dst_arena, &optmap, &optcopy) == ASH_OK,
+    GeasValue optcopy;
+    CHECK(geas_value_deep_copy(dst_arena, &optmap, &optcopy) == GEAS_OK,
           "deep copy of an Option valued map");
     CHECK(value_eq(&optmap, &optcopy), "Option valued map copy is equal");
     check_render(&optmap, "{\"maybe\": Some(7)}",
                  "render an Option valued map");
 }
 
-static void test_record_copy(AshContract* arena, AshContract* dst_arena) {
+static void test_record_copy(GeasContract* arena, GeasContract* dst_arena) {
     /* A two field record: a String field and an Int field, fields in
      * declaration order on the shared list arm. */
-    AshValue* fields = (AshValue*)ash_bytes(arena, 2 * sizeof(AshValue));
+    GeasValue* fields = (GeasValue*)geas_bytes(arena, 2 * sizeof(GeasValue));
     CHECK(fields != NULL, "record field array");
     if (!fields) return;
-    fields[0] = ash_string_copy(arena, (const uint8_t*)"card", 4);
+    fields[0] = geas_string_copy(arena, (const uint8_t*)"card", 4);
     fields[1] = int_val(42);
 
-    AshValue rec;
+    GeasValue rec;
     memset(&rec, 0, sizeof(rec));
-    rec.ty = ASH_TY_RECORD;
+    rec.ty = GEAS_TY_RECORD;
     rec.as.list.data = fields;
     rec.as.list.len = 2;
     rec.as.list.cap = 2;
 
-    AshValue copy;
-    CHECK(ash_value_deep_copy(dst_arena, &rec, &copy) == ASH_OK,
+    GeasValue copy;
+    CHECK(geas_value_deep_copy(dst_arena, &rec, &copy) == GEAS_OK,
           "deep copy of a record");
     CHECK(value_eq(&rec, &copy), "record copy is structurally equal");
     CHECK(copy.as.list.data != rec.as.list.data,
           "record copy owns its own field array");
-    const AshValue* cf = (const AshValue*)copy.as.list.data;
+    const GeasValue* cf = (const GeasValue*)copy.as.list.data;
     CHECK(cf[0].as.s.ptr != fields[0].as.s.ptr,
           "record copy owns its own string bytes");
 }
 
-static void test_sum_copy(AshContract* arena, AshContract* dst_arena) {
+static void test_sum_copy(GeasContract* arena, GeasContract* dst_arena) {
     /* A payload carrying variant: tag 1 with one String field. */
-    AshValue* payload = (AshValue*)ash_bytes(arena, sizeof(AshValue));
+    GeasValue* payload = (GeasValue*)geas_bytes(arena, sizeof(GeasValue));
     CHECK(payload != NULL, "sum payload array");
     if (!payload) return;
-    payload[0] = ash_string_copy(arena, (const uint8_t*)"overflow", 8);
+    payload[0] = geas_string_copy(arena, (const uint8_t*)"overflow", 8);
 
-    AshValue sum;
+    GeasValue sum;
     memset(&sum, 0, sizeof(sum));
-    sum.ty = ASH_TY_SUM;
+    sum.ty = GEAS_TY_SUM;
     sum.tag = 1;
     sum.as.list.data = payload;
     sum.as.list.len = 1;
     sum.as.list.cap = 1;
 
-    AshValue copy;
-    CHECK(ash_value_deep_copy(dst_arena, &sum, &copy) == ASH_OK,
+    GeasValue copy;
+    CHECK(geas_value_deep_copy(dst_arena, &sum, &copy) == GEAS_OK,
           "deep copy of a payload variant");
-    CHECK(copy.ty == ASH_TY_SUM && copy.tag == 1,
+    CHECK(copy.ty == GEAS_TY_SUM && copy.tag == 1,
           "sum copy keeps its variant tag");
     CHECK(value_eq(&sum, &copy), "sum copy is structurally equal");
     CHECK(copy.as.list.data != sum.as.list.data,
           "sum copy owns its own payload array");
 
     /* A bare variant: tag alone, an empty payload arm. */
-    AshValue bare;
+    GeasValue bare;
     memset(&bare, 0, sizeof(bare));
-    bare.ty = ASH_TY_SUM;
+    bare.ty = GEAS_TY_SUM;
     bare.tag = 2;
-    CHECK(ash_value_deep_copy(dst_arena, &bare, &copy) == ASH_OK,
+    CHECK(geas_value_deep_copy(dst_arena, &bare, &copy) == GEAS_OK,
           "deep copy of a bare variant");
-    CHECK(copy.ty == ASH_TY_SUM && copy.tag == 2 && copy.as.list.len == 0,
+    CHECK(copy.ty == GEAS_TY_SUM && copy.tag == 2 && copy.as.list.len == 0,
           "bare variant copies to a bare variant");
-    CHECK(!ash_value_eq(&bare, &sum), "different variants read unequal");
-    CHECK(ash_value_eq(&bare, &copy), "same variant reads equal");
+    CHECK(!geas_value_eq(&bare, &sum), "different variants read unequal");
+    CHECK(geas_value_eq(&bare, &copy), "same variant reads equal");
 }
 
 /* Renders v and compares against the expected debug spelling, checking the
  * size protocol on the way: the sizing call reports the exact need, a cap
  * one short is refused with nothing written, and the full cap round trips. */
-static void check_render(const AshValue* v, const char* want, const char* what) {
+static void check_render(const GeasValue* v, const char* want, const char* what) {
     size_t need = 0;
-    CHECK(ash_value_render(v, NULL, 0, &need) == ASH_ERR_OOM,
-          "sizing call reports ASH_ERR_OOM");
+    CHECK(geas_value_render(v, NULL, 0, &need) == GEAS_ERR_OOM,
+          "sizing call reports GEAS_ERR_OOM");
     CHECK(need == strlen(want) + 1, what);
     char buf[256];
     if (need > sizeof buf) {
@@ -358,20 +358,20 @@ static void check_render(const AshValue* v, const char* want, const char* what) 
         return;
     }
     buf[0] = 'Z';
-    CHECK(ash_value_render(v, buf, need - 1, &need) == ASH_ERR_OOM,
+    CHECK(geas_value_render(v, buf, need - 1, &need) == GEAS_ERR_OOM,
           "a short cap is refused");
     CHECK(buf[0] == 'Z', "a short cap writes nothing");
-    CHECK(ash_value_render(v, buf, sizeof buf, &need) == ASH_OK,
+    CHECK(geas_value_render(v, buf, sizeof buf, &need) == GEAS_OK,
           "render with room succeeds");
     CHECK(strcmp(buf, want) == 0, what);
 }
 
-static void test_render(AshContract* arena) {
-    AshValue v = int_val(-42);
+static void test_render(GeasContract* arena) {
+    GeasValue v = int_val(-42);
     check_render(&v, "-42", "render Int");
 
     memset(&v, 0, sizeof(v));
-    v.ty = ASH_TY_BOOL;
+    v.ty = GEAS_TY_BOOL;
     v.as.b = 1;
     check_render(&v, "true", "render Bool");
 
@@ -379,86 +379,86 @@ static void test_render(AshContract* arena) {
     check_render(&v, "\"say \\\"hi\\\"\\x0a\"", "render String escapes");
 
     /* Err(Some("deep")): the boxed shapes recurse. */
-    AshValue some;
+    GeasValue some;
     memset(&some, 0, sizeof(some));
-    some.ty = ASH_TY_OPTION;
+    some.ty = GEAS_TY_OPTION;
     some.tag = 1;
-    some.as.box = ash_box(arena);
-    *(AshValue*)some.as.box = ash_string_copy(arena, (const uint8_t*)"deep", 4);
-    AshValue err;
+    some.as.box = geas_box(arena);
+    *(GeasValue*)some.as.box = geas_string_copy(arena, (const uint8_t*)"deep", 4);
+    GeasValue err;
     memset(&err, 0, sizeof(err));
-    err.ty = ASH_TY_RESULT;
+    err.ty = GEAS_TY_RESULT;
     err.tag = 1;
-    err.as.box = ash_box(arena);
-    *(AshValue*)err.as.box = some;
+    err.as.box = geas_box(arena);
+    *(GeasValue*)err.as.box = some;
     check_render(&err, "Err(Some(\"deep\"))", "render Err(Some(String))");
 
     /* A payload variant and a list of a tuple, the deep composite arms. */
-    AshValue* payload = (AshValue*)ash_bytes(arena, sizeof(AshValue));
+    GeasValue* payload = (GeasValue*)geas_bytes(arena, sizeof(GeasValue));
     payload[0] = str_val("overflow");
-    AshValue sum;
+    GeasValue sum;
     memset(&sum, 0, sizeof(sum));
-    sum.ty = ASH_TY_SUM;
+    sum.ty = GEAS_TY_SUM;
     sum.tag = 1;
     sum.as.list.data = payload;
     sum.as.list.len = 1;
     sum.as.list.cap = 1;
     check_render(&sum, "#1(\"overflow\")", "render a payload variant");
 
-    AshValue tup;
-    CHECK(ash_tuple_new(arena, 2, &tup) == ASH_OK, "render tuple_new");
-    ((AshValue*)tup.as.list.data)[0] = str_val("alpha");
-    ((AshValue*)tup.as.list.data)[1] = int_val(10);
-    AshValue list;
-    CHECK(ash_list_new(arena, ASH_TY_TUPLE, 1, &list) == ASH_OK,
+    GeasValue tup;
+    CHECK(geas_tuple_new(arena, 2, &tup) == GEAS_OK, "render tuple_new");
+    ((GeasValue*)tup.as.list.data)[0] = str_val("alpha");
+    ((GeasValue*)tup.as.list.data)[1] = int_val(10);
+    GeasValue list;
+    CHECK(geas_list_new(arena, GEAS_TY_TUPLE, 1, &list) == GEAS_OK,
           "render list_new");
-    CHECK(ash_list_push(arena, &list, &tup) == ASH_OK, "render list_push");
+    CHECK(geas_list_push(arena, &list, &tup) == GEAS_OK, "render list_push");
     check_render(&list, "[(\"alpha\", 10)]", "render a list of tuples");
 
     /* Past the depth limit the render prints ... instead of recursing. */
-    AshValue deep;
+    GeasValue deep;
     memset(&deep, 0, sizeof(deep));
-    deep.ty = ASH_TY_OPTION;
+    deep.ty = GEAS_TY_OPTION;
     deep.tag = 1;
     deep.as.box = NULL;
     for (int i = 0; i < 12; i++) {
-        AshValue* box = ash_box(arena);
+        GeasValue* box = geas_box(arena);
         *box = deep;
         memset(&deep, 0, sizeof(deep));
-        deep.ty = ASH_TY_OPTION;
+        deep.ty = GEAS_TY_OPTION;
         deep.tag = 1;
         deep.as.box = box;
     }
     char buf[256];
     size_t need = 0;
-    CHECK(ash_value_render(&deep, buf, sizeof buf, &need) == ASH_OK,
+    CHECK(geas_value_render(&deep, buf, sizeof buf, &need) == GEAS_OK,
           "render a deep nest");
     CHECK(strstr(buf, "...") != NULL, "the depth limit cuts the recursion");
 
-    CHECK(ash_value_render(NULL, buf, sizeof buf, &need) == ASH_ERR_TYPE,
+    CHECK(geas_value_render(NULL, buf, sizeof buf, &need) == GEAS_ERR_TYPE,
           "render of NULL is refused");
 }
 
-static void test_copy_in_isolation(AshContract* cap) {
+static void test_copy_in_isolation(GeasContract* cap) {
     /* The host's mutable bytes. The fulfill deep copies them onto the
      * instance; scribbling over them afterwards must not reach the thunk's
      * view. */
     char buf[] = "original";
-    AshValue arg;
+    GeasValue arg;
     memset(&arg, 0, sizeof(arg));
-    arg.ty = ASH_TY_STRING;
+    arg.ty = GEAS_TY_STRING;
     arg.as.s.ptr = (uint8_t*)buf;
     arg.as.s.len = 8;
 
-    AshValue out;
-    CHECK(ash_pledge_fulfill_sync(cap, "capture", &arg, 1, NULL, 0, &out) ==
-              ASH_OK,
+    GeasValue out;
+    CHECK(geas_pledge_fulfill_sync(cap, "capture", &arg, 1, NULL, 0, &out) ==
+              GEAS_OK,
           "capture fulfill");
     memset(buf, 'X', 8);
 
     CHECK(g_seen != NULL, "the thunk saw a frame");
     if (g_seen) {
-        CHECK(g_seen->ty == ASH_TY_STRING && g_seen->as.s.len == 8,
+        CHECK(g_seen->ty == GEAS_TY_STRING && g_seen->as.s.len == 8,
               "captured slot shape");
         CHECK(memcmp(g_seen->as.s.ptr, "original", 8) == 0,
               "captured bytes untouched by the host mutation");
@@ -468,19 +468,19 @@ static void test_copy_in_isolation(AshContract* cap) {
 }
 
 int main(void) {
-    AshRuntime* rt = NULL;
-    CHECK(ash_runtime_init(NULL, &rt) == ASH_OK, "runtime init");
-    CHECK(ash_register_contract(rt, &k_arena) == ASH_OK, "register Arena");
-    CHECK(ash_register_contract(rt, &k_capture) == ASH_OK, "register Capture");
+    GeasRuntime* rt = NULL;
+    CHECK(geas_runtime_init(NULL, &rt) == GEAS_OK, "runtime init");
+    CHECK(geas_register_contract(rt, &k_arena) == GEAS_OK, "register Arena");
+    CHECK(geas_register_contract(rt, &k_capture) == GEAS_OK, "register Capture");
 
-    AshContract* src = NULL;
-    AshContract* dst = NULL;
-    AshContract* cap = NULL;
-    CHECK(ash_contract_sign(rt, "Arena", NULL, 0, 0, &src) == ASH_OK,
+    GeasContract* src = NULL;
+    GeasContract* dst = NULL;
+    GeasContract* cap = NULL;
+    CHECK(geas_contract_sign(rt, "Arena", NULL, 0, 0, &src) == GEAS_OK,
           "sign the source arena");
-    CHECK(ash_contract_sign(rt, "Arena", NULL, 0, 0, &dst) == ASH_OK,
+    CHECK(geas_contract_sign(rt, "Arena", NULL, 0, 0, &dst) == GEAS_OK,
           "sign the destination arena");
-    CHECK(ash_contract_sign(rt, "Capture", NULL, 0, 0, &cap) == ASH_OK,
+    CHECK(geas_contract_sign(rt, "Capture", NULL, 0, 0, &cap) == GEAS_OK,
           "sign Capture");
 
     if (src && dst && cap) {
@@ -493,10 +493,10 @@ int main(void) {
         test_copy_in_isolation(cap);
     }
 
-    CHECK(ash_contract_break(src) == ASH_OK, "break the source arena");
-    CHECK(ash_contract_break(dst) == ASH_OK, "break the destination arena");
-    CHECK(ash_contract_break(cap) == ASH_OK, "break Capture");
-    ash_runtime_shutdown(rt);
+    CHECK(geas_contract_break(src) == GEAS_OK, "break the source arena");
+    CHECK(geas_contract_break(dst) == GEAS_OK, "break the destination arena");
+    CHECK(geas_contract_break(cap) == GEAS_OK, "break Capture");
+    geas_runtime_shutdown(rt);
 
     if (g_failures) {
         fprintf(stderr, "[test_value] %d check(s) failed\n", g_failures);

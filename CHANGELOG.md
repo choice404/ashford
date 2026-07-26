@@ -1,6 +1,26 @@
 # Changelog
 
-Every released version of Ashford, newest first. A commit message carries the
+Every released version of Geas, newest first. The language was named
+Ashford through v0.6.8; entries below the rename keep the names they
+shipped with, because a changelog that rewrites its own past is not one.
+
+## [v0.7.0] the true name
+
+The language is Geas. A geas, in Celtic myth, is a binding obligation
+laid on a person: keep it and it protects you, break it and the
+consequences find you, which is not a metaphor for this language but a
+description of it. Ashford was a placeholder that never earned its
+keep; the rename lands now, before anything is published, so nothing
+downstream ever carries the old name. Every surface renames in one
+sweep and every gate in the repository re proves itself under the new
+one.
+
+- rename the whole surface: the compiler is geas, sources end in .geas, the runtime is libgeasrt.so, the headers live under geas/ as geas.h, geas_abi.h, geas_wire.h, and geas_store.h, the C prefix is geas_ and GEAS_, the mangled prefix is __geas_, the park table is geas_park, and GEAS_ROOT replaces ASH_ROOT
+- rename the standard library to what it is: lib/std, imported as std.store and the rest, because the language's own name does not belong in its import paths
+- rename the hosts with the runtime: the Python binding is geas.py with Geas typed names, the Go module is geasbridge, and the bridge, supervisor, and demo hosts follow
+- keep the changelog's past tense honest: entries before this one keep the names they shipped with, and only this entry knows both
+- re prove everything: the full suite, the determinism gate, every proto golden regenerated under the new type names, the five bridge gates, and both supervisor gates, all green under the new name
+- say what the name means where a reader first meets it: the README carries the geas, the pronunciation, and why the name is a description rather than a metaphor A commit message carries the
 short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.

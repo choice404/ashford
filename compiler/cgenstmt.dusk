@@ -1,13 +1,13 @@
 // cgenstmt: lowering statements and blocks to C. A block opens a scope on
 // both sides of the fence at once, a brace pair in the C and a scope frame in
-// the emitter, so an ashford binding lives exactly as long as the C variable
+// the emitter, so a geas binding lives exactly as long as the C variable
 // that carries it. The statement set is the whole grammar now: let with a
 // fresh copy per binding so a later assignment never writes through an
 // aliased name, assignment through the in-place lvalue walk, a mut local, a
 // record field slot, a bounds checked list slot, or a map entry, chained to
 // any depth, if with else, while and for lowered onto real C loops so
 // break and continue map one to one, and return, which writes the pledge's
-// value through the thunk's out parameter and reports ASH_OK, the one exit
+// value through the thunk's out parameter and reports GEAS_OK, the one exit
 // convention every thunk shares.
 
 @paradigm procedural
@@ -39,19 +39,19 @@ func gen_let(g: *Cg, s: StmtNode) -> void {
     // The binding gets its own C variable, never the initializer's, so that
     // 'let mut x = y' followed by an assignment to x leaves y alone.
     nv: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshValue ", nv, " = ", cv.cvar, ";", "", ""))
+    cg_line(g, tmsg7("GeasValue ", nv, " = ", cv.cvar, ";", "", ""))
     cg_declare(g, s.a, nv, bound)
 }
 
 func gen_return(g: *Cg, s: StmtNode) -> void {
     if s.a < 0 {
-        cg_line(g, "out->ty = ASH_TY_UNIT;")
-        cg_line(g, "return ASH_OK;")
+        cg_line(g, "out->ty = GEAS_TY_UNIT;")
+        cg_line(g, "return GEAS_OK;")
         return
     }
     v: CVal = gen_expr(g, s.a, (*g).cur_ret)
     cg_line(g, tmsg3("*out = ", v.cvar, ";"))
-    cg_line(g, "return ASH_OK;")
+    cg_line(g, "return GEAS_OK;")
 }
 
 func gen_if(g: *Cg, s: StmtNode) -> void {
@@ -69,7 +69,7 @@ func gen_if(g: *Cg, s: StmtNode) -> void {
     cg_line(g, "}")
 }
 
-// The resolved storage slot of an lvalue chain: a C AshValue* aimed at the
+// The resolved storage slot of an lvalue chain: a C GeasValue* aimed at the
 // exact memory the assignment writes.
 struct LSlot { pvar: string, ty: int64, ok: bool }
 
@@ -81,9 +81,9 @@ func bad_slot() -> LSlot {
 // pointer down the chain, never through the copy-on-read path an rvalue
 // takes: the root is the address of the binding's own C variable, a record
 // field is the address of its slot in the live field array, a list element
-// is its bounds checked address through ash_list_get, out of range being the
-// standing ASH_ERR_TYPE fault, and a mid-chain map index is the borrowed
-// value slot through ash_map_get, a miss being ASH_ERR_TYPE too, since an
+// is its bounds checked address through geas_list_get, out of range being the
+// standing GEAS_ERR_TYPE fault, and a mid-chain map index is the borrowed
+// value slot through geas_map_get, a miss being GEAS_ERR_TYPE too, since an
 // lvalue has no Option to hang a None on. The borrowed pointers stay valid
 // through the statement: nothing between the walk and the final write can
 // insert into a walked container, because the right hand side sees only
@@ -96,7 +96,7 @@ func gen_lvalue(g: *Cg, eid: int64) -> LSlot {
         bind: CBind = cg_lookup(g, e.a)
         if bind.found {
             p: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshValue* ", p, " = &", bind.cvar, ";", "", ""))
+            cg_line(g, tmsg7("GeasValue* ", p, " = &", bind.cvar, ";", "", ""))
             return LSlot { pvar: p, ty: bind.ty, ok: true }
         }
         cg_unsupported(g, e.lo, e.hi, tmsg3("assignment to '", ast_name(a, e.a), "' in a pledge body"))
@@ -110,7 +110,7 @@ func gen_lvalue(g: *Cg, eid: int64) -> LSlot {
             cf: CField = cg_rec_field(g, cn.name, e.b)
             if cf.found {
                 p2: string = cg_tmp(g)
-                cg_line(g, tmsg7("AshValue* ", p2, " = ((AshValue*)", base.pvar, "->as.list.data) + ", int_to_string(cf.idx), ";"))
+                cg_line(g, tmsg7("GeasValue* ", p2, " = ((GeasValue*)", base.pvar, "->as.list.data) + ", int_to_string(cf.idx), ";"))
                 return LSlot { pvar: p2, ty: cf.ty, ok: true }
             }
         }
@@ -124,17 +124,17 @@ func gen_lvalue(g: *Cg, eid: int64) -> LSlot {
         if n.kind == tyk_list() {
             idx: CVal = gen_expr(g, e.b, ty_int(t))
             p3: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshValue* ", p3, " = (AshValue*)ash_list_get(", base2.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
-            cg_line(g, tmsg3("if (!", p3, ") return ASH_ERR_TYPE;"))
+            cg_line(g, tmsg7("GeasValue* ", p3, " = (GeasValue*)geas_list_get(", base2.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+            cg_line(g, tmsg3("if (!", p3, ") return GEAS_ERR_TYPE;"))
             return LSlot { pvar: p3, ty: n.a, ok: true }
         }
         if n.kind == tyk_map() {
             key: CVal = gen_expr(g, e.b, n.a)
             q: string = cg_tmp(g)
-            cg_line(g, tmsg3("const AshValue* ", q, " = NULL;"))
+            cg_line(g, tmsg3("const GeasValue* ", q, " = NULL;"))
             f: string = cg_tmp(g)
-            cg_line(g, tmsg7("if (!ash_map_get(", base2.pvar, ", &", key.cvar, ", &", q, ")) return ASH_ERR_TYPE;"))
-            cg_line(g, tmsg7("AshValue* ", f, " = (AshValue*)", q, ";", "", ""))
+            cg_line(g, tmsg7("if (!geas_map_get(", base2.pvar, ", &", key.cvar, ", &", q, ")) return GEAS_ERR_TYPE;"))
+            cg_line(g, tmsg7("GeasValue* ", f, " = (GeasValue*)", q, ";", "", ""))
             return LSlot { pvar: f, ty: n.b, ok: true }
         }
         cg_unsupported(g, e.lo, e.hi, "assignment through this index in a pledge body")
@@ -148,7 +148,7 @@ func gen_lvalue(g: *Cg, eid: int64) -> LSlot {
 // it names, however deep the chain of fields and elements runs, and the
 // value lands there in place. The one form that writes no single slot is a
 // final map index, m[k] = v at the end of any chain, which is the insert-or-
-// update onto the map ash_map_set carries out, deep copying both halves
+// update onto the map geas_map_set carries out, deep copying both halves
 // onto the instance itself, so no copy-out rides in front of it. Every other
 // target takes a deep copied value, the same isolation a let makes.
 func gen_assign(g: *Cg, s: StmtNode) -> void {
@@ -163,15 +163,15 @@ func gen_assign(g: *Cg, s: StmtNode) -> void {
             key: CVal = gen_expr(g, lv.b, n.a)
             mv: CVal = gen_expr(g, s.b, n.b)
             stm: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshStatus ", stm, " = ash_map_set(cc, ", base.pvar, ", &", key.cvar, tmsg3(", &", mv.cvar, ");")))
-            cg_line(g, tmsg5("if (", stm, " != ASH_OK) return ", stm, ";"))
+            cg_line(g, tmsg7("GeasStatus ", stm, " = geas_map_set(cc, ", base.pvar, ", &", key.cvar, tmsg3(", &", mv.cvar, ");")))
+            cg_line(g, tmsg5("if (", stm, " != GEAS_OK) return ", stm, ";"))
             return
         }
         if n.kind == tyk_list() {
             idx: CVal = gen_expr(g, lv.b, ty_int(t))
             p: string = cg_tmp(g)
-            cg_line(g, tmsg7("AshValue* ", p, " = (AshValue*)ash_list_get(", base.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
-            cg_line(g, tmsg3("if (!", p, ") return ASH_ERR_TYPE;"))
+            cg_line(g, tmsg7("GeasValue* ", p, " = (GeasValue*)geas_list_get(", base.pvar, ", (uint64_t)", idx.cvar, ".as.i);"))
+            cg_line(g, tmsg3("if (!", p, ") return GEAS_ERR_TYPE;"))
             v3: CVal = gen_expr(g, s.b, n.a)
             cv3: CVal = cg_copy_out(g, v3)
             cg_line(g, tmsg5("*", p, " = ", cv3.cvar, ";"))
@@ -216,7 +216,7 @@ func gen_for(g: *Cg, s: StmtNode) -> void {
     cg_line(g, tmsg7("for (uint64_t ", iv, " = 0; ", iv, tmsg3(" < ", it.cvar, ".as.list.len; "), tmsg2(iv, "++) {"), ""))
     (*g).indent = (*g).indent + 1
     ev: string = cg_tmp(g)
-    cg_line(g, tmsg7("AshValue ", ev, " = ((const AshValue*)", it.cvar, ".as.list.data)[", tmsg2(iv, "];"), ""))
+    cg_line(g, tmsg7("GeasValue ", ev, " = ((const GeasValue*)", it.cvar, ".as.list.data)[", tmsg2(iv, "];"), ""))
     cg_push_scope(g)
     cg_declare(g, s.a, ev, n.a)
     gen_block(g, s.c)

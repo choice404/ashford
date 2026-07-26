@@ -1,12 +1,12 @@
-// loader: the M8 module loader. Given a root .ash file it loads the whole
+// loader: the M8 module loader. Given a root .geas file it loads the whole
 // program: every import resolves to a file, every file lexes and parses into
 // one shared AST arena, and the merged declaration list flows into resolve,
 // typeck, and cgen exactly as a single file always has, so one module comes
 // out of a build however many files went in.
 //
 // The search order per import: the dotted path becomes a relative file path,
-// util -> util.ash and foo.bar -> foo/bar.ash, probed first beside the root
-// file and then under ASH_HOME, which defaults to lib/ in the working
+// util -> util.geas and foo.bar -> foo/bar.geas, probed first beside the root
+// file and then under GEAS_HOME, which defaults to lib/ in the working
 // directory when the variable is unset. Imports walk depth first in
 // declaration order, each file loads exactly once, and an import that lands
 // on a file still being loaded is a cycle and a fault. A path that repeats
@@ -119,8 +119,8 @@ func dir_of(path: string) -> string {
     return substring(path, 0, last)
 }
 
-// A dotted import path as a relative file path with the .ash extension:
-// foo.bar becomes foo/bar.ash.
+// A dotted import path as a relative file path with the .geas extension:
+// foo.bar becomes foo/bar.geas.
 func import_rel(imp: string) -> string {
     b: *StringBuilder = alloc(sb_new())
     n: int64 = str_len(imp)
@@ -133,7 +133,7 @@ func import_rel(imp: string) -> string {
         }
         i = i + 1
     }
-    sb_push(b, ".ash")
+    sb_push(b, ".geas")
     out: string = substring(sb_cstr(b), 0, sb_size(b))
     sb_free(b)
     free(b)
@@ -151,10 +151,10 @@ func path_under(dir: string, rel: string) -> string {
     return out
 }
 
-// The second search root: ASH_HOME when set, otherwise lib/ in the working
-// directory, the spot the ashstd modules live in a checkout.
-func ash_home() -> string {
-    h: string = env("ASH_HOME")
+// The second search root: GEAS_HOME when set, otherwise lib/ in the working
+// directory, the spot the std modules live in a checkout.
+func geas_home() -> string {
+    h: string = env("GEAS_HOME")
     if str_len(h) > 0 { return h }
     return "lib"
 }
@@ -343,7 +343,7 @@ func load_file(ld: *Ld, path: string) -> void {
     map_put((*ld).status, path, 1)
     s, e := source_load(path)
     if e.exists() {
-        vec_push((*ld).errors, lmsg3("ashc: cannot read source file '", path, "'"))
+        vec_push((*ld).errors, lmsg3("geas: cannot read source file '", path, "'"))
         (*ld).ok = false
         map_put((*ld).status, path, 2)
         return
@@ -485,7 +485,7 @@ export func load_program(root_path: string) -> *Program {
         pkgs: pkgs,
         npkgs: 0,
         rootdir: dir_of(root_path),
-        home: ash_home(),
+        home: geas_home(),
         base: 0,
         ok: true,
     })
