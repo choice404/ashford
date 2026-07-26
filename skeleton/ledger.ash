@@ -60,20 +60,16 @@ contract Ledger {
         }
     }
 
-    // The total an owner holds across every account: Store.query binds the owner
-    // column to the given name and answers every matching row, and the pledge
-    // folds their balances into one sum. An owner with no accounts is a clean
-    // Ok(0.0), the empty list a fold that never runs, and only a backend failure
-    // leaves this Result as Err(StoreFailed) for the status channel.
+    // The total an owner holds across every account: Store.sum totals the
+    // balance column over the rows whose owner matches the given name and
+    // answers that one Float, the store's own answer with the rows never
+    // materialized into the process. An owner with no accounts is a clean
+    // Ok(0.0), the empty set summing to the column's own zero, and only a backend
+    // failure leaves this Result as Err(StoreFailed) for the status channel.
     pledge owned_total(owner: String) -> Result<Float, LedgerError> {
-        return match Store.query(Accounts, owner, owner) {
-            Ok(rows) -> {
-                let mut sum = 0.0
-                for row in rows {
-                    sum = sum + row.balance
-                }
-                Ok(sum)
-            }
+        // sum is answered by the store; the empty set is the column type's zero.
+        return match Store.sum(Accounts, balance, owner == owner) {
+            Ok(total) -> Ok(total)
             _ -> Err(StoreFailed)
         }
     }

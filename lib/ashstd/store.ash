@@ -17,6 +17,7 @@
 //   Store.query(S, predicate, desc(column)) -> Result<List<Row>, StoreError>
 //   Store.query(S, predicate, desc(column), limit(n)) -> Result<List<Row>, StoreError>
 //   Store.count(S, predicate)      -> Result<Int, StoreError>   (rows not materialized)
+//   Store.sum(S, column, predicate) -> Result<Int|Float, StoreError> (rows not materialized)
 //   Store.insert(S, row)           -> Result<Unit, StoreError>
 //   Store.update(S, key, row)      -> Result<Unit, StoreError>
 //   Store.delete(S, key)           -> Result<Unit, StoreError>
@@ -41,6 +42,11 @@
 // Store.count reads that same two argument predicate and answers how many rows
 // pass it as an Int, the rows never materialized into the process: the store
 // counts them behind the boundary and hands back only the number.
+// Store.sum names a schema, a bare Int or Float column to total, and that same
+// predicate, and answers the total of that column over the rows the predicate
+// accepts, an Int column giving Result<Int, StoreError> and a Float column
+// Result<Float, StoreError>; the rows are never materialized, the store totals
+// them behind the boundary, and an empty set sums to the column's own zero.
 // Every operation returns a Result so a store failure
 // is a value in the surface's own error type. The
 // backend failing the runtime, a connection lost, a disk with no room, a

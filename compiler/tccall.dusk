@@ -615,7 +615,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     t: *TyArena = (*tc).ty
     op: string = ast_name(a, mname)
     err_ty: int64 = ty_named(t, "StoreError")
-    if !str_eq(op, "find") && !str_eq(op, "query") && !str_eq(op, "count") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
+    if !str_eq(op, "find") && !str_eq(op, "query") && !str_eq(op, "count") && !str_eq(op, "sum") && !str_eq(op, "insert") && !str_eq(op, "update") && !str_eq(op, "delete") {
         walk_args(tc, e.b, e.c)
         tc_emit(tc, e.lo, e.hi, tmsg3("Store has no operation '", op, "'"))
         return ty_unknown(t)
@@ -785,6 +785,56 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
             check_query_pred(tc, rs, sc.name, a1.expr)
         }
         return ty_result(t, ty_int(t), err_ty)
+    }
+    if str_eq(op, "sum") {
+        // sum answers the total of one column over the rows a predicate accepts
+        // without materializing any of them, so the result carries that column's
+        // own scalar. It names a schema, the bare column to total, and one
+        // predicate, the same predicate count reads. The column is read as a bare
+        // name resolved against the schema at compile time, never a value, and it
+        // must be an Int or a Float, the two columns a sum has meaning over: an
+        // Int column answers Result<Int, StoreError> and a Float column answers
+        // Result<Float, StoreError>. An empty set sums to that column's own zero,
+        // a runtime COALESCE the checker leaves alone. Any other arity is refused
+        // by the shape the call should have taken; the predicate walks the same
+        // check the query predicate does, so its faults surface beside it.
+        if e.c != 3 {
+            tc_emit(tc, e.lo, e.hi, "Store.sum takes a schema, a column, and a predicate")
+        }
+        mut col_ty: int64 = ty_unknown(t)
+        if e.c >= 2 {
+            a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
+            a1e: ExprNode = vec_get((*a).exprs, a1.expr)
+            if a1e.kind != xk_ident() {
+                tc_emit(tc, a1e.lo, a1e.hi, "the second argument of Store.sum is a column name")
+            } else {
+                mut found_col: bool = false
+                mut i: int64 = 0
+                while i < rs.len {
+                    f: FieldSig = sig_field((*tc).sigs, rs.off, i)
+                    if f.name == a1e.a {
+                        col_ty = f.ty
+                        found_col = true
+                    }
+                    i = i + 1
+                }
+                if !found_col {
+                    tc_emit(tc, a1e.lo, a1e.hi, tmsg5("no column '", ast_name(a, a1e.a), "' in schema '", ast_name(a, sc.name), "'"))
+                    col_ty = ty_unknown(t)
+                } else {
+                    ck: int64 = ty_get(t, col_ty).kind
+                    if ck != tyk_int() && ck != tyk_float() {
+                        tc_emit(tc, a1e.lo, a1e.hi, "Store.sum takes an Int or Float column")
+                        col_ty = ty_unknown(t)
+                    }
+                }
+            }
+        }
+        if e.c >= 3 {
+            a2: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 2))
+            check_query_pred(tc, rs, sc.name, a2.expr)
+        }
+        return ty_result(t, col_ty, err_ty)
     }
     // The argument shapes per operation. The count is checked first, then each
     // trailing argument against the key or row type the schema fixes.

@@ -493,6 +493,12 @@ AshStatus ash_store_query_page(AshContract* c, const AshSchemaDesc* schema,
 AshStatus ash_store_count_where(AshContract* c, const AshSchemaDesc* schema,
                                 const AshStoreTerm* terms, uint32_t nterms,
                                 AshValue* out);
+/* query_where, answering the sum of one Int or Float column, as the Ok value
+ * of that same type inside the Result every read form answers. Empty matches
+ * answer that column type's zero. */
+AshStatus ash_store_sum_where(AshContract* c, const AshSchemaDesc* schema,
+                              uint32_t sum_col, const AshStoreTerm* terms,
+                              uint32_t nterms, AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

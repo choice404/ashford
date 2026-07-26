@@ -5,6 +5,39 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.4] the summed read
+
+The store answers how much. `Store.sum(S, column, predicate)` sums one
+numeric column over the matching rows where the rows live, an Int column
+answering `Result<Int, StoreError>` and a Float column
+`Result<Float, StoreError>`, any other column type refused at compile
+time by name. A sum over no rows is the zero of the column's own type,
+never a missing value: an empty ledger owes nothing rather than owing a
+question, and the runtime spells that COALESCE so the surface never
+meets a NULL. The Ledger's owned_total keeps its signature and its gate
+values and loses its fold; owned_above keeps its fold on purpose, the
+row walking proof standing beside the aggregate.
+
+- check the sum where the schema lives: exactly a schema, a bare column
+  name, and a predicate, the column resolved at compile time and refused
+  by name when it is not Int or Float, the predicate on the same checker
+  path as every query form
+- lower onto one runtime primitive: ash_store_sum_where builds
+  COALESCE(SUM(column), zero) from the schema descriptor with the zero
+  spelled in the column's own type, binds every predicate value as a
+  parameter, decodes the scalar through the scratch allocator freed
+  before the call returns, and answers the wrapped Ok every read form
+  answers
+- let the backend keep its own honesty: SQLite reports integer overflow
+  on an Int sum as a step error and it surfaces as the store failure
+  status, no special case and no silent wrap
+- retire the fold without moving the surface: owned_total sums through
+  the store with the same Result<Float, LedgerError> and the same gate
+  values, the empty owner still an Ok of zero, now the column's zero
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  sum joins the operation table, and the leaves out list narrows to
+  average, min, max, and grouping
+
 ## [v0.6.3] the counted read
 
 The store answers how many. `Store.count(S, predicate)` takes the same
