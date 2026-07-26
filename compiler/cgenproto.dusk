@@ -50,10 +50,40 @@ func proto_scalar(g: *Cg, tyid: int64) -> string {
     return ""
 }
 
+// The proto scalar a Map key crosses as. Geas allows six key types and every
+// one has a proto scalar: the two sized integers, Bool, Byte and Char as
+// uint32, and String. The empty string for anything else, a key the checker
+// never admits, so the map surface stays inside the keyable set.
+func map_key_scalar(g: *Cg, kty: int64) -> string {
+    k: int64 = ty_get((*g).ty, kty).kind
+    if k == tyk_int() { return "int64" }
+    if k == tyk_uint() { return "uint64" }
+    if k == tyk_bool() { return "bool" }
+    if k == tyk_byte() { return "uint32" }
+    if k == tyk_char() { return "uint32" }
+    if k == tyk_str() { return "string" }
+    return ""
+}
+
+// The Geas word a Map key contributes to a wrapper name, over the same six
+// key types map_key_scalar spells; the value word comes from ty_word, which
+// carries the full container set a value may take.
+func map_key_word(g: *Cg, kty: int64) -> string {
+    k: int64 = ty_get((*g).ty, kty).kind
+    if k == tyk_int() { return "Int" }
+    if k == tyk_uint() { return "Uint" }
+    if k == tyk_bool() { return "Bool" }
+    if k == tyk_byte() { return "Byte" }
+    if k == tyk_char() { return "Char" }
+    if k == tyk_str() { return "String" }
+    return ""
+}
+
 // The Geas spelling that names a result message arm or a wrapper:
 // Result<Bool, Int> contributes the Bool and the Int of BoolIntResult, a
 // declared record or sum contributes its own name, Unit is Unit, and the
-// containers compose, Option<Int> naming IntOption and List<Int> IntList.
+// containers compose, Option<Int> naming IntOption, List<Int> IntList,
+// Map<String, Int> StringIntMap, and Tuple<Int, String> IntStringTuple.
 func ty_word(g: *Cg, tyid: int64) -> string {
     k: int64 = ty_get((*g).ty, tyid).kind
     if k == tyk_int() { return "Int" }
@@ -78,6 +108,31 @@ func ty_word(g: *Cg, tyid: int64) -> string {
         iw: string = ty_word(g, ty_get((*g).ty, tyid).a)
         if str_len(iw) == 0 { return "" }
         return tmsg2(iw, "List")
+    }
+    if k == tyk_map() {
+        kw: string = map_key_word(g, ty_get((*g).ty, tyid).a)
+        vw: string = ty_word(g, ty_get((*g).ty, tyid).b)
+        if str_len(kw) == 0 || str_len(vw) == 0 { return "" }
+        return tmsg3(kw, vw, "Map")
+    }
+    if k == tyk_tuple() {
+        tn: TyNode = ty_get((*g).ty, tyid)
+        t: *TyArena = (*g).ty
+        b: *StringBuilder = alloc(sb_new())
+        mut ok: bool = true
+        mut i: int64 = 0
+        while i < tn.len {
+            ew: string = ty_word(g, vec_get((*t).kids, tn.off + i))
+            if str_len(ew) == 0 { ok = false }
+            sb_push(b, ew)
+            i = i + 1
+        }
+        sb_push(b, "Tuple")
+        out: string = substring(sb_cstr(b), 0, sb_size(b))
+        sb_free(b)
+        free(b)
+        if !ok { return "" }
+        return out
     }
     return ""
 }
@@ -303,6 +358,59 @@ func ensure_type(g: *Cg, tyid: int64, seen: *Vector<string>, lo: int64, hi: int6
             cg_top(g, "")
         }
         if str_len(lw) > 0 { return lw }
+    }
+    if k == tyk_map() {
+        key: int64 = ty_get((*g).ty, tyid).a
+        val: int64 = ty_get((*g).ty, tyid).b
+        mw: string = ty_word(g, tyid)
+        if str_len(mw) > 0 && !has_str(seen, mw) {
+            kspell: string = map_key_scalar(g, key)
+            vspell: string = ensure_type(g, val, seen, lo, hi)
+            if str_len(kspell) == 0 || str_len(vspell) == 0 { return "" }
+            entry: string = tmsg2(mw, "Entry")
+            vec_push(seen, mw)
+            vec_push(seen, entry)
+            cg_top(g, tmsg3("// The ", ty_render((*g).ty, tyid), " wrapper: Geas pins map iteration as insertion"))
+            cg_top(g, "// ordered and proto's own map type carries no order, so the bridge spells")
+            cg_top(g, "// a map as the ordered entry list it actually is.")
+            cg_top(g, tmsg3("message ", entry, " {"))
+            cg_top(g, tmsg3("  ", kspell, " key = 1;"))
+            cg_top(g, tmsg3("  ", vspell, " value = 2;"))
+            cg_top(g, "}")
+            cg_top(g, tmsg3("message ", mw, " {"))
+            cg_top(g, tmsg3("  repeated ", entry, " entries = 1;"))
+            cg_top(g, "}")
+            cg_top(g, "")
+        }
+        if str_len(mw) > 0 { return mw }
+    }
+    if k == tyk_tuple() {
+        tn: TyNode = ty_get((*g).ty, tyid)
+        tw: string = ty_word(g, tyid)
+        if str_len(tw) > 0 && !has_str(seen, tw) {
+            t: *TyArena = (*g).ty
+            lines: *Vector<string> = alloc(vec_new())
+            mut ok: bool = true
+            mut i: int64 = 0
+            while i < tn.len {
+                espell: string = ensure_type(g, vec_get((*t).kids, tn.off + i), seen, lo, hi)
+                if str_len(espell) == 0 { ok = false }
+                vec_push(lines, tmsg7("  ", espell, " item", int_to_string(i + 1), " = ", int_to_string(i + 1), ";"))
+                i = i + 1
+            }
+            if !ok { return "" }
+            vec_push(seen, tw)
+            cg_top(g, tmsg3("// The ", ty_render((*g).ty, tyid), " as a message, each element a numbered field."))
+            cg_top(g, tmsg3("message ", tw, " {"))
+            mut j: int64 = 0
+            while j < vec_len(lines) {
+                cg_top(g, vec_get(lines, j))
+                j = j + 1
+            }
+            cg_top(g, "}")
+            cg_top(g, "")
+        }
+        if str_len(tw) > 0 { return tw }
     }
     cg_unsupported(g, lo, hi, tmsg2("a type on the gRPC surface outside the bridged set: ", ty_render((*g).ty, tyid)))
     return ""

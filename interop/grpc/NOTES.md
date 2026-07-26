@@ -500,12 +500,14 @@ the wrapper directly.
 Two names earned rules. A pledge spelled sign, which the stdlib has, would
 take the session surface's SignRequest, so its request message alone steps
 aside to SignPledgeRequest; a pledge whose rpc spelling would take Session,
-GetPartial, or Break is refused by name. Map and tuple stay named refusals,
-the gauntlet's snapshot pledge being the standing proof, a nonzero exit
-that writes nothing rather than a service with a hole in it.
+GetPartial, or Break is refused by name. Map and tuple cross as wrapper
+messages: a map as a repeated entry pair whose order is the insertion
+order the language pins, never proto's own unordered map type, and a
+tuple as one numbered item field per position, so the gauntlet's snapshot
+pledge, once the standing refusal, is now an ordinary rpc on the surface.
 
 Every skeleton and the whole stdlib emit and pass protoc now, the gauntlet
-excepted by design. The goldens pin the walk: hello's enum Err, ledger's
+included. The goldens pin the walk: hello's enum Err, ledger's
 Unit, main_demo's payload sum under two services, std_user's four contracts
 with the prefix rule, the wrappers, and the reserved spelling.
 

@@ -305,6 +305,47 @@ contract LangGauntlet {
         return Ok(m)
     }
 
+    // A List in and a Map out: the tally rides the gRPC surface as an argument
+    // list and an Ok boxed map, so the wrapper the bridge emits sees the map in
+    // return position and the walk that built it stays a plain list loop.
+    pledge tally(names: List<String>) -> Result<Map<String, Int>, Int> {
+        let mut counts = Map<String, Int>()
+        for n in names {
+            match counts[n] {
+                Some(c) -> {
+                    counts[n] = c + 1
+                }
+                None -> {
+                    counts[n] = 1
+                }
+            }
+        }
+        return Ok(counts)
+    }
+
+    // Two maps in argument position: the bridge lowers each parameter to the
+    // ordered entry wrapper, and the body reads a shared key from both and
+    // sums what it finds, a miss on either side counting as zero.
+    pledge merge_counts(a: Map<String, Int>, b: Map<String, Int>) -> Result<Int, Int> {
+        let av = match a["x"] {
+            Some(v) -> v
+            None -> 0
+        }
+        let bv = match b["x"] {
+            Some(w) -> w
+            None -> 0
+        }
+        return Ok(av + bv)
+    }
+
+    // A tuple in return position: the pair crosses as a message of numbered
+    // fields, so a signature spelling Tuple is enough to pull the wrapper onto
+    // the surface.
+    pledge coords() -> Result<Tuple<Int, String>, Int> {
+        let t = (1, "one")
+        return Ok(t)
+    }
+
     // The nested lvalue chain: assignment resolves its target in place, so
     // a write through record.list[i] lands in the record's own storage and
     // the read right after sees it. An out of range i keeps the standing

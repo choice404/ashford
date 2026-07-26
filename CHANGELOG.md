@@ -4,6 +4,38 @@ Every released version of Geas, newest first. The language was named
 Ashford through v0.6.8; entries below the rename keep the names they
 shipped with, because a changelog that rewrites its own past is not one.
 
+## [v0.7.1] the whole type set
+
+Map and tuple cross the bridge, and the refusal that guarded them
+retires with its reason intact. The old build error existed because
+proto's own map type carries no order and Geas pins map iteration as
+insertion ordered; the answer was never to ship the unordered thing,
+it was to spell the ordered thing. A Map crosses as a wrapper message
+holding a repeated entry pair, key and value in one small message, so
+the order a program built is the order the wire carries, and a tuple
+crosses as a wrapper with one numbered item field per position. The
+gauntlet, the file whose snapshot pledge was the standing refusal, is
+now a golden on the surface and compiles under real protoc.
+
+- spell the map as what it is: StringIntMap holds repeated
+  StringIntMapEntry, never proto's map field, because an ordered
+  language type does not become an unordered wire type quietly, and
+  the wrapper works in every position a map can appear, a field, a
+  list element, an argument, a oneof arm
+- spell the tuple as a message: IntStringTuple carries item1 and
+  item2, the value kind last in the name, the same rule that names
+  BoolIntResult
+- keep every existing golden byte identical: the five prior skeletons
+  and the four session wrappers carry no map or tuple and emitted
+  exactly what they emitted before
+- prove the surface with the gauntlet: snapshot, tally, merge_counts,
+  and coords put Map in return and argument position and Tuple in
+  return position, lang.proto joins the goldens, and the bridge gate
+  compiles it under grpc_tools protoc so the wrappers are valid
+  proto3 by a real compiler's word
+- tell the order story where the type set lives: docs/bridge.md and
+  the bridge notes carry why the entry list is the honest spelling
+
 ## [v0.7.0] the true name
 
 The language is Geas. A geas, in Celtic myth, is a binding obligation

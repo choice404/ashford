@@ -424,8 +424,10 @@ test-header: $(GEAS) $(MODULE) $(RT_SO)
 # sum and a repeated parameter under two services, and std_user the
 # multi-contract prefix rule, Option and List wrappers, and the reserved
 # SignPledgeRequest disambiguation, with its wrapper pinning four session
-# types out of one file. The gauntlet's Map stays a named refusal, proven
-# here as a nonzero exit that writes nothing.
+# types out of one file. The gauntlet closes the set: its Maps cross as
+# ordered entry list wrappers, the insertion order the language pins and
+# proto's own map type would lose, and its tuple as a numbered item
+# message, so the file that was the standing refusal is now a golden.
 test-proto: $(GEAS)
 	$(GEAS) emit-proto skeleton/payment.geas
 	diff tests/golden/payment.proto $(OUT)/payment.proto
@@ -441,9 +443,8 @@ test-proto: $(GEAS)
 	diff tests/golden/std_user.proto $(OUT)/std_user.proto
 	diff tests/golden/std_user_session.go $(OUT)/std_user_session.go
 	diff tests/golden/std_user_session.ts $(OUT)/std_user_session.ts
-	rm -f $(OUT)/lang.proto
-	! $(GEAS) emit-proto skeleton/lang.geas 2>/dev/null
-	test ! -f $(OUT)/lang.proto
+	$(GEAS) emit-proto skeleton/lang.geas
+	diff tests/golden/lang.proto $(OUT)/lang.proto
 	@echo "[test-proto] ok"
 
 # The determinism gate: two builds of the same source must emit byte
@@ -546,6 +547,9 @@ test-grpc-bridge: $(RT_SO) $(MODULE_PAY)
 	$$py -m grpc_tools.protoc -I interop/grpc \
 	    --python_out=$(GRPC_GEN) --grpc_python_out=$(GRPC_GEN) \
 	    $(GRPC_PROTO) || exit 1; \
+	$(GEAS) emit-proto skeleton/lang.geas || exit 1; \
+	$$py -m grpc_tools.protoc -I $(OUT) --python_out=$(GRPC_GEN) \
+	    $(OUT)/lang.proto || exit 1; \
 	$$py interop/grpc/bridge_server.py --port 50251 & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null; wait $$srv 2>/dev/null' EXIT INT TERM; \
