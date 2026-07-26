@@ -30,7 +30,17 @@
 // value. && binds tighter than ||, the precedence the grammar already fixes, so
 // a && b || c reads the a && b group or c, and parentheses regroup it the usual
 // way; the predicate is a free boolean tree of comparisons the compiler
-// normalizes before it reaches the store. Every comparison names its column on
+// normalizes before it reaches the store. A leading ! negates any subtree, a
+// lone comparison, a parenthesized group, or the whole predicate alike, and the
+// compiler eliminates it before the store is ever asked: ! flips a comparison to
+// its opposite at the leaf, ==/!=, </>=, <=/>, distributes over && and || by De
+// Morgan's law so a negated && becomes an || of negations and the other way, and
+// cancels against a second !. Every row the language writes carries every
+// column, so a row either passes a comparison or passes its negation and the
+// rewrite is exact, and a null that reaches a table another way fails both a
+// comparison and its flip alike, so the rewrite still names the same rows; the store
+// reads only the positive comparisons the negation resolves to and never learns
+// a ! was written. Every comparison names its column on
 // the left as a bare name resolved against the schema at compile time, never a
 // value, and query answers every row the whole predicate accepts. A third argument orders those rows: asc(column) sorts
 // them by the named column ascending and desc(column) descending. asc and desc

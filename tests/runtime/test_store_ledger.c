@@ -383,6 +383,49 @@ int main(void) {
         CHECK(ok_float(&r, &bal) && bal == 0.0,
               "tail_total(0.0, 100000.0) matches neither tail and is Ok(0.0)");
 
+        /* Store.query over a negated predicate: mid_owners is the complement of
+         * extremes, reading !(balance <= lo || balance >= hi). The compiler
+         * eliminates the ! at compile time, De Morgan turning the negated '||'
+         * into an '&&' of two flipped comparisons, balance > lo && balance < hi,
+         * so the store sees a pure '&&' predicate and the ordered where primitive
+         * answers it, no '||' path taken. The table holds 1/alice 250,
+         * 3/injection 5, 10/ada 40, 11/ada 60, and 12/bob 999.
+         * mid_owners(10.0, 500.0) keeps the rows strictly between 10 and 500,
+         * ada's 40 and 60 and alice's 250, orders them ascending, and folds their
+         * owners; account 3 (5) and account 12 (999) fall in the excluded
+         * tails. */
+        AshValue mid_lohi[2] = { float_val(10.0), float_val(500.0) };
+        r = run(c, "mid_owners", mid_lohi, 2);
+        CHECK(ok_str(&r, "adaadaalice"),
+              "mid_owners(10.0, 500.0) folds the middle band by ascending balance");
+
+        /* A range that spans every balance keeps every row in the middle:
+         * nothing is at or below 0 and nothing at or above 100000, so both
+         * negated tails exclude no row and all five owners fold by ascending
+         * balance, the injection owner first, the runtime having read the value
+         * bytes and never the SQL they spell. */
+        AshValue mid_all[2] = { float_val(0.0), float_val(100000.0) };
+        r = run(c, "mid_owners", mid_all, 2);
+        CHECK(ok_str(&r, "'); DROP TABLE Accounts; --adaadaalicebob"),
+              "mid_owners(0.0, 100000.0) keeps every row and folds all five owners");
+
+        /* Store.count over a negated equality: others reads !(owner == who),
+         * which the compiler flips at the leaf to owner != who, a pure '&&' the
+         * where count primitive reads with no '||' to widen it, the rows never
+         * materialized into the process. others("ada") counts the three rows no
+         * ada owns, alice, the injection owner, and bob. */
+        AshValue others_ada[1] = { str_val("ada") };
+        r = run(c, "others", others_ada, 1);
+        CHECK(ok_int(&r, &cnt) && cnt == 3,
+              "others(ada) counts the three rows ada does not own");
+
+        /* An owner no row holds negates to the whole table: others("nobody")
+         * counts all five rows. */
+        AshValue others_none[1] = { str_val("nobody") };
+        r = run(c, "others", others_none, 1);
+        CHECK(ok_int(&r, &cnt) && cnt == 5,
+              "others(nobody) counts all five rows");
+
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }
 

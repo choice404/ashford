@@ -245,6 +245,46 @@ contract Ledger {
         }
     }
 
+    // The owners of the accounts in the middle of a balance range, listed by
+    // ascending balance: the complement of extremes. Store.query reads a negated
+    // predicate, !(balance <= lo || balance >= hi), so a row passes when it sits
+    // in neither tail. The ! is eliminated at compile time: De Morgan turns the
+    // negated '||' into an '&&' of two negated comparisons, and each comparison
+    // flips at the leaf, so the store sees the pure '&&' predicate balance > lo
+    // && balance < hi, the ordered where form with no '||' in sight. asc(balance)
+    // fixes the order over the matching band, low balances first, and the pledge
+    // folds the owners of the returned rows into one string in that order. A
+    // range no account falls inside is a clean Ok(""), the empty list a fold that
+    // never runs, and only a backend failure leaves this Result as
+    // Err(StoreFailed).
+    pledge mid_owners(lo: Float, hi: Float) -> Result<String, LedgerError> {
+        return match Store.query(Accounts, !(balance <= lo || balance >= hi), asc(balance)) {
+            Ok(rows) -> {
+                let mut s = ""
+                for row in rows {
+                    s = s + row.owner
+                }
+                Ok(s)
+            }
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // How many accounts belong to anyone but a given owner: Store.count reads a
+    // negated equality, !(owner == who), so a row passes when its owner is not
+    // the named one. The ! is eliminated at compile time by flipping the leaf,
+    // so the store sees the pure '==' twin's opposite, owner != who, the where
+    // count form with no '||' to widen it. count answers the number behind the
+    // boundary with the rows never materialized into the process. An owner no row
+    // holds negates to the whole table, a clean Ok of every row, and only a
+    // backend failure leaves this Result as Err(StoreFailed).
+    pledge others(who: String) -> Result<Int, LedgerError> {
+        return match Store.count(Accounts, !(owner == who)) {
+            Ok(n) -> Ok(n)
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the

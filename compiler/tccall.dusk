@@ -513,6 +513,16 @@ func check_query_term(tc: *Tc, rs: RecSig, sname: int64, x: ExprNode) -> void {
 func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64) -> void {
     a: *Ast = (*tc).ast
     x: ExprNode = vec_get((*a).exprs, xid)
+    if x.kind == xk_unary() {
+        // A ! negates any subtree of the predicate. It is eliminated at compile
+        // time, so the checker walks straight through it: the operand is itself
+        // a predicate, and whatever the operand rejects the negation rejects
+        // too. A ! over a non-predicate form surfaces the operand's own refusal.
+        if x.a == uop_not() {
+            check_query_pred(tc, rs, sname, x.b)
+            return
+        }
+    }
     if x.kind == xk_binary() {
         op: int64 = x.a
         if op == bop_and() || op == bop_or() {
@@ -525,7 +535,7 @@ func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64) -> void {
             return
         }
     }
-    tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with && and ||")
+    tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with && and ||, any subtree negated with !")
 }
 
 // The third argument of the ordered Store.query, asc(column) or desc(column):

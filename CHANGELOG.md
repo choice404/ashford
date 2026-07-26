@@ -5,6 +5,42 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.7] the negated predicate
+
+The predicate learns not, and the database never hears about it. A `!`
+may wrap any predicate subtree in any of the three read forms, and the
+compiler eliminates every one before lowering: De Morgan swaps the
+joiners on the way down, the comparison flips at the leaf, `!(balance <
+lo)` becoming `balance >= lo`, and a doubled negation cancels. What runs
+is always the same or of and groups the surface already had, so this
+milestone adds no runtime primitive and changes no runtime line, and the
+elimination even picks the cheaper primitive: the complement of an or of
+tails is a plain conjunction band, and it lowers onto the ordered where
+call, not the grouped one. The flips are sound in the store's
+own terms: every row the language writes carries every column, and a
+NULL that reaches a table another way fails a comparison and its flip
+alike, so the rewrite never changes which rows answer.
+
+- admit not where the predicate lives: the shared checker recurses
+  through the unary, so ! wraps a comparison, a group, or the whole
+  tree, and a non predicate under ! still speaks the operand's own
+  refusal
+- eliminate with a pending flag, not a rebuilt tree: the normalizer
+  toggles a negation flag down the walk, mints a node only on the
+  negated path, and an untouched subtree answers its original node, so
+  the no negation path lowers byte for byte down to temp numbering
+- prove the elimination by the primitive it picks: mid_owners asks for
+  the band extremes excludes and compiles to a single conjunction group
+  on the plain ordered call, and others counts a negated equality on the
+  plain where call, neither touching the grouped primitives
+- walk the complement in the gate: the middle band answers the three
+  owners the tails exclude, the full band answers all five including
+  the injection owner string, and others counts three around ada and
+  five around nobody
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  negation joins the one predicate grammar with its elimination story
+  told once, and the leaves out list drops negation
+
 ## [v0.6.6] the one predicate
 
 One predicate grammar, everywhere. `Store.count` and `Store.sum` now

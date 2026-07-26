@@ -939,6 +939,69 @@ func cg_build_term_array(g: *Cg, rs: RecSig, xid: int64) -> (string, int64) {
     return (arr, vec_len(terms))
 }
 
+// Flips a comparison operator to its own negation, the leaf half of the !
+// rewrite: == to !=, != to ==, < to >=, <= to >, > to <=, and >= to <. A
+// negated comparison is still one comparison, so a ! over a leaf stays a leaf
+// and never grows the predicate.
+func cg_flip_cmp(op: int64) -> int64 {
+    if op == bop_eq() { return bop_ne() }
+    if op == bop_ne() { return bop_eq() }
+    if op == bop_lt() { return bop_ge() }
+    if op == bop_le() { return bop_gt() }
+    if op == bop_gt() { return bop_le() }
+    if op == bop_ge() { return bop_lt() }
+    // The checker admits exactly the six operators above into a predicate. A
+    // seventh comparison must gain its flip here before check_query_pred may
+    // admit it, or a negated predicate would lower without the negation.
+    return op
+}
+
+// Eliminates every ! from a Store predicate at compile time, returning the id of
+// an equivalent predicate over comparisons joined with && and || alone. neg
+// carries a pending negation down the tree: a ! toggles it, a && or || under a
+// pending negation becomes the other joiner with both sides still negated, De
+// Morgan's law, and a comparison under it flips its operator, the leaf rewrite.
+// Two ! cancel because two toggles restore neg. Schema columns are never null,
+// so a row either passes a comparison or passes its negation and the rewrite is
+// exact. With neg false and no ! in the subtree every node returns its own id
+// unchanged, so a predicate that never wrote ! lowers through the very tree it
+// always did and the select of primitive stays unchanged, byte for byte.
+func cg_pred_norm(g: *Cg, xid: int64, neg: bool) -> int64 {
+    a: *Ast = (*g).ast
+    x: ExprNode = vec_get((*a).exprs, xid)
+    if x.kind == xk_unary() {
+        if x.a == uop_not() {
+            return cg_pred_norm(g, x.b, !neg)
+        }
+    }
+    if x.kind == xk_binary() {
+        if x.a == bop_and() || x.a == bop_or() {
+            mut op: int64 = x.a
+            if neg {
+                if op == bop_and() { op = bop_or() } else { op = bop_and() }
+            }
+            nb: int64 = cg_pred_norm(g, x.b, neg)
+            nc: int64 = cg_pred_norm(g, x.c, neg)
+            if !neg {
+                if nb == x.b && nc == x.c { return xid }
+            }
+            return ast_expr(a, xk_binary(), x.lo, x.hi, op, nb, nc, 0)
+        }
+        if neg {
+            return ast_expr(a, xk_binary(), x.lo, x.hi, cg_flip_cmp(x.a), x.b, x.c, 0)
+        }
+    }
+    return xid
+}
+
+// The negation-free form of a Store predicate: the tree with every ! pushed to
+// the leaves and eliminated, so has_or, DNF, and the term walkers read only &&,
+// ||, and comparison nodes. A predicate that carries no ! comes back as its own
+// id, so its lowering is untouched.
+func cg_pred_positive(g: *Cg, xid: int64) -> int64 {
+    return cg_pred_norm(g, xid, false)
+}
+
 // Whether a Store.query predicate carries a ||. A pure && predicate keeps the
 // where, ordered, and page lowerings the golden pins; a predicate with even one
 // || normalizes to disjunctive normal form and rides the select primitive
@@ -1153,7 +1216,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             // A predicate carrying a || normalizes to disjunctive normal form and
             // rides the select primitive; a pure && predicate keeps the where
             // lowering byte for byte.
-            pred2: int64 = cg_arg_expr(g, e, 1)
+            pred2: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
             if cg_pred_has_or(g, pred2) {
                 cg_store_select(g, rs, pred2, schref, out, st, "ASH_STORE_NO_ORDER", "0u", "NULL")
                 return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
@@ -1162,7 +1225,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             // temporary and one AshStoreTerm rides an array beside it, and the
             // where primitive answers every row the whole predicate accepts.
             terms: *Vector<string> = alloc(vec_new())
-            cg_query_terms(g, rs, cg_arg_expr(g, e, 1), terms)
+            cg_query_terms(g, rs, pred2, terms)
             arr: string = cg_tmp(g)
             line: *StringBuilder = alloc(sb_new())
             sb_push(line, "AshStoreTerm ")
@@ -1215,13 +1278,13 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                         // A || in the predicate normalizes to DNF and rides the
                         // select primitive, ordered by the same column; a pure &&
                         // predicate keeps the ordered lowering byte for byte.
-                        pred3: int64 = cg_arg_expr(g, e, 1)
+                        pred3: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
                         if cg_pred_has_or(g, pred3) {
                             ordcol_sel: string = tmsg2(int_to_string(ordcol), "u")
                             cg_store_select(g, rs, pred3, schref, out, st, ordcol_sel, descflag, "NULL")
                             return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
                         }
-                        arr2, nterms2 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+                        arr2, nterms2 := cg_build_term_array(g, rs, pred3)
                         nterms_s: string = tmsg2(int_to_string(nterms2), "u, ")
                         ordcol_s: string = tmsg2(int_to_string(ordcol), "u, ")
                         tail: string = tmsg5(descflag, ", &", out, ");", "")
@@ -1264,7 +1327,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             // primitive, ordered and bounded by the same column and count; a pure
             // && predicate keeps the page lowering byte for byte. The count lowers
             // into its own Int temporary either way, its address the limit.
-            pred4: int64 = cg_arg_expr(g, e, 1)
+            pred4: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
             if cg_pred_has_or(g, pred4) {
                 lvalsel: CVal = gen_expr(g, larg.expr, ty_int(t))
                 ordcol_sel4: string = tmsg2(int_to_string(ordcol), "u")
@@ -1272,7 +1335,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
                 cg_store_select(g, rs, pred4, schref, out, st, ordcol_sel4, descflag, limref4)
                 return CVal { cvar: out, ty: ty_result(t, ty_list(t, row_ty), err_ty) }
             }
-            arr4, nterms4 := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+            arr4, nterms4 := cg_build_term_array(g, rs, pred4)
             lval: CVal = gen_expr(g, larg.expr, ty_int(t))
             nterms4_s: string = tmsg2(int_to_string(nterms4), "u, ")
             ordcol4_s: string = tmsg2(int_to_string(ordcol), "u, ")
@@ -1313,7 +1376,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         // list, its Result Ok the primitive wraps. A predicate carrying a ||
         // normalizes to disjunctive normal form and rides the group aware count
         // primitive; a pure && predicate keeps the where lowering byte for byte.
-        predc: int64 = cg_arg_expr(g, e, 1)
+        predc: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 1))
         if cg_pred_has_or(g, predc) {
             ctarr, cgarr, cng := cg_dnf_arrays(g, rs, predc)
             callca: string = tmsg7(" = ash_store_count_any(cc, ", schref, ", ", ctarr, ", ", cgarr, tmsg5(", ", cng, "u, &", out, ");"))
@@ -1324,7 +1387,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         // The pure && predicate lowers to the same term array the where form
         // builds and the count primitive reads it, landing the Int the surface
         // promised in the fresh temporary.
-        arrc, ntermsc := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
+        arrc, ntermsc := cg_build_term_array(g, rs, predc)
         callc: string = tmsg7(" = ash_store_count_where(cc, ", schref, ", ", arrc, ", ", int_to_string(ntermsc), tmsg5("u, &", out, ");", "", ""))
         cg_line(g, tmsg3("AshStatus ", st, callc))
         cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
@@ -1358,7 +1421,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         // A predicate carrying a || normalizes to disjunctive normal form and
         // rides the group aware sum primitive, the sum column ahead of the terms;
         // a pure && predicate keeps the where lowering byte for byte.
-        preds: int64 = cg_arg_expr(g, e, 2)
+        preds: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 2))
         if cg_pred_has_or(g, preds) {
             starr, sgarr, sng := cg_dnf_arrays(g, rs, preds)
             callsa_head: string = tmsg7(" = ash_store_sum_any(cc, ", schref, ", ", int_to_string(sumcol), "u, ", starr, ", ")
@@ -1368,7 +1431,7 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
             cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
             return CVal { cvar: out, ty: ty_result(t, sum_col_ty, err_ty) }
         }
-        arrs, ntermss := cg_build_term_array(g, rs, cg_arg_expr(g, e, 2))
+        arrs, ntermss := cg_build_term_array(g, rs, preds)
         calls: string = tmsg7(" = ash_store_sum_where(cc, ", schref, ", ", int_to_string(sumcol), "u, ", arrs, tmsg5(", ", int_to_string(ntermss), "u, &", out, ");"))
         cg_line(g, tmsg3("AshStatus ", st, calls))
         cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
