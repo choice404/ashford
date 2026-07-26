@@ -5,6 +5,37 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.6] the one predicate
+
+One predicate grammar, everywhere. `Store.count` and `Store.sum` now
+take the same comparisons, the same `&&`, and the same `||` that
+`Store.query` takes, so the conjunction only rule and its refusal are
+gone rather than documented. The same compile time normalization
+applies, or of and groups decided before the program runs, and a pure
+conjunction keeps its existing lowering byte for byte down to the temp
+numbering. The Ledger's notable stops counting rows in the pledge and
+asks the store the mixed question directly, and tail_total sums both
+tails of the balances in one or, the sum twin of extremes.
+
+- retire the refusal, not just relax it: check_query_pred loses its
+  allow_or switch entirely, all six call sites read the same, the "not
+  ||" diagnostic and its dead branch are gone, and the fallback message
+  says joined with && and ||
+- lower the aggregates onto grouped primitives: ash_store_count_any and
+  ash_store_sum_any take the flat terms and the group lengths select
+  takes, share the grouped WHERE emission with it through one helper,
+  and answer through the same wrapped Ok every read form answers
+- keep what compiled compiled: a pure conjunction count or sum emits
+  the exact call it emitted before, proven against the emitted C down
+  to temp numbering, so no shipped aggregate moves primitives
+- ask the store the whole question in the skeleton: notable counts its
+  mixed group, an owner conjunction or a vip floor, with no fold left,
+  and tail_total answers 1004.0 across both tails and the column's zero
+  over no rows, both walked in the store gate
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  one predicate grammar is stated once for all three read forms, and
+  the leaves out list drops disjunction under the aggregates
+
 ## [v0.6.5] the either predicate
 
 The predicate learns or. A `Store.query` predicate now joins comparisons

@@ -214,24 +214,33 @@ contract Ledger {
     }
 
     // How many accounts are notable, either one owner's own holdings at or above
-    // a floor or anyone's holdings at or above a higher mark: Store.query reads a
+    // a floor or anyone's holdings at or above a higher mark: Store.count reads a
     // predicate that ors a two comparison group, the owner bound to a name and
     // the balance cleared against the floor, with a lone balance comparison
     // against the vip mark, so '&&' binds the owner group tighter than the '||'
-    // that widens it. count answers only '&&' predicates, so this one rides
-    // query, and the pledge folds a running total over the returned rows into the
-    // count. A predicate no account satisfies is a clean Ok(0), the empty list a
-    // fold that never runs, and only a backend failure leaves this Result as
-    // Err(StoreFailed).
+    // that widens it. count reads the same predicate grammar query does, so it
+    // answers the disjunction directly, the store counting the rows behind the
+    // boundary with none materialized into the process. A predicate no account
+    // satisfies is a clean Ok(0), and only a backend failure leaves this Result
+    // as Err(StoreFailed).
     pledge notable(who: String, floor: Float, vip: Float) -> Result<Int, LedgerError> {
-        return match Store.query(Accounts, (owner == who && balance >= floor) || balance >= vip) {
-            Ok(rows) -> {
-                let mut n = 0
-                for row in rows {
-                    n = n + 1
-                }
-                Ok(n)
-            }
+        return match Store.count(Accounts, (owner == who && balance >= floor) || balance >= vip) {
+            Ok(n) -> Ok(n)
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // The total held in the two tails of a balance range: Store.sum totals the
+    // balance column over the rows at or below a low water mark or at or above a
+    // high one, the '||' widening the predicate to either tail, and answers that
+    // one Float with the rows never materialized into the process. It is the sum
+    // twin of extremes, the same disjunction summed rather than listed. A range
+    // that no account falls outside sums the empty set to the column's own zero, a
+    // clean Ok(0.0), and only a backend failure leaves this Result as
+    // Err(StoreFailed).
+    pledge tail_total(lo: Float, hi: Float) -> Result<Float, LedgerError> {
+        return match Store.sum(Accounts, balance, balance <= lo || balance >= hi) {
+            Ok(total) -> Ok(total)
             _ -> Err(StoreFailed)
         }
     }

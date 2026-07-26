@@ -365,6 +365,24 @@ int main(void) {
         CHECK(ok_int(&r, &cnt) && cnt == 0,
               "notable(nobody, 50, 10000) matches no row and is Ok(0)");
 
+        /* tail_total is the sum twin of extremes: Store.sum over the same '||'
+         * predicate, totalling the balances in the two tails of a range rather
+         * than listing their owners. The table holds 1/alice 250, 3/injection 5,
+         * 10/ada 40, 11/ada 60, and 12/bob 999. tail_total(10.0, 500.0) totals
+         * the rows at or below 10 or at or above 500, account 3 (5) and account
+         * 12 (999), 1004.0; the middle three fall in neither tail. */
+        AshValue tail_lohi[2] = { float_val(10.0), float_val(500.0) };
+        r = run(c, "tail_total", tail_lohi, 2);
+        CHECK(ok_float(&r, &bal) && bal == 1004.0,
+              "tail_total(10.0, 500.0) sums the low and high tails");
+
+        /* A range that spans every balance leaves both tails empty, so the sum is
+         * the empty set's own zero, a clean Ok(0.0). */
+        AshValue tail_none[2] = { float_val(0.0), float_val(100000.0) };
+        r = run(c, "tail_total", tail_none, 2);
+        CHECK(ok_float(&r, &bal) && bal == 0.0,
+              "tail_total(0.0, 100000.0) matches neither tail and is Ok(0.0)");
+
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }
 

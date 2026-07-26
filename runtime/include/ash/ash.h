@@ -510,6 +510,16 @@ AshStatus ash_store_select(AshContract* c, const AshSchemaDesc* schema,
                            const uint32_t* group_lens, uint32_t ngroups,
                            uint32_t order_col, uint32_t order_desc,
                            const AshValue* limit, AshValue* out);
+/* count_where, with terms grouped as select groups and matched by OR. */
+AshStatus ash_store_count_any(AshContract* c, const AshSchemaDesc* schema,
+                              const AshStoreTerm* terms,
+                              const uint32_t* group_lens, uint32_t ngroups,
+                              AshValue* out);
+/* sum_where, with terms grouped as select groups and matched by OR. */
+AshStatus ash_store_sum_any(AshContract* c, const AshSchemaDesc* schema,
+                            uint32_t sum_col, const AshStoreTerm* terms,
+                            const uint32_t* group_lens, uint32_t ngroups,
+                            AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

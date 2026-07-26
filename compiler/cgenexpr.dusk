@@ -1071,7 +1071,15 @@ func cg_emit_init_array(g: *Cg, decl: string, arr: string, items: *Vector<string
 // query is bounded or NULL when it is not. Each comparison's value lowers into
 // its own temporary, a term repeated across groups re-lowering its value, so the
 // array initializers borrow live values.
-func cg_store_select(g: *Cg, rs: RecSig, xid: int64, schref: string, out: string, st: string, ordcol_s: string, dir_s: string, limref: string) -> void {
+// Flattens a Store predicate's disjunctive normal form into one AshStoreTerm
+// array and a parallel uint32_t group-length array, the shape the group aware
+// store primitives read: the primitive reads group i as the group_lens[i] terms
+// after the groups before it. Each group's comparisons flatten in order and each
+// comparison's value lowers into its own temporary, a term repeated across groups
+// re-lowering its value, so the array initializers borrow live values. Returns
+// the term array name, the length array name, and the group count as a bare Int
+// string the caller suffixes with 'u' as it feeds its primitive.
+func cg_dnf_arrays(g: *Cg, rs: RecSig, xid: int64) -> (string, string, string) {
     dnf: *Vector<*Vector<int64>> = cg_dnf(g, xid)
     terms: *Vector<string> = alloc(vec_new())
     lens: *Vector<string> = alloc(vec_new())
@@ -1090,7 +1098,11 @@ func cg_store_select(g: *Cg, rs: RecSig, xid: int64, schref: string, out: string
     cg_emit_init_array(g, "AshStoreTerm ", tarr, terms)
     garr: string = cg_tmp(g)
     cg_emit_init_array(g, "uint32_t ", garr, lens)
-    ng: string = int_to_string(vec_len(dnf))
+    return (tarr, garr, int_to_string(vec_len(dnf)))
+}
+
+func cg_store_select(g: *Cg, rs: RecSig, xid: int64, schref: string, out: string, st: string, ordcol_s: string, dir_s: string, limref: string) -> void {
+    tarr, garr, ng := cg_dnf_arrays(g, rs, xid)
     head: string = tmsg7("AshStatus ", st, " = ash_store_select(cc, ", schref, ", ", tarr, ", ")
     mid: string = tmsg7(garr, ", ", ng, "u, ", ordcol_s, ", ", dir_s)
     tail: string = tmsg7(", ", limref, ", &", out, ");", "", "")
@@ -1297,10 +1309,21 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
     }
     if str_eq(op, "count") {
         // count answers how many rows the predicate accepts without
-        // materializing any of them, so the predicate lowers to the same term
-        // array the where form builds and the count primitive reads it, landing
-        // the Int the surface promised in the fresh temporary. The value is not
-        // a list but the count itself, its Result Ok the primitive wraps.
+        // materializing any of them, its value the count itself and never a
+        // list, its Result Ok the primitive wraps. A predicate carrying a ||
+        // normalizes to disjunctive normal form and rides the group aware count
+        // primitive; a pure && predicate keeps the where lowering byte for byte.
+        predc: int64 = cg_arg_expr(g, e, 1)
+        if cg_pred_has_or(g, predc) {
+            ctarr, cgarr, cng := cg_dnf_arrays(g, rs, predc)
+            callca: string = tmsg7(" = ash_store_count_any(cc, ", schref, ", ", ctarr, ", ", cgarr, tmsg5(", ", cng, "u, &", out, ");"))
+            cg_line(g, tmsg3("AshStatus ", st, callca))
+            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            return CVal { cvar: out, ty: ty_result(t, ty_int(t), err_ty) }
+        }
+        // The pure && predicate lowers to the same term array the where form
+        // builds and the count primitive reads it, landing the Int the surface
+        // promised in the fresh temporary.
         arrc, ntermsc := cg_build_term_array(g, rs, cg_arg_expr(g, e, 1))
         callc: string = tmsg7(" = ash_store_count_where(cc, ", schref, ", ", arrc, ", ", int_to_string(ntermsc), tmsg5("u, &", out, ");", "", ""))
         cg_line(g, tmsg3("AshStatus ", st, callc))
@@ -1331,6 +1354,19 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         if sumcol < 0 {
             cg_unsupported(g, e.lo, e.hi, "a Store.sum on an unknown column")
             return bad_val(g)
+        }
+        // A predicate carrying a || normalizes to disjunctive normal form and
+        // rides the group aware sum primitive, the sum column ahead of the terms;
+        // a pure && predicate keeps the where lowering byte for byte.
+        preds: int64 = cg_arg_expr(g, e, 2)
+        if cg_pred_has_or(g, preds) {
+            starr, sgarr, sng := cg_dnf_arrays(g, rs, preds)
+            callsa_head: string = tmsg7(" = ash_store_sum_any(cc, ", schref, ", ", int_to_string(sumcol), "u, ", starr, ", ")
+            callsa_tail: string = tmsg7(sgarr, ", ", sng, "u, &", out, ");", "")
+            callsa: string = tmsg2(callsa_head, callsa_tail)
+            cg_line(g, tmsg3("AshStatus ", st, callsa))
+            cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+            return CVal { cvar: out, ty: ty_result(t, sum_col_ty, err_ty) }
         }
         arrs, ntermss := cg_build_term_array(g, rs, cg_arg_expr(g, e, 2))
         calls: string = tmsg7(" = ash_store_sum_where(cc, ", schref, ", ", int_to_string(sumcol), "u, ", arrs, tmsg5(", ", int_to_string(ntermss), "u, &", out, ");"))

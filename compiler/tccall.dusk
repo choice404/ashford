@@ -505,31 +505,19 @@ func check_query_term(tc: *Tc, rs: RecSig, sname: int64, x: ExprNode) -> void {
     }
 }
 
-// The predicate that is the second argument of Store.query: a comparison is one
-// term, a && joins two predicates and each side recurses, and a || joins two
-// predicates the same way when the caller admits it. query admits ||, so its
-// predicate is a free boolean tree of comparisons over && and ||; count and sum
-// do not, so a || in their predicate is refused with the form the argument
-// should have taken. allow_or carries that choice down every recursion, so the
-// refusal lands only where the caller withheld ||. The walk mirrors the codegen
-// that normalizes the same tree.
-func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64, allow_or: bool) -> void {
+// The predicate that is the second argument of Store.query, and the predicate
+// count and sum read the same way: a comparison is one term, and a && or a ||
+// joins two predicates with each side recursing. Every Store predicate is one
+// grammar, a free boolean tree of comparisons over && and ||, so the walk that
+// validates it mirrors the codegen that normalizes the same tree.
+func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64) -> void {
     a: *Ast = (*tc).ast
     x: ExprNode = vec_get((*a).exprs, xid)
     if x.kind == xk_binary() {
         op: int64 = x.a
-        if op == bop_and() {
-            check_query_pred(tc, rs, sname, x.b, allow_or)
-            check_query_pred(tc, rs, sname, x.c, allow_or)
-            return
-        }
-        if op == bop_or() {
-            if allow_or {
-                check_query_pred(tc, rs, sname, x.b, allow_or)
-                check_query_pred(tc, rs, sname, x.c, allow_or)
-                return
-            }
-            tc_emit(tc, x.lo, x.hi, "Store.query joins comparisons with &&, not ||")
+        if op == bop_and() || op == bop_or() {
+            check_query_pred(tc, rs, sname, x.b)
+            check_query_pred(tc, rs, sname, x.c)
             return
         }
         if op == bop_eq() || op == bop_ne() || op == bop_lt() || op == bop_le() || op == bop_gt() || op == bop_ge() {
@@ -537,7 +525,7 @@ func check_query_pred(tc: *Tc, rs: RecSig, sname: int64, xid: int64, allow_or: b
             return
         }
     }
-    tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with &&")
+    tc_emit(tc, x.lo, x.hi, "the second argument of Store.query is a column and a value, or a predicate of comparisons joined with && and ||")
 }
 
 // The third argument of the ordered Store.query, asc(column) or desc(column):
@@ -667,7 +655,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
         // that binds one column with '=='.
         if e.c == 2 {
             a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
-            check_query_pred(tc, rs, sc.name, a1.expr, true)
+            check_query_pred(tc, rs, sc.name, a1.expr)
             return ty_result(t, ty_list(t, row_ty), err_ty)
         }
         // The ordered form: a predicate, then asc(column) or desc(column). It is
@@ -688,7 +676,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
             // predicate and the count still walk their own checks so their
             // faults surface beside this one.
             if str_eq(query_suffix_name(tc, a2.expr), "limit") {
-                check_query_pred(tc, rs, sc.name, a1.expr, true)
+                check_query_pred(tc, rs, sc.name, a1.expr)
                 check_query_limit(tc, a2.expr)
                 tc_emit(tc, a2e.lo, a2e.hi, "a bounded Store.query names its order")
                 return ty_result(t, ty_list(t, row_ty), err_ty)
@@ -702,7 +690,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
                 }
             }
             if a2_order || a1e.kind != xk_ident() {
-                check_query_pred(tc, rs, sc.name, a1.expr, true)
+                check_query_pred(tc, rs, sc.name, a1.expr)
                 if a2_order {
                     check_query_order(tc, rs, sc.name, a2.expr)
                 } else {
@@ -725,7 +713,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
             a2e: ExprNode = vec_get((*a).exprs, a2.expr)
             a3: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 3))
             a3e: ExprNode = vec_get((*a).exprs, a3.expr)
-            check_query_pred(tc, rs, sc.name, a1.expr, true)
+            check_query_pred(tc, rs, sc.name, a1.expr)
             mut a2_order: bool = false
             if a2e.kind == xk_call() {
                 occ: ExprNode = vec_get((*a).exprs, a2e.a)
@@ -781,17 +769,17 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
     if str_eq(op, "count") {
         // count answers how many rows a predicate accepts without materializing
         // any of them, so the result carries an Int. It names a schema and one
-        // predicate, the two argument form's own: a comparison, or comparisons
-        // joined with &&, each comparing a bare column resolved against the
-        // schema to a value of that column's type. Any other arity is refused by
-        // the shape the call should have taken; the predicate walks the same
-        // check the query predicate does, so its faults surface beside it.
+        // predicate, the query's own: a comparison, or comparisons joined with
+        // && and ||, each comparing a bare column resolved against the schema to
+        // a value of that column's type. Any other arity is refused by the shape
+        // the call should have taken; the predicate walks the same check the
+        // query predicate does, so its faults surface beside it.
         if e.c != 2 {
             tc_emit(tc, e.lo, e.hi, "Store.count takes a schema and a predicate")
         }
         if e.c >= 2 {
             a1: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 1))
-            check_query_pred(tc, rs, sc.name, a1.expr, false)
+            check_query_pred(tc, rs, sc.name, a1.expr)
         }
         return ty_result(t, ty_int(t), err_ty)
     }
@@ -841,7 +829,7 @@ func check_store_op(tc: *Tc, e: ExprNode, mname: int64) -> int64 {
         }
         if e.c >= 3 {
             a2: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b + 2))
-            check_query_pred(tc, rs, sc.name, a2.expr, false)
+            check_query_pred(tc, rs, sc.name, a2.expr)
         }
         return ty_result(t, col_ty, err_ty)
     }

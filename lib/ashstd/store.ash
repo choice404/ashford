@@ -44,11 +44,11 @@
 // alike, and a negative count is a runtime refusal, not a compile time one.
 // Store.count reads a two argument predicate and answers how many rows pass it
 // as an Int, the rows never materialized into the process: the store counts them
-// behind the boundary and hands back only the number. count and sum join their
-// comparisons with && alone, never ||, so their predicate is one AND-group and a
-// || in it is refused at compile time.
+// behind the boundary and hands back only the number. count and sum read the
+// same predicate grammar query does, comparisons joined with && and ||, the one
+// free boolean tree the compiler normalizes before it reaches the store.
 // Store.sum names a schema, a bare Int or Float column to total, and that same
-// && only predicate, and answers the total of that column over the rows the
+// predicate, and answers the total of that column over the rows the
 // predicate accepts, an Int column giving Result<Int, StoreError> and a Float column
 // Result<Float, StoreError>; the rows are never materialized, the store totals
 // them behind the boundary, and an empty set sums to the column's own zero.
