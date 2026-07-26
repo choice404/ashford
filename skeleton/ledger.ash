@@ -285,6 +285,43 @@ contract Ledger {
         }
     }
 
+    // The width of the balance band across the accounts at or above a floor:
+    // Store.min and Store.max read the least and the greatest balance the floor
+    // admits, each the store's own answer with the rows never materialized into
+    // the process, and the pledge answers their difference. The two reads are
+    // Options, Some on a matching row and None on the empty set, so the match
+    // nests: both Some folds to Ok(max - min), and either None is a clean
+    // Ok(0.0). The width of an empty band is zero, no least and no greatest to
+    // subtract, so the pledge answers zero rather than inventing a bound; only a
+    // backend failure leaves this Result as Err(StoreFailed) for the status
+    // channel.
+    pledge spread(lo: Float) -> Result<Float, LedgerError> {
+        return match Store.min(Accounts, balance, balance >= lo) {
+            Ok(Some(mn)) -> match Store.max(Accounts, balance, balance >= lo) {
+                Ok(Some(mx)) -> Ok(mx - mn)
+                Ok(None) -> Ok(0.0)
+                _ -> Err(StoreFailed)
+            }
+            Ok(None) -> Ok(0.0)
+            _ -> Err(StoreFailed)
+        }
+    }
+
+    // The mean balance across the accounts at or above a floor: Store.avg reads
+    // the average balance the floor admits, the store's own answer with the rows
+    // never materialized into the process, and the pledge passes it straight
+    // through. avg answers an Option, Some the mean on a matching row and None on
+    // the empty set, since the mean of no rows is absent rather than zero, so the
+    // Option rides all the way out through this pledge's own return type, an
+    // Ok(o) that keeps whichever the store handed back. Only a backend failure
+    // leaves this Result as Err(StoreFailed) for the status channel.
+    pledge midpoint(lo: Float) -> Result<Option<Float>, LedgerError> {
+        return match Store.avg(Accounts, balance, balance >= lo) {
+            Ok(o) -> Ok(o)
+            _ -> Err(StoreFailed)
+        }
+    }
+
     // The transfer: two writes that must both land or both vanish. The
     // transactional modifier makes the subcontract one all-or-nothing episode,
     // so the runtime opens a transaction on debit, buffers credit's write in the

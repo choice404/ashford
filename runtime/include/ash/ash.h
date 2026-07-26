@@ -520,6 +520,19 @@ AshStatus ash_store_sum_any(AshContract* c, const AshSchemaDesc* schema,
                             uint32_t sum_col, const AshStoreTerm* terms,
                             const uint32_t* group_lens, uint32_t ngroups,
                             AshValue* out);
+/* Aggregate over terms grouped as select groups and matched by OR. Min and
+ * max answer the column type. Avg answers Float. Empty matches answer None. */
+typedef enum AshStoreAgg {
+    ASH_AGG_MIN = 0,
+    ASH_AGG_MAX = 1,
+    ASH_AGG_AVG = 2,
+} AshStoreAgg;
+
+AshStatus ash_store_agg_any(AshContract* c, const AshSchemaDesc* schema,
+                            uint32_t agg, uint32_t agg_col,
+                            const AshStoreTerm* terms,
+                            const uint32_t* group_lens, uint32_t ngroups,
+                            AshValue* out);
 AshStatus ash_store_insert(AshContract* c, const AshSchemaDesc* schema,
                            const AshValue* row, AshValue* out);
 AshStatus ash_store_update(AshContract* c, const AshSchemaDesc* schema,

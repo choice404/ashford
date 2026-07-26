@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <math.h>
 
 static int g_fail = 0;
 
@@ -102,6 +103,32 @@ static int ok_str(const AshValue* r, const char* want) {
     if ((size_t)p->as.s.len != wl) return 0;
     if (wl == 0) return 1;
     return memcmp(p->as.s.ptr, want, wl) == 0;
+}
+
+/* An Ok(Some(Float)) result, its inner Float read out for comparison. The
+ * aggregate reads answer an Option in the Result's Ok arm, Some around the
+ * value on a matching set, so the read unwraps the Result then the Option. */
+static int ok_some_float(const AshValue* r, double* out) {
+    if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
+    const AshValue* opt = (const AshValue*)r->as.box;
+    if (opt->ty != ASH_TY_OPTION || opt->tag != 1 || !opt->as.box) return 0;
+    const AshValue* p = (const AshValue*)opt->as.box;
+    if (p->ty != ASH_TY_FLOAT) return 0;
+    *out = p->as.f;
+    return 1;
+}
+
+/* An Ok(None) result: the aggregate of an empty set, absent and never zero. */
+static int ok_none(const AshValue* r) {
+    if (r->ty != ASH_TY_RESULT || r->tag != 0 || !r->as.box) return 0;
+    const AshValue* opt = (const AshValue*)r->as.box;
+    return opt->ty == ASH_TY_OPTION && opt->tag == 0;
+}
+
+/* Two Floats equal within a small epsilon, the mean of a division never held
+ * to the exact bits a literal spells. */
+static int close_enough(double a, double b) {
+    return fabs(a - b) < 1e-9;
 }
 
 /* Whether a Result is an Err, the contract's own error surfacing as a value. */
@@ -425,6 +452,43 @@ int main(void) {
         r = run(c, "others", others_none, 1);
         CHECK(ok_int(&r, &cnt) && cnt == 5,
               "others(nobody) counts all five rows");
+
+        /* Store.min and Store.max over an aggregate: spread reads the least and
+         * the greatest balance at or above a floor and answers their difference.
+         * The table holds 1/alice 250, 3/injection 5, 10/ada 40, 11/ada 60, and
+         * 12/bob 999. spread(0.0) admits every row, so the least is 5 and the
+         * greatest 999 and the width is 994.0, the store aggregating both behind
+         * the boundary with no row materialized. */
+        AshValue spread0[1] = { float_val(0.0) };
+        r = run(c, "spread", spread0, 1);
+        CHECK(ok_float(&r, &bal) && bal == 994.0,
+              "spread(0.0) is 999 - 5 across the whole table");
+
+        /* A floor no account clears leaves both the min and the max on the empty
+         * set, each Ok(None), so the width of the empty band is a clean Ok(0.0),
+         * no least and no greatest to subtract. */
+        AshValue spread_hi[1] = { float_val(10000.0) };
+        r = run(c, "spread", spread_hi, 1);
+        CHECK(ok_float(&r, &bal) && bal == 0.0,
+              "spread(10000.0) matches no row and is a zero-width Ok(0.0)");
+
+        /* Store.avg over an aggregate: midpoint reads the mean balance at or
+         * above a floor and passes the Option straight through its own return
+         * type. midpoint(0.0) averages all five balances, 1354 / 5 = 270.8, so
+         * the Ok carries Some(270.8), the mean a Float even though the empty set
+         * would be None. */
+        AshValue mid0[1] = { float_val(0.0) };
+        r = run(c, "midpoint", mid0, 1);
+        double mean = 0.0;
+        CHECK(ok_some_float(&r, &mean) && close_enough(mean, 270.8),
+              "midpoint(0.0) is Some(270.8), the mean of the five balances");
+
+        /* A floor no account clears leaves avg on the empty set, so the mean is
+         * absent and midpoint answers Ok(None) rather than a fabricated zero. */
+        AshValue mid_hi[1] = { float_val(10000.0) };
+        r = run(c, "midpoint", mid_hi, 1);
+        CHECK(ok_none(&r),
+              "midpoint(10000.0) matches no row and is Ok(None)");
 
         CHECK(ash_contract_break(c) == ASH_OK, "break Ledger");
     }

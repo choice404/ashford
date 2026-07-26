@@ -18,6 +18,9 @@
 //   Store.query(S, predicate, desc(column), limit(n)) -> Result<List<Row>, StoreError>
 //   Store.count(S, predicate)      -> Result<Int, StoreError>   (rows not materialized)
 //   Store.sum(S, column, predicate) -> Result<Int|Float, StoreError> (rows not materialized)
+//   Store.min(S, column, predicate) -> Result<Option<Col>, StoreError> (rows not materialized)
+//   Store.max(S, column, predicate) -> Result<Option<Col>, StoreError> (rows not materialized)
+//   Store.avg(S, column, predicate) -> Result<Option<Float>, StoreError> (Int or Float column)
 //   Store.insert(S, row)           -> Result<Unit, StoreError>
 //   Store.update(S, key, row)      -> Result<Unit, StoreError>
 //   Store.delete(S, key)           -> Result<Unit, StoreError>
@@ -62,6 +65,15 @@
 // predicate accepts, an Int column giving Result<Int, StoreError> and a Float column
 // Result<Float, StoreError>; the rows are never materialized, the store totals
 // them behind the boundary, and an empty set sums to the column's own zero.
+// Store.min, Store.max, and Store.avg read the same schema, column, and
+// predicate shape, and each answers an Option so the empty set is Ok(None)
+// rather than a fabricated zero: the least, the greatest, and the mean of no
+// rows are absent and spoken of as None. min and max order any of the seven
+// scalar columns and answer that column's own type, Result<Option<Col>,
+// StoreError>; avg has meaning only over an Int or Float column and always
+// answers Result<Option<Float>, StoreError>, the mean a Float even over an Int
+// column. The rows are never materialized, the store aggregates them behind the
+// boundary and hands back the one Option.
 // Every operation returns a Result so a store failure
 // is a value in the surface's own error type. The
 // backend failing the runtime, a connection lost, a disk with no room, a

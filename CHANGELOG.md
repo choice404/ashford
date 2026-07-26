@@ -5,6 +5,42 @@ short bulleted shape of a change; this file carries the whole of it, the design
 notes and the reasons a bullet has no room for. Versions are the `v` tags on the
 history, one per milestone.
 
+## [v0.6.8] the empty answer
+
+The aggregates that have no zero learn to say so. `Store.min`,
+`Store.max`, and `Store.avg` take the schema, column, and predicate
+shape sum takes, the full predicate grammar included, and each answers
+an Option: `Some` of the value over a non empty match and `None` over
+an empty one, because an empty set has no smallest member, no largest,
+and no mean, and the surface says so rather than inventing one. Sum
+keeps its zero on purpose; an empty ledger owes nothing, but it has no
+cheapest account, and the two answers differ because the questions do.
+min and max take any scalar column, since every scalar column compares,
+and avg takes a numeric one and always answers Float.
+
+- answer the extremes without an aggregate: min and max lower onto an
+  ordered limit one read of the column itself, zero rows None and one
+  row the Some, so no SQL NULL is ever decoded and a String extreme
+  deep copies from scratch onto the instance before the scratch frees
+- answer the mean by count and coalesced sum: the count decides None,
+  the coalesce guards the decode, and the divide promotes an Int
+  column's total to Float, so again no NULL reaches the type check
+- lower all three onto one grouped primitive: ash_store_agg_any carries
+  the kind and the column beside the flat terms and group lengths every
+  grouped read takes, negation eliminated and disjunction normalized on
+  the same shared path
+- surface the Option end to end: spread answers max minus min with the
+  empty spread an honest zero the pledge chose, and midpoint hands the
+  avg's Option straight through its own return type, so the bridge
+  carries a None a remote caller can see
+- walk both answers in the gate: spread reads 994.0 across the table
+  and 0.0 over no rows, midpoint reads 270.8 over five accounts and
+  None over none
+- keep the surface honest in lib/ashstd/store.ash and docs/database.md:
+  three rows join the operation table with the empty set spoken as
+  None, and the leaves out list narrows to grouping, an offset, and
+  arbitrary SQL
+
 ## [v0.6.7] the negated predicate
 
 The predicate learns not, and the database never hears about it. A `!`

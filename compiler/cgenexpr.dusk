@@ -1437,6 +1437,49 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
         cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
         return CVal { cvar: out, ty: ty_result(t, sum_col_ty, err_ty) }
     }
+    if str_eq(op, "min") || str_eq(op, "max") || str_eq(op, "avg") {
+        // min, max, and avg aggregate one column over the rows the predicate
+        // accepts without materializing any of them. The second argument is a
+        // bare column name the checker already resolved to a real schema field,
+        // so it lowers to that field's declaration index; the aggregate kind is
+        // the enum the primitive reads, 0 min, 1 max, 2 avg. Unlike sum, these
+        // three are new, so no golden pins their bytes: the predicate always
+        // normalizes to disjunctive normal form and rides the one group aware
+        // primitive, a pure && predicate a single group of one and no special
+        // path. ash_store_agg_any lands the answer, an Option the runtime fills
+        // Some on a match and None on the empty set, so the value is
+        // Result<Option<Col>, StoreError>, and avg's own answer is a Float even
+        // over an Int column.
+        a1ge: ExprNode = vec_get((*a).exprs, cg_arg_expr(g, e, 1))
+        mut aggcol: int64 = -1
+        mut agg_col_ty: int64 = ty_unknown(t)
+        mut gi: int64 = 0
+        while gi < rs.len {
+            f: FieldSig = sig_field((*g).sigs, rs.off, gi)
+            if f.name == a1ge.a {
+                aggcol = gi
+                agg_col_ty = f.ty
+            }
+            gi = gi + 1
+        }
+        if aggcol < 0 {
+            cg_unsupported(g, e.lo, e.hi, "a Store aggregate on an unknown column")
+            return bad_val(g)
+        }
+        mut aggkind: string = "0u"
+        if str_eq(op, "max") { aggkind = "1u" }
+        if str_eq(op, "avg") { aggkind = "2u" }
+        predg: int64 = cg_pred_positive(g, cg_arg_expr(g, e, 2))
+        gtarr, ggarr, gng := cg_dnf_arrays(g, rs, predg)
+        callg_head: string = tmsg7(" = ash_store_agg_any(cc, ", schref, ", ", aggkind, ", ", int_to_string(aggcol), "u, ")
+        callg_tail: string = tmsg7(gtarr, ", ", ggarr, ", ", gng, "u, &", tmsg2(out, ");"))
+        callg: string = tmsg2(callg_head, callg_tail)
+        cg_line(g, tmsg3("AshStatus ", st, callg))
+        cg_line(g, tmsg5("if (", st, " != ASH_OK) return ", st, ";"))
+        mut agg_ret: int64 = agg_col_ty
+        if str_eq(op, "avg") { agg_ret = ty_float(t) }
+        return CVal { cvar: out, ty: ty_result(t, ty_option(t, agg_ret), err_ty) }
+    }
     if str_eq(op, "insert") {
         row: CVal = gen_expr(g, cg_arg_expr(g, e, 1), row_ty)
         call2: string = tmsg5(" = ash_store_insert(cc, ", schref, ", &", row.cvar, tmsg3(", &", out, ");"))

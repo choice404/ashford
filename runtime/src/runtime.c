@@ -1192,6 +1192,49 @@ static char* store_sql_sum_any(const AshSchemaDesc* s,
     return q;
 }
 
+/* SELECT cN FROM table WHERE (g0) OR (g1) ORDER BY cN ASC LIMIT 1. */
+static char* store_sql_extreme_any(const AshSchemaDesc* s,
+                                   uint32_t agg_col,
+                                   uint32_t desc,
+                                   const AshStoreTerm* terms,
+                                   const uint32_t* group_lens,
+                                   uint32_t ngroups,
+                                   uint32_t total_terms) {
+    const char* dir = desc ? "DESC" : "ASC";
+    size_t need = 80 + strlen(s->table) + strlen(s->cols[agg_col].name) * 2 +
+                  strlen(dir) + store_sql_any_where_span(s, terms, ngroups,
+                                                         total_terms);
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n, "SELECT %s FROM %s WHERE ",
+                          s->cols[agg_col].name, s->table);
+    n = store_sql_emit_any_where(q, need, n, s, terms, group_lens, ngroups);
+    snprintf(q + n, need - n, " ORDER BY %s %s LIMIT 1",
+             s->cols[agg_col].name, dir);
+    return q;
+}
+
+/* SELECT COUNT(*), COALESCE(SUM(cN), 0) FROM table WHERE (g0) OR (g1). */
+static char* store_sql_avg_any(const AshSchemaDesc* s,
+                               uint32_t agg_col,
+                               const AshStoreTerm* terms,
+                               const uint32_t* group_lens,
+                               uint32_t ngroups,
+                               uint32_t total_terms) {
+    const char* zero = s->cols[agg_col].ty == ASH_TY_FLOAT ? "0.0" : "0";
+    size_t need = 96 + strlen(s->table) + strlen(s->cols[agg_col].name) + strlen(zero) +
+                  store_sql_any_where_span(s, terms, ngroups, total_terms);
+    char* q = (char*)malloc(need);
+    if (!q) return NULL;
+    size_t n = 0;
+    n += (size_t)snprintf(q + n, need - n,
+                          "SELECT COUNT(*), COALESCE(SUM(%s), %s) FROM %s WHERE ",
+                          s->cols[agg_col].name, zero, s->table);
+    store_sql_emit_any_where(q, need, n, s, terms, group_lens, ngroups);
+    return q;
+}
+
 /* INSERT INTO table(c0, ...) VALUES(?, ...), every column bound positionally. */
 static char* store_sql_insert(const AshSchemaDesc* s) {
     size_t need = 48 + strlen(s->table) + store_cols_span(s) + (size_t)s->ncols * 3;
@@ -1625,6 +1668,128 @@ AshStatus ash_store_sum_any(AshContract* c, const AshSchemaDesc* schema,
                         }
                     }
                 }
+            }
+            scratch_store_free(&scratch);
+        }
+        free(sql);
+        free(params);
+    }
+    pthread_mutex_unlock(&c->mu);
+    return st;
+}
+
+AshStatus ash_store_agg_any(AshContract* c, const AshSchemaDesc* schema,
+                            uint32_t agg, uint32_t agg_col,
+                            const AshStoreTerm* terms,
+                            const uint32_t* group_lens, uint32_t ngroups,
+                            AshValue* out) {
+    if (!c || !schema || !terms || !group_lens || !out) return ASH_ERR_TYPE;
+    memset(out, 0, sizeof(*out));
+    if (schema->ncols == 0 || ngroups == 0) return ASH_ERR_TYPE;
+    if (agg > ASH_AGG_AVG) return ASH_ERR_TYPE;
+    uint32_t total_terms = 0;
+    for (uint32_t g = 0; g < ngroups; g++) {
+        if (group_lens[g] == 0) return ASH_ERR_TYPE;
+        if (UINT32_MAX - total_terms < group_lens[g]) return ASH_ERR_TYPE;
+        total_terms += group_lens[g];
+    }
+    for (uint32_t i = 0; i < total_terms; i++) {
+        if (terms[i].col >= schema->ncols) return ASH_ERR_TYPE;
+        if (terms[i].cmp > ASH_CMP_GE) return ASH_ERR_TYPE;
+        if (!terms[i].value) return ASH_ERR_TYPE;
+        if (terms[i].value->ty != schema->cols[terms[i].col].ty) return ASH_ERR_TYPE;
+    }
+    if (agg_col >= schema->ncols) return ASH_ERR_TYPE;
+    uint32_t agg_ty = schema->cols[agg_col].ty;
+    if (agg == ASH_AGG_AVG && agg_ty != ASH_TY_INT && agg_ty != ASH_TY_FLOAT) {
+        return ASH_ERR_TYPE;
+    }
+    pthread_mutex_lock(&c->mu);
+    AshStatus st = ASH_ERR_STORE;
+    if (c->store) {
+        char* sql = NULL;
+        uint32_t result_types[2] = { ASH_TY_INT, agg_ty };
+        uint32_t nresult_types = 1;
+        if (agg == ASH_AGG_AVG) {
+            sql = store_sql_avg_any(schema, agg_col, terms, group_lens, ngroups,
+                                    total_terms);
+            nresult_types = 2;
+        } else {
+            sql = store_sql_extreme_any(schema, agg_col, agg == ASH_AGG_MAX,
+                                        terms, group_lens, ngroups, total_terms);
+            result_types[0] = agg_ty;
+        }
+        AshValue* params = (AshValue*)malloc((size_t)total_terms * sizeof(AshValue));
+        if (!sql || !params) {
+            st = ASH_ERR_OOM;
+        } else {
+            for (uint32_t i = 0; i < total_terms; i++) params[i] = *terms[i].value;
+            StoreScratchAlloc scratch = { NULL };
+            AshStoreAlloc alloc = { scratch_store_bytes, &scratch };
+            AshValue rows;
+            st = ash_store_query(c->store, sql, params, total_terms, result_types, NULL,
+                                 nresult_types, &alloc, &rows);
+            if (st == ASH_OK) {
+                AshValue opt;
+                memset(&opt, 0, sizeof(opt));
+                opt.ty = ASH_TY_OPTION;
+                if (agg == ASH_AGG_AVG) {
+                    if (rows.ty != ASH_TY_LIST || rows.as.list.len != 1 ||
+                        !rows.as.list.data) {
+                        st = ASH_ERR_STORE;
+                    } else {
+                        AshValue* rec = (AshValue*)rows.as.list.data;
+                        if (rec[0].ty != ASH_TY_RECORD || rec[0].as.list.len != 2 ||
+                            !rec[0].as.list.data) {
+                            st = ASH_ERR_STORE;
+                        } else {
+                            AshValue* field = (AshValue*)rec[0].as.list.data;
+                            if (field[0].ty != ASH_TY_INT || field[1].ty != agg_ty) {
+                                st = ASH_ERR_STORE;
+                            } else if (field[0].as.i != 0) {
+                                AshValue* box = ash_box(c);
+                                if (!box) {
+                                    st = ASH_ERR_OOM;
+                                } else {
+                                    memset(box, 0, sizeof(*box));
+                                    box->ty = ASH_TY_FLOAT;
+                                    double sum = agg_ty == ASH_TY_INT
+                                                     ? (double)field[1].as.i
+                                                     : field[1].as.f;
+                                    box->as.f = sum / (double)field[0].as.i;
+                                    opt.tag = 1;
+                                    opt.as.box = box;
+                                }
+                            }
+                        }
+                    }
+                } else if (rows.ty != ASH_TY_LIST || rows.as.list.len > 1 ||
+                           (rows.as.list.len && !rows.as.list.data)) {
+                    st = ASH_ERR_STORE;
+                } else if (rows.as.list.len > 0) {
+                    AshValue* rec = (AshValue*)rows.as.list.data;
+                    if (rec[0].ty != ASH_TY_RECORD || rec[0].as.list.len != 1 ||
+                        !rec[0].as.list.data) {
+                        st = ASH_ERR_STORE;
+                    } else {
+                        AshValue* field = (AshValue*)rec[0].as.list.data;
+                        if (field[0].ty != agg_ty) {
+                            st = ASH_ERR_STORE;
+                        } else {
+                            AshValue* box = ash_box(c);
+                            if (!box) {
+                                st = ASH_ERR_OOM;
+                            } else {
+                                st = ash_value_deep_copy(c, &field[0], box);
+                                if (st == ASH_OK) {
+                                    opt.tag = 1;
+                                    opt.as.box = box;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (st == ASH_OK) st = store_ok(c, &opt, out);
             }
             scratch_store_free(&scratch);
         }
