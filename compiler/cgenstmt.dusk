@@ -201,6 +201,30 @@ func gen_while(g: *Cg, s: StmtNode) -> void {
     cg_line(g, "}")
 }
 
+// for over a Map: a counted C for loop over the flat [k0,v0,k1,v1,...] store,
+// stepping two slots at a time so the loop variable binds each key at its even
+// slot, a struct copy of it the same way the List form copies an element. The
+// entry count is snapshotted into a local before the loop, so a key the body
+// inserts lands past the frozen bound and does not join the current pass;
+// an update to an existing key moves its value, not its slot, so it is seen.
+// The data pointer is re-read each pass, so an insert that reallocates the
+// store never leaves a stale base behind.
+func gen_for_map(g: *Cg, s: StmtNode, it: CVal, n: TyNode) -> void {
+    ln: string = cg_tmp(g)
+    cg_line(g, tmsg7("uint64_t ", ln, " = ", it.cvar, ".as.list.len;", "", ""))
+    iv: string = cg_tmp(g)
+    cg_line(g, tmsg7("for (uint64_t ", iv, " = 0; ", iv, tmsg3(" < ", ln, "; "), tmsg2(iv, " += 2) {"), ""))
+    (*g).indent = (*g).indent + 1
+    ev: string = cg_tmp(g)
+    cg_line(g, tmsg7("GeasValue ", ev, " = ((const GeasValue*)", it.cvar, ".as.list.data)[", tmsg2(iv, "];"), ""))
+    cg_push_scope(g)
+    cg_declare(g, s.a, ev, n.a)
+    gen_block(g, s.c)
+    cg_pop_scope(g)
+    (*g).indent = (*g).indent - 1
+    cg_line(g, "}")
+}
+
 // for over a List: a counted C for loop over the element array, the loop
 // variable a struct copy of the slot, so continue lands on the increment and
 // an empty list runs the body zero times.
@@ -208,6 +232,10 @@ func gen_for(g: *Cg, s: StmtNode) -> void {
     t: *TyArena = (*g).ty
     it: CVal = gen_expr(g, s.b, -1)
     n: TyNode = ty_get(t, it.ty)
+    if n.kind == tyk_map() {
+        gen_for_map(g, s, it, n)
+        return
+    }
     if n.kind != tyk_list() {
         cg_unsupported(g, (*g).cur_lo, (*g).cur_hi, "for over this type in a pledge body")
         return

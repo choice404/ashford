@@ -4,6 +4,37 @@ Every released version of Geas, newest first. The language was named
 Ashford through v0.6.8; entries below the rename keep the names they
 shipped with, because a changelog that rewrites its own past is not one.
 
+## [v0.7.2] the walked map
+
+The map opens to the language that owns it. A `for` over a `Map<K, V>`
+binds the key, first inserted first, the same insertion order the wire,
+equality, and the bridge already speak, and the body reads the value
+through the map itself. `len` arrives beside it, the one builtin both
+collections share: the element count of a list, the entry count of a
+map. Neither feature touches the runtime, because the storage was
+already the ordered pair array the semantics promised; the language
+just learns to say what it always kept.
+
+- retire the refusal in the checker: for binds a map's key type where
+  it bound a list's element, and the wrong operand diagnostic now names
+  both collections
+- walk the store the runtime already keeps: the loop snapshots the
+  entry count, strides the flat pair array by two, and re reads the
+  base each pass, so a key the body inserts lands past the frozen bound
+  and is not visited this walk, an updated key keeps its slot and is,
+  and the rule is written in the grammar where for lives
+- reserve len in callee position only: len(x) answers Int over a List
+  or a Map, refuses anything else by name, and a binding named len
+  stays legal because the spelling is special only where a call is
+- prove it in the gauntlet, in and out: ordered_keys walks b then a
+  then c because insertion beats the alphabet, sizes sums both lens,
+  and merge_counts walks two maps the C host built and handed across
+  the boundary, so the iteration surface holds for a map the instance
+  did not build itself
+- write it down where the semantics live: the grammar carries the for
+  binding and the mutation law, and the spec's Map entry carries the
+  walk and the shared builtin
+
 ## [v0.7.1] the whole type set
 
 Map and tuple cross the bridge, and the refusal that guarded them

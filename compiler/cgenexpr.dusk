@@ -1510,12 +1510,36 @@ func gen_store_op(g: *Cg, e: ExprNode, cn: ExprNode) -> CVal {
 // bare clause of the enclosing contract, sign on a contract name, and the
 // pledge and break operations on a signed instance; a call through a first
 // class pledge value stays a named build error.
+// len(x): the length of a List or a Map read out as an Int. A List answers its
+// element count straight off the header; a Map answers its entry count, half
+// the slot count of the flat [k0,v0,...] store the runtime keeps. The checker
+// has already fixed the argument to a List or a Map, so the tag alone decides.
+func gen_len(g: *Cg, e: ExprNode) -> CVal {
+    a: *Ast = (*g).ast
+    t: *TyArena = (*g).ty
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b))
+    x: CVal = gen_expr(g, arg.expr, -1)
+    n: TyNode = ty_get(t, x.ty)
+    v: string = new_value(g)
+    set_ty(g, v, cg_tag_of(g, ty_int(t)))
+    fld: string = cg_field_of(g, ty_int(t))
+    if n.kind == tyk_map() {
+        cg_line(g, tmsg7(v, ".as.", fld, " = (int64_t)(", x.cvar, ".as.list.len / 2);", ""))
+    } else {
+        cg_line(g, tmsg7(v, ".as.", fld, " = (int64_t)", x.cvar, ".as.list.len;", ""))
+    }
+    return CVal { cvar: v, ty: ty_int(t) }
+}
+
 func gen_call(g: *Cg, e: ExprNode) -> CVal {
     a: *Ast = (*g).ast
     cn: ExprNode = vec_get((*a).exprs, e.a)
     if cn.kind == xk_ident() {
         b: CBind = cg_lookup(g, cn.a)
         if !b.found {
+            if str_eq(ast_name(a, cn.a), "len") {
+                return gen_len(g, e)
+            }
             if (*g).cur_cid >= 0 {
                 m: MEntry = rs_member((*g).res, (*g).cur_cid, cn.a)
                 if m.kind == mk_clause() {

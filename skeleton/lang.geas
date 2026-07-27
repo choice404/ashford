@@ -324,18 +324,32 @@ contract LangGauntlet {
     }
 
     // Two maps in argument position: the bridge lowers each parameter to the
-    // ordered entry wrapper, and the body reads a shared key from both and
-    // sums what it finds, a miss on either side counting as zero.
+    // ordered entry wrapper, and the body walks both, keys first from a and
+    // then from b, reading each value back through the map mid-iteration and
+    // summing what it finds into one running total.
     pledge merge_counts(a: Map<String, Int>, b: Map<String, Int>) -> Result<Int, Int> {
-        let av = match a["x"] {
-            Some(v) -> v
-            None -> 0
+        let mut acc = 0
+        for k in a {
+            match a[k] {
+                Some(v) -> {
+                    acc = acc + v
+                }
+                None -> {
+                    return Err(1)
+                }
+            }
         }
-        let bv = match b["x"] {
-            Some(w) -> w
-            None -> 0
+        for k in b {
+            match b[k] {
+                Some(w) -> {
+                    acc = acc + w
+                }
+                None -> {
+                    return Err(2)
+                }
+            }
         }
-        return Ok(av + bv)
+        return Ok(acc)
     }
 
     // A tuple in return position: the pair crosses as a message of numbered
@@ -431,5 +445,37 @@ contract LangGauntlet {
 
     pledge total_twice(xs: List<Int>) -> Result<Int, Int> {
         return Ok(total_of(xs) + total_of(xs))
+    }
+
+    // for over a Map walks its keys in insertion order, not sorted order: the
+    // keys go in as b, a, c, and the concatenation reads back "bac", so the
+    // pledge answers Ok only when the walk kept the order the writes made.
+    pledge ordered_keys() -> Result<String, Int> {
+        let mut m = Map<String, Int>()
+        m["b"] = 1
+        m["a"] = 2
+        m["c"] = 3
+        let mut acc = ""
+        for k in m {
+            acc = acc + k
+        }
+        if acc == "bac" {
+            return Ok(acc)
+        }
+        return Err(11)
+    }
+
+    // len over both containers: a three element list and a two entry map sum to
+    // five, the map counting its entries rather than its flat slot pairs.
+    pledge sizes() -> Result<Int, Int> {
+        let nums = [10, 20, 30]
+        let mut m = Map<String, Int>()
+        m["a"] = 1
+        m["b"] = 2
+        let total = len(nums) + len(m)
+        if total == 5 {
+            return Ok(total)
+        }
+        return Err(21)
     }
 }

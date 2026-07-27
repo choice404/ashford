@@ -234,6 +234,8 @@ ForStmt   ::= "for" IDENT "in" Expr Block
 
 Bindings are immutable unless declared `let mut`. Assignment targets a `let mut` binding, a field of one, or an element of one. There are no compound assignment operators in the first version. `break` and `continue` are loop control only, so they appear inside a `while` or `for` body.
 
+`for` walks a `List` or a `Map`. Over a `List<T>` the loop variable binds each element in order, type `T`. Over a `Map<K, V>` it binds each key in insertion order, type `K`, and the body reads a value back with `m[key]` where it needs one. The entry count is fixed when the loop begins, so a key the body inserts is not visited on the current pass, while updating the value of a key already present is seen through a later read, since an update moves the value and not the key's place.
+
 A block used as a value takes the type of its final expression statement, and `Unit` when it ends with anything else. Match arms must agree on one type wherever the match sits, so a statement position match with mixed arms ends each arm in a statement or returns.
 
 `+` on two `String` values concatenates into a new `String`. That is the one operator with a non numeric arm; a `String` never meets a numeric operand.
@@ -284,7 +286,9 @@ let hit = ages["ada"]      // Option<Int>, Some(36)
 let miss = ages["bob"]     // None
 ```
 
-Indexing a map reads an `Option<V>`, `None` on a missing key, so a miss is a value and never a fault; `m[k] = v` inserts or updates. Entries keep insertion order, which is the order any serialization sees. Removal and iteration over a map are not in the first version.
+Indexing a map reads an `Option<V>`, `None` on a missing key, so a miss is a value and never a fault; `m[k] = v` inserts or updates. Entries keep insertion order, which is the order any serialization sees and the order `for k in m` walks the keys. Removal from a map is not in the first version.
+
+`len(x)` is a builtin call, the length of a `List` or a `Map` as an `Int`: a list answers its element count and a map its entry count. It is reserved in callee position only, so a binding may still be named `len`; `len` applied to any other type, or to other than one argument, is an error. There is no method form.
 
 An assignment target is a place, not a value, so the lvalue walk differs from reading in two ways. A map index in an assignment target names the value slot directly and types as `V`, not `Option<V>`: in final position `m[k] = v` inserts or updates and never faults, while a missing key in the middle of a chain, `m[k].field = v`, is a fault, the same status an out of range list index reports, because a place that does not exist cannot hang a `None` anywhere. And writing through a chain, `b.xs[0] = 99`, mutates the named binding in place; the copies value semantics make on reads never apply to the target being assigned.
 

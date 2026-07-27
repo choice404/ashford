@@ -300,7 +300,10 @@ anywhere in the language, widths included.
 - **`Map<K, V>`**: an ordered map, constructed `Map<K, V>()`, with a keyable
   scalar key. An index read answers `Option<V>`, `None` on a miss, and an index
   assignment inserts or updates. Entries keep insertion order, and that order is
-  what serialization sees and what equality compares.
+  what serialization sees, what equality compares, and what `for` walks: a `for`
+  over a map binds the key, first inserted first, and the body reads the value
+  through the map itself. `len` answers the entry count of a map and the element
+  count of a list, the one builtin both collections share.
 
 ### Records
 

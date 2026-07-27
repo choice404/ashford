@@ -231,9 +231,12 @@ func check_for(tc: *Tc, s: StmtNode) -> void {
     if n.kind == tyk_list() {
         elem = n.a
     } else if n.kind == tyk_map() {
-        tc_emit(tc, ie.lo, ie.hi, "not yet supported: for over a Map")
+        // for over a Map walks its keys in insertion order, so the loop
+        // variable binds the key type K. A read of m[key] in the body takes
+        // the ordinary index path from there.
+        elem = n.a
     } else if n.kind != tyk_unknown() {
-        tc_emit(tc, ie.lo, ie.hi, tmsg3("for needs a List value, got '", ty_render(t, it), "'"))
+        tc_emit(tc, ie.lo, ie.hi, tmsg3("for needs a List or a Map value, got '", ty_render(t, it), "'"))
     }
     push_scope(tc)
     declare(tc, s.a, elem, false)

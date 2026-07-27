@@ -358,6 +358,32 @@ export func infer_member(tc: *Tc, e: ExprNode) -> int64 {
     return member_with_base(tc, e, bt)
 }
 
+// len(x): the one bare-name builtin call, the length of a List or a Map as an
+// Int. It is reserved in callee position only, so an ordinary binding may still
+// be named len; a call whose callee spells len reads this form ahead of any
+// clause of the same name. A Map answers its entry count, half the flat store's
+// slot count, and any other type is refused.
+func check_len(tc: *Tc, e: ExprNode) -> int64 {
+    a: *Ast = (*tc).ast
+    t: *TyArena = (*tc).ty
+    if e.c != 1 {
+        walk_args(tc, e.b, e.c)
+        tc_emit(tc, e.lo, e.hi, tmsg_count("len takes one value, got ", e.c, ""))
+        return ty_int(t)
+    }
+    arg: ArgNode = vec_get((*a).args, vec_get((*a).kids, e.b))
+    ae: ExprNode = vec_get((*a).exprs, arg.expr)
+    if arg.label >= 0 {
+        tc_emit(tc, ae.lo, ae.hi, "named arguments are used only with sign")
+    }
+    at: int64 = infer_expr(tc, arg.expr, -1)
+    n: TyNode = ty_get(t, at)
+    if n.kind != tyk_list() && n.kind != tyk_map() && n.kind != tyk_unknown() {
+        tc_emit(tc, ae.lo, ae.hi, tmsg3("len takes a List or a Map, got '", ty_render(t, at), "'"))
+    }
+    return ty_int(t)
+}
+
 // A call through a bare identifier that no local binds.
 func call_ident(tc: *Tc, cn: ExprNode, e: ExprNode) -> int64 {
     a: *Ast = (*tc).ast
@@ -366,6 +392,9 @@ func call_ident(tc: *Tc, cn: ExprNode, e: ExprNode) -> int64 {
     if str_len(text) == 0 {
         walk_args(tc, e.b, e.c)
         return ty_unknown(t)
+    }
+    if str_eq(text, "len") {
+        return check_len(tc, e)
     }
     if (*tc).cur_cid >= 0 {
         m: MEntry = rs_member((*tc).res, (*tc).cur_cid, cn.a)

@@ -408,6 +408,45 @@ int main(void) {
               "snapshot renders {\"ada\": 3, \"bob\": 2}");
     }
 
+    /* ---- the walked map: iteration order, len, and a map crossing in ---- */
+
+    memset(&out, 0, sizeof(out));
+    CHECK(geas_pledge_fulfill_sync(c, "ordered_keys", NULL, 0, NULL, 0, &out) ==
+              GEAS_OK,
+          "ordered_keys runs");
+    CHECK(result_str(&out, 0, "bac"),
+          "ordered_keys walks insertion order, not name order, Ok(\"bac\")");
+
+    memset(&out, 0, sizeof(out));
+    CHECK(geas_pledge_fulfill_sync(c, "sizes", NULL, 0, NULL, 0, &out) ==
+              GEAS_OK,
+          "sizes runs");
+    CHECK(result_int(&out, 0, 5),
+          "sizes: len of a three list plus len of a two map, Ok(5)");
+
+    {
+        /* Two maps built host side cross the boundary as arguments and the
+         * pledge walks both: the iteration surface holds for a map the
+         * instance did not build itself. */
+        GeasValue ma = geas_map_new(c, GEAS_TY_STRING);
+        GeasValue mb = geas_map_new(c, GEAS_TY_STRING);
+        GeasValue k1 = str_val("x");
+        GeasValue k2 = str_val("y");
+        GeasValue v1 = int_val(10);
+        GeasValue v2 = int_val(32);
+        CHECK(geas_map_set(c, &ma, &k1, &v1) == GEAS_OK, "ma[x]=10");
+        CHECK(geas_map_set(c, &mb, &k2, &v2) == GEAS_OK, "mb[y]=32");
+        GeasValue margs[2];
+        margs[0] = ma;
+        margs[1] = mb;
+        memset(&out, 0, sizeof(out));
+        CHECK(geas_pledge_fulfill_sync(c, "merge_counts", margs, 2, NULL, 0,
+                                       &out) == GEAS_OK,
+              "merge_counts runs");
+        CHECK(result_int(&out, 0, 42),
+              "merge_counts walks both argument maps, Ok(42)");
+    }
+
     CHECK(geas_contract_break(c) == GEAS_OK, "break the instance");
     geas_runtime_shutdown(rt);
     if (g_fail) return 1;

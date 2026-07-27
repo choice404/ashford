@@ -12,7 +12,7 @@ package geas.lang;
 // lays its module out differently overrides this with protoc's M flags.
 option go_package = "geasbridge/langpb";
 
-// contract LangGauntlet, version 1, shape 0x5e5a9edad7a67af6.
+// contract LangGauntlet, version 1, shape 0x727e7c9fbc13e80a.
 // The sign surface: one optional field per vow, and the shape check,
 // where 0 skips it and the wrapper's pinned hash enforces this build.
 message SignRequest {
@@ -252,6 +252,14 @@ message TotalTwiceRequest {
   repeated int64 xs = 2;
 }
 
+message OrderedKeysRequest {
+  uint64 instance_id = 1;
+}
+
+message SizesRequest {
+  uint64 instance_id = 1;
+}
+
 // The lifecycle states, GEAS_UNSIGNED through GEAS_BROKEN, in the runtime's
 // own numbering.
 enum ContractState {
@@ -316,6 +324,8 @@ service LangGauntlet {
   rpc Label(LabelRequest) returns (StringIntResult);
   rpc Scale(ScaleRequest) returns (IntIntResult);
   rpc TotalTwice(TotalTwiceRequest) returns (IntIntResult);
+  rpc OrderedKeys(OrderedKeysRequest) returns (StringIntResult);
+  rpc Sizes(SizesRequest) returns (IntIntResult);
   rpc GetPartial(PartialRequest) returns (PartialReply);
   rpc Break(BreakRequest) returns (BreakReply);
 }
