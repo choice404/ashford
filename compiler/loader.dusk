@@ -6,8 +6,9 @@
 //
 // The search order per import: the dotted path becomes a relative file path,
 // util -> util.geas and foo.bar -> foo/bar.geas, probed first beside the root
-// file and then under GEAS_HOME, which defaults to lib/ in the working
-// directory when the variable is unset. Imports walk depth first in
+// file, then under GEAS_HOME when that is set, then lib/ in the working
+// directory, then /usr/local/share/geas and /usr/share/geas, where an
+// installed toolchain keeps its std tree. Imports walk depth first in
 // declaration order, each file loads exactly once, and an import that lands
 // on a file still being loaded is a cycle and a fault. A path that repeats
 // inside one file is a duplicate import fault here, where the file is known,
@@ -57,7 +58,8 @@ export struct Program {
 
 // The loader state one load carries: the program under construction, the
 // status of every path seen, 1 while its imports are still loading and 2
-// once done, the dir to package id table, and the two search roots.
+// once done, the dir to package id table, the root file's own directory and
+// the ordered home roots an import falls back to.
 struct Ld {
     ast: *Ast,
     files: *Vector<LdFile>,
@@ -67,7 +69,7 @@ struct Ld {
     pkgs: *Map<string, int64>,
     npkgs: int64,
     rootdir: string,
-    home: string,
+    homes: *Vector<string>,
     base: int64,
     ok: bool,
 }
@@ -151,12 +153,22 @@ func path_under(dir: string, rel: string) -> string {
     return out
 }
 
-// The second search root: GEAS_HOME when set, otherwise lib/ in the working
-// directory, the spot the std modules live in a checkout.
-func geas_home() -> string {
+// The search roots tried after the root file's own directory, in order.
+// GEAS_HOME leads when it is set, so a caller can always name its own tree.
+// lib/ comes next, the spot the std modules live in a checkout, and it stays
+// ahead of the system roots so a checkout builds against its own std whatever
+// is installed on the machine. The two share directories are the installed
+// layout, /usr/share/geas/std/errors.geas answering an import of std.errors,
+// and they are what lets an installed geas run with nothing in the
+// environment.
+func geas_homes() -> *Vector<string> {
+    homes: *Vector<string> = alloc(vec_new())
     h: string = env("GEAS_HOME")
-    if str_len(h) > 0 { return h }
-    return "lib"
+    if str_len(h) > 0 { vec_push(homes, h) }
+    vec_push(homes, "lib")
+    vec_push(homes, "/usr/local/share/geas")
+    vec_push(homes, "/usr/share/geas")
+    return homes
 }
 
 // The package id of a directory, assigned in first encounter order so a
@@ -311,8 +323,9 @@ func ld_error(ld: *Ld, path: string, src: string, n: int64, lo: int64, hi: int64
 }
 
 // Resolves one import to the file it names, probing beside the root first
-// and then under the home root. A path already loaded or loading counts as
-// found without touching the disk again.
+// and then under each home root in turn, stopping at the first that answers.
+// A path already loaded or loading counts as found without touching the disk
+// again.
 struct LdTarget { found: bool, path: string }
 
 func resolve_import(ld: *Ld, imp: string) -> LdTarget {
@@ -325,12 +338,18 @@ func resolve_import(ld: *Ld, imp: string) -> LdTarget {
     if source_is_file(c1) {
         return LdTarget { found: true, path: c1 }
     }
-    c2: string = path_under((*ld).home, rel)
-    if map_has(status, c2) {
-        return LdTarget { found: true, path: c2 }
-    }
-    if source_is_file(c2) {
-        return LdTarget { found: true, path: c2 }
+    homes: *Vector<string> = (*ld).homes
+    mut i: int64 = 0
+    while i < vec_len(homes) {
+        c: string = path_under(vec_get(homes, i), rel)
+        if map_has(status, c) {
+            return LdTarget { found: true, path: c }
+        }
+        if source_is_file(c) {
+            return LdTarget { found: true, path: c }
+        }
+        free(c)
+        i = i + 1
     }
     free(rel)
     return LdTarget { found: false, path: "" }
@@ -485,7 +504,7 @@ export func load_program(root_path: string) -> *Program {
         pkgs: pkgs,
         npkgs: 0,
         rootdir: dir_of(root_path),
-        home: geas_home(),
+        homes: geas_homes(),
         base: 0,
         ok: true,
     })

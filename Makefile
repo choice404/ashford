@@ -54,7 +54,7 @@ MODULE_SVC := $(OUT)/libservice.geas.so
 HOST       := $(OUT)/host
 BIN_DEMO   := $(OUT)/main_demo
 
-.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover test-supervisor test-supervisor-watch tsan clean
+.PHONY: all smoke smoke-asan runtime compiler module host test-runtime test-wire test-park test-lifecycle test-store-unit test-store test-store-txn test-store-fail test-store-crash test-store-stress test-store-stress-tsan test-store-python test-thread test-iname test-partial test-lang test-std test-python test-bin test-header test-proto test-determinism grpc-venv test-grpc-bridge test-grpc-go test-grpc-node test-grpc-resume test-grpc-failover test-supervisor test-supervisor-watch tsan install uninstall clean
 
 # The full suite, one gate per surface the language carries: the walking
 # skeleton, the runtime's own units, the compiled language, and the store, with
@@ -72,7 +72,7 @@ $(SQLITE_OBJ): runtime/third_party/sqlite3.c runtime/third_party/sqlite3.h
 
 $(RT_SO): runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c runtime/include/geas/geas.h runtime/include/geas/geas_abi.h runtime/include/geas/geas_wire.h runtime/include/geas/geas_store.h runtime/third_party/sqlite3.h $(SQLITE_OBJ)
 	@mkdir -p $(OUT)
-	$(CC) $(CFLAGS) -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
+	$(CC) $(CFLAGS) -fPIC -shared -pthread -I runtime/include -I runtime/src -I runtime/third_party runtime/src/runtime.c runtime/src/wire.c runtime/src/store.c $(SQLITE_OBJ) -ldl -o $(RT_SO)
 
 compiler: $(GEAS)
 
@@ -748,6 +748,29 @@ smoke-asan: $(MODULE)
 	$(CC) $(CFLAGS) -fsanitize=address,leak -g -pthread -rdynamic $(RT_INC) \
 	    skeleton/host.c $(RT_UNITS) $(RT_SQLITE) -ldl -o $(OUT)/host_asan
 	./$(OUT)/host_asan
+
+# The installed toolchain. install lays the artifacts out the way a system
+# expects them: the geas binary on PATH, libgeasrt where the linker already
+# searches, the runtime headers under include/geas so the emitted C's
+# <geas/geas.h> resolves with no flags, and the std modules under
+# share/geas/std where the loader's system probe finds them. PREFIX defaults
+# to /usr/local for a hand install; a package build passes PREFIX=/usr and
+# DESTDIR at the fakeroot.
+PREFIX ?= /usr/local
+
+install: $(GEAS) $(RT_SO)
+	install -Dm755 $(GEAS) $(DESTDIR)$(PREFIX)/bin/geas
+	install -Dm755 $(RT_SO) $(DESTDIR)$(PREFIX)/lib/libgeasrt.so
+	install -Dm644 -t $(DESTDIR)$(PREFIX)/include/geas \
+	    runtime/include/geas/geas.h runtime/include/geas/geas_abi.h \
+	    runtime/include/geas/geas_wire.h runtime/include/geas/geas_store.h
+	install -Dm644 -t $(DESTDIR)$(PREFIX)/share/geas/std lib/std/*.geas
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/geas
+	rm -f $(DESTDIR)$(PREFIX)/lib/libgeasrt.so
+	rm -rf $(DESTDIR)$(PREFIX)/include/geas
+	rm -rf $(DESTDIR)$(PREFIX)/share/geas
 
 clean:
 	rm -rf target

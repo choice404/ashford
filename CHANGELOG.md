@@ -4,6 +4,41 @@ Every released version of Geas, newest first. The language was named
 Ashford through v0.6.8; entries below the rename keep the names they
 shipped with, because a changelog that rewrites its own past is not one.
 
+## [v0.7.3] the installed toolchain
+
+The toolchain leaves the checkout. `make install` lays geas out the way
+a system expects it: the binary on PATH, libgeasrt where the linker
+already searches, the headers under include/geas so the emitted C's one
+include resolves with no flags, and the std modules under
+share/geas/std. The compiler learns to tell the three worlds apart on
+its own: an explicit `GEAS_ROOT` leads, a repository checkout is
+detected and keeps every path it always used, and anywhere else cc and
+ld are left to their own search paths, because an installed toolchain
+should need no environment at all. On top of that sits the first
+package: `geas` on the AUR, built from the tagged release tarball.
+
+- teach the compiler the installed layout: runtime_include and
+  runtime_libdir answer GEAS_ROOT first, the checkout's relative paths
+  when runtime/include/geas/geas.h is present, and empty otherwise, and
+  the link lines drop -I, -L, and the libdir rpath when empty so the
+  system search paths carry the build
+- extend the loader's probe chain: an import resolves beside the root,
+  then under GEAS_HOME when set, then lib/, then
+  /usr/local/share/geas, then /usr/share/geas, so std.errors finds the
+  installed std the same way it finds the checkout's
+- add make install and uninstall: PREFIX defaults to /usr/local,
+  DESTDIR stages for packaging, and the four artifact groups land as
+  bin/geas, lib/libgeasrt.so, include/geas, and share/geas/std
+- pin -fPIC on the runtime shared library rule itself, so a packager's
+  own CFLAGS cannot drop it out from under -shared
+- cut the AUR package: packaging/aur carries the PKGBUILD the AUR copy
+  is cut from, gcc is the one runtime dependency because the vendored
+  SQLite rides inside libgeasrt, and dusk-lang builds it
+- license the language: MIT, the LICENSE file the package installs
+- write the release path down: PUBLISH.md walks the AUR flow end to
+  end, from the SSH key to the pushed .SRCINFO, with room for the other
+  package repositories to follow
+
 ## [v0.7.2] the walked map
 
 The map opens to the language that owns it. A `for` over a `Map<K, V>`

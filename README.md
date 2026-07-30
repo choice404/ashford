@@ -66,6 +66,24 @@ Unsigned -> Signed -> Fulfilled
 
 The runtime is a shared C library. A compiled `.geas` module carries its contract descriptors, and the runtime registers them in the iname table, a queryable registry of every contract and pledge signature with the language of origin, the type signature hash, and the version baked into each mangled name. A version mismatch is a descriptive error at link time instead of silent corruption at run time. A C program, or anything that can load a C library, looks up a contract, signs it, fulfills pledges, and reads results, all through a handful of runtime calls.
 
+## Installing
+
+On Arch, the [geas](https://aur.archlinux.org/packages/geas) package on the AUR builds from the latest tagged release:
+
+```sh
+paru -S geas   # or yay -S geas
+```
+
+From a checkout, `make install` lays the toolchain out under a prefix: the `geas` binary, `libgeasrt.so`, the C ABI headers, and the std modules. The default prefix is `/usr/local`.
+
+```sh
+make compiler runtime
+sudo make install            # PREFIX=/usr/local
+make DESTDIR=./stage install # a staged install for packaging
+```
+
+An installed `geas` needs no environment variables. It probes for a repository checkout first and falls back to the system paths; `GEAS_ROOT` and `GEAS_HOME` still override both for out of tree development.
+
 ## How to use
 
 New to Geas, start with [docs/tutorial.md](docs/tutorial.md): it walks the whole language and then drives one contract from C and from Python with no generated bindings. [spec.md](spec.md) is the full language reference, and [CHANGELOG.md](CHANGELOG.md) carries the history version by version.

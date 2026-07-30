@@ -14,9 +14,11 @@
 // module's shape hashes and mangled names for a foreign host.
 //
 // Progress and error messages go to stderr, so stdout carries dump output
-// alone and a tool can diff it byte for byte. build expects to run from the
-// repository root, since it hands cc the relative runtime/include path; a
-// proper home lookup is a later milestone.
+// alone and a tool can diff it byte for byte. build finds the runtime three
+// ways: GEAS_ROOT when it is set, the relative runtime/include and
+// target/geas-out paths when the working directory is a checkout, and the
+// compiler's own system search paths when it is neither, which is how an
+// installed toolchain works with no environment set at all.
 
 @paradigm procedural
 
@@ -234,35 +236,58 @@ func push_arg(cmd: *StringBuilder, arg: string) -> void {
     free(q)
 }
 
+// True when the working directory is a toolchain checkout, decided by the one
+// header every checkout has at a fixed spot. An installed toolchain needs no
+// environment variable and no checkout around it: cc and ld already know where
+// the system include and library directories are, so a failed probe means the
+// build hands them nothing and lets them look for themselves.
+func in_checkout() -> bool {
+    return source_is_file("runtime/include/geas/geas.h")
+}
+
 // The runtime include directory the emitted C compiles against. GEAS_ROOT, when
 // set, points at a toolchain checkout so geas runs from any working directory;
-// unset it falls back to the relative path a run from the repository root uses.
+// unset it falls back to the relative path a run from a checkout root uses. An
+// empty string is the third answer, the installed layout, and means the build
+// passes no -I at all.
 func runtime_include() -> string {
     r: string = env("GEAS_ROOT")
     if str_len(r) > 0 {
         return join2(r, "/runtime/include")
     }
-    return "runtime/include"
+    if in_checkout() {
+        return "runtime/include"
+    }
+    return ""
 }
 
-// The directory libgeasrt lives in, target/geas-out under GEAS_ROOT when set, the
-// relative build directory otherwise.
+// The directory libgeasrt lives in, target/geas-out under GEAS_ROOT when set,
+// the relative build directory in a checkout, and an empty string under the
+// installed layout, where the linker's own search path finds the library.
 func runtime_libdir() -> string {
     r: string = env("GEAS_ROOT")
     if str_len(r) > 0 {
         return join2(r, "/target/geas-out")
     }
-    return "target/geas-out"
+    if in_checkout() {
+        return "target/geas-out"
+    }
+    return ""
 }
 
-// Compiles the emitted C into a shared library with cc. Returns the cc exit
-// code, zero on success.
+// Compiles the emitted C into a shared library with cc. An empty include
+// directory is the installed layout and drops the -I, leaving cc to find
+// geas/geas.h on its own search path. Returns the cc exit code, zero on
+// success.
 func link_module(cpath: string, sopath: string) -> int64 {
     cmd: *StringBuilder = alloc(sb_new())
+    inc: string = runtime_include()
     sb_push(cmd, "cc -shared -fPIC")
     push_arg(cmd, cpath)
-    sb_push(cmd, " -I ")
-    sb_push(cmd, runtime_include())
+    if str_len(inc) > 0 {
+        sb_push(cmd, " -I ")
+        sb_push(cmd, inc)
+    }
     sb_push(cmd, " -o")
     push_arg(cmd, sopath)
     linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))
@@ -277,24 +302,35 @@ func link_module(cpath: string, sopath: string) -> int64 {
     return code
 }
 
-// Links the emitted wrapper and module C into a standalone executable. The
-// program needs libgeasrt beside it in target/geas-out, which is where the
-// Makefile builds it, and the rpath keeps the pair relocatable together.
+// Links the emitted wrapper and module C into a standalone executable. In a
+// checkout the program needs libgeasrt beside it in target/geas-out, which is
+// where the Makefile builds it, and the rpath keeps the pair relocatable
+// together. Under the installed layout the include and library directories are
+// both empty: the -I, the -L and the rpath into them all drop, and ld finds
+// libgeasrt on the system path. The $ORIGIN rpath stays either way, since a
+// binary shipped next to its runtime is the point of it.
 // Returns the cc exit code, zero on success.
 func link_bin(wpath: string, cpath: string, binpath: string) -> int64 {
     cmd: *StringBuilder = alloc(sb_new())
+    inc: string = runtime_include()
     libdir: string = runtime_libdir()
     sb_push(cmd, "cc")
     push_arg(cmd, wpath)
     push_arg(cmd, cpath)
-    sb_push(cmd, " -I ")
-    sb_push(cmd, runtime_include())
-    sb_push(cmd, " -L ")
-    sb_push(cmd, libdir)
+    if str_len(inc) > 0 {
+        sb_push(cmd, " -I ")
+        sb_push(cmd, inc)
+    }
+    if str_len(libdir) > 0 {
+        sb_push(cmd, " -L ")
+        sb_push(cmd, libdir)
+    }
     sb_push(cmd, " -lgeasrt")
     push_arg(cmd, "-Wl,-rpath,$ORIGIN")
-    sb_push(cmd, " -Wl,-rpath,")
-    sb_push(cmd, libdir)
+    if str_len(libdir) > 0 {
+        sb_push(cmd, " -Wl,-rpath,")
+        sb_push(cmd, libdir)
+    }
     sb_push(cmd, " -o")
     push_arg(cmd, binpath)
     linkline: string = substring(sb_cstr(cmd), 0, sb_size(cmd))
